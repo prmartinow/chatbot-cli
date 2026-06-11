@@ -1,0 +1,15 @@
+{
+  "name": "chatbot-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "CB": "./CB.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.54.0"
+  },
+  "scripts": {
+    "check": "node --check CB.js"
+  }
+}
