@@ -60,6 +60,11 @@ Options:
   --model         Select a model by visible label before sending.
   --reasoning     Select a reasoning mode by visible label before sending.
   --status        Print current target app page state and exit.
+  --watch-state   Poll target app state continuously for external orchestration.
+  --wait-ready    With --watch-state, exit once a new assistant answer is complete.
+  --state-jsonl   Emit state updates as JSON Lines instead of human text.
+  --state-interval
+                  Poll interval in ms for state watching. Default: ${RESPONSE_POLL_MS}
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
   --download-artifacts
@@ -99,6 +104,10 @@ function parseArgs(argv) {
     model: '',
     reasoning: '',
     status: false,
+    watchState: false,
+    waitReady: false,
+    stateJsonl: false,
+    stateInterval: RESPONSE_POLL_MS,
     models: false,
     stop: false,
     downloadArtifacts: false,
@@ -124,6 +133,10 @@ function parseArgs(argv) {
     else if (arg === '--model') args.model = next();
     else if (arg === '--reasoning') args.reasoning = next();
     else if (arg === '--status') args.status = true;
+    else if (arg === '--watch-state') args.watchState = true;
+    else if (arg === '--wait-ready') args.waitReady = true;
+    else if (arg === '--state-jsonl') args.stateJsonl = true;
+    else if (arg === '--state-interval') args.stateInterval = Number(next());
     else if (arg === '--models') args.models = true;
     else if (arg === '--stop') args.stop = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -140,6 +153,10 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.timeout) || args.timeout <= 0) {
     throw new Error('--timeout must be a positive number');
   }
+  if (!Number.isFinite(args.stateInterval) || args.stateInterval <= 0) {
+    throw new Error('--state-interval must be a positive number');
+  }
+  if (args.waitReady) args.watchState = true;
 
   if (args.transcript) args.transcript = path.resolve(args.transcript);
   args.attachments = args.attachments.map((filePath) => path.resolve(filePath));
@@ -377,11 +394,9 @@ async function sendMessage(page, message) {
 
 function responseAfterMessage(turns, message, baselineLastTurnId) {
   let userIndex = -1;
-  const normalizedMessage = message.trim();
   for (let i = turns.length - 1; i >= 0; i--) {
     const turn = turns[i];
-    const turnText = turn.text.trim();
-    if (turn.role === 'user' && (turnText === normalizedMessage || turnText.includes(normalizedMessage))) {
+    if (turn.role === 'user' && turnMatchesMessage(turn.text, message)) {
       userIndex = i;
       break;
     }
@@ -399,15 +414,29 @@ function responseAfterMessage(turns, message, baselineLastTurnId) {
 }
 
 function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
-  const normalizedMessage = message.trim();
   const baselineIndex = baselineLastTurnId
     ? turns.findIndex((turn) => turn.testid === baselineLastTurnId)
     : -1;
   return turns.some((turn, index) => {
     if (index <= baselineIndex || turn.role !== 'user') return false;
-    const turnText = turn.text.trim();
-    return turnText === normalizedMessage || turnText.includes(normalizedMessage);
+    return turnMatchesMessage(turn.text, message);
   });
+}
+
+function normalizeTurnText(text) {
+  return (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function turnMatchesMessage(turnText, message) {
+  const normalizedTurn = normalizeTurnText(turnText);
+  const normalizedMessage = normalizeTurnText(message);
+  if (!normalizedTurn || !normalizedMessage) return false;
+  if (normalizedTurn === normalizedMessage || normalizedTurn.includes(normalizedMessage)) return true;
+  if (normalizedMessage.length < 1000) return false;
+
+  const head = normalizedMessage.slice(0, 200);
+  const tail = normalizedMessage.slice(-200);
+  return normalizedTurn.includes(head) && normalizedTurn.includes(tail);
 }
 
 async function getGenerationState(page) {
@@ -423,7 +452,7 @@ async function getGenerationState(page) {
       ].join(' ').toLowerCase();
 
       return /\b(stop|interrupt|cancel)\b/.test(text)
-        && !/\bshare\b|\bcopy\b|\bclose\b/.test(text);
+        && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/.test(text);
     });
 
     return {
@@ -466,7 +495,16 @@ async function getTargetAppState(page) {
     const generationControls = buttons
       .map((button) => ({ text: controlText(button), testid: button.getAttribute('data-testid') || '' }))
       .filter((item) => /\b(stop|interrupt|cancel)\b/i.test(item.text)
-        && !/\b(share|copy|close|cancel dictation)\b/i.test(item.text));
+        && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(item.text));
+
+    const voiceControls = controls
+      .filter((item) => /\b(start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test([
+        item.testid,
+        item.aria,
+        item.title,
+        item.text,
+      ].join(' ')))
+      .slice(0, 20);
 
     const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .map((turn, index) => {
@@ -565,7 +603,7 @@ async function getTargetAppState(page) {
           const meta = [item.testid, item.aria, item.title].join(' ');
           const body = item.text;
           const joined = [meta, body].join(' ');
-          if (/\b(add files|start dictation|start voice|chat with targetapp)\b/i.test(joined)) return false;
+          if (/\b(add files|start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(joined)) return false;
           if (/\b(file|attachment|upload|remove|pasted text|pasted|pdf|doc|image|csv|txt)\b/i.test(meta)) return true;
           return body.length <= 240
             && /\b(pasted text|attachment|file|pdf|docx?|image|csv|\.txt|\.pdf|\.csv|\.png|\.jpe?g|\.webp)\b/i.test(body);
@@ -598,6 +636,7 @@ async function getTargetAppState(page) {
       reasoningControls,
       isGenerating: generationControls.length > 0,
       generationControls,
+      voiceControls,
       composer: {
         visible: isVisible(composer),
         textChars: composerText.length,
@@ -636,6 +675,9 @@ function summarizeState(state) {
   if (state.generationControls.length) {
     lines.push(`Generation controls: ${state.generationControls.map((item) => item.text).join(' | ')}`);
   }
+  if (state.voiceControls.length) {
+    lines.push(`Voice/dictation controls: recognized, not used (${state.voiceControls.map((item) => item.aria || item.title || item.text || item.testid).join(' | ')})`);
+  }
   lines.push(`Composer: ${state.composer.visible ? 'visible' : 'not visible'}, ${state.composer.textChars} chars`);
   if (state.composer.textChars >= 10000) {
     lines.push(`Composer long text: yes (${state.composer.textChars} chars)`);
@@ -652,6 +694,148 @@ function summarizeState(state) {
     lines.push(`Latest assistant: ${state.latestAssistant.preview}`);
   }
   return lines.join('\n');
+}
+
+function latestTurnByRole(state, role) {
+  return [...(state.lastTurns || [])].reverse().find((turn) => turn.role === role) || null;
+}
+
+function compactTurn(turn) {
+  if (!turn) return null;
+  return {
+    index: turn.index,
+    testid: turn.testid,
+    role: turn.role,
+    chars: turn.chars,
+    preview: turn.preview,
+  };
+}
+
+function turnSignature(turn) {
+  if (!turn) return '';
+  return [turn.testid || turn.index, turn.role, turn.chars].join(':');
+}
+
+function stateBaseline(state) {
+  const latestTurn = state.lastTurns?.[state.lastTurns.length - 1] || null;
+  const latestAssistant = latestTurnByRole(state, 'assistant');
+  return {
+    turnCount: state.turnCount || 0,
+    latestTurnIndex: latestTurn?.index ?? -1,
+    latestAssistantSignature: turnSignature(latestAssistant),
+    latestAssistantChars: latestAssistant?.chars || 0,
+  };
+}
+
+function buildStateEvent(state, baseline = null, transcriptPath = '') {
+  const latestTurn = state.lastTurns?.[state.lastTurns.length - 1] || null;
+  const latestAssistant = latestTurnByRole(state, 'assistant');
+  const latestAssistantSignature = turnSignature(latestAssistant);
+  const assistantAdvanced = Boolean(latestAssistant && baseline && (
+    latestAssistantSignature !== baseline.latestAssistantSignature
+    || latestAssistant.chars > baseline.latestAssistantChars
+    || latestAssistant.index > baseline.latestTurnIndex
+  ));
+  const ready = Boolean(!state.isGenerating && assistantAdvanced);
+  const composerBusy = Boolean(state.composer?.textChars || state.composer?.attachments?.length);
+  const phase = ready
+    ? 'ready'
+    : state.isGenerating
+      ? 'generating'
+      : latestTurn?.role === 'user'
+        ? 'waiting'
+        : composerBusy
+          ? 'composing'
+          : 'idle';
+
+  return {
+    type: 'target_app_state',
+    at: new Date().toISOString(),
+    phase,
+    ready,
+    sessionId: sessionIdFromUrl(state.url),
+    url: state.url,
+    title: state.title,
+    transcript: transcriptPath,
+    model: state.model || '',
+    generating: state.isGenerating,
+    generationControls: (state.generationControls || []).map((item) => item.text).filter(Boolean),
+    voiceControls: (state.voiceControls || []).map((item) => item.aria || item.title || item.text || item.testid).filter(Boolean),
+    activity: (state.activityTexts || []).slice(-5),
+    composer: {
+      visible: Boolean(state.composer?.visible),
+      textChars: state.composer?.textChars || 0,
+      attachments: (state.composer?.attachments || []).map((item) => item.text || item.aria || item.testid).filter(Boolean),
+      fileInputCount: state.composer?.fileInputCount || 0,
+    },
+    turns: {
+      count: state.turnCount || 0,
+      latest: compactTurn(latestTurn),
+      latestAssistant: compactTurn(latestAssistant),
+    },
+    artifacts: {
+      links: state.artifacts?.links?.length || 0,
+      images: state.artifacts?.images?.length || 0,
+      downloadControls: state.artifacts?.downloadControls?.length || 0,
+      codeBlocks: state.artifacts?.codeBlocks?.length || 0,
+    },
+  };
+}
+
+function stateEventKey(event) {
+  return [
+    event.phase,
+    event.ready ? 'ready' : '',
+    event.generating ? 'generating' : '',
+    event.turns.count,
+    event.turns.latest?.testid || '',
+    event.turns.latest?.chars || 0,
+    event.turns.latestAssistant?.testid || '',
+    event.turns.latestAssistant?.chars || 0,
+    event.composer.textChars,
+    event.composer.attachments.join('|'),
+    event.generationControls.join('|'),
+    event.activity.join('|'),
+    event.artifacts.links,
+    event.artifacts.images,
+    event.artifacts.downloadControls,
+    event.artifacts.codeBlocks,
+  ].join('::');
+}
+
+function formatStateEvent(event) {
+  const parts = [
+    `phase=${event.phase}`,
+    `ready=${event.ready ? 'yes' : 'no'}`,
+    `generating=${event.generating ? 'yes' : 'no'}`,
+  ];
+  if (event.sessionId) parts.push(`session=${event.sessionId}`);
+  if (event.model) parts.push(`model=${event.model}`);
+  if (event.generationControls.length) parts.push(`control=${event.generationControls.join(' | ')}`);
+  if (event.activity.length) parts.push(`activity=${event.activity.join(' | ')}`);
+  if (event.turns.latest) parts.push(`latest=${event.turns.latest.role || 'unknown'}:${event.turns.latest.chars}`);
+  if (event.artifacts.links || event.artifacts.images || event.artifacts.downloadControls || event.artifacts.codeBlocks) {
+    parts.push(`artifacts links=${event.artifacts.links} images=${event.artifacts.images} downloads=${event.artifacts.downloadControls} code=${event.artifacts.codeBlocks}`);
+  }
+  return `[state] ${parts.join(' ')}`;
+}
+
+function createStateEmitter({ jsonl = false, stream = process.stderr, baseline = null, transcriptPath = '', getTranscriptPath = null } = {}) {
+  let lastKey = '';
+  return {
+    emit(state, force = false) {
+      const event = buildStateEvent(state, baseline, getTranscriptPath ? getTranscriptPath() : transcriptPath);
+      const key = stateEventKey(event);
+      if (!force && key === lastKey) return event;
+      lastKey = key;
+      if (jsonl) {
+        stream.write(`${JSON.stringify(event)}\n`);
+      } else {
+        stream.write(`${formatStateEvent(event)}\n`);
+      }
+      return event;
+    },
+  };
 }
 
 function artifactDir(args) {
@@ -930,7 +1114,7 @@ async function stopGeneration(page) {
           textOf(el),
         ].join(' ');
         return /\b(stop|interrupt|cancel)\b/i.test(text)
-          && !/\b(share|copy|close|cancel dictation)\b/i.test(text);
+          && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(text);
       });
     if (!control) return '';
     control.setAttribute('data-cb-stop-generation', 'true');
@@ -1114,36 +1298,23 @@ async function settlePage(page) {
   await page.waitForTimeout(500);
 }
 
-function createStreamPrinter() {
+function createStreamPrinter(args, baseline = null) {
   let lastText = '';
-  let lastStateKey = '';
+  const stateEmitter = createStateEmitter({
+    jsonl: args.stateJsonl,
+    stream: process.stderr,
+    baseline,
+    getTranscriptPath: () => args.transcript || '',
+  });
 
   return {
     update(event) {
       const state = event.state;
       if (state) {
-        const activity = state.activityTexts.slice(-3).join(' | ');
-        const control = state.generationControls.map((item) => item.text).join(' | ');
-        const key = [
-          state.isGenerating ? 'generating' : 'idle',
-          control,
-          activity,
-          state.artifacts.links.length,
-          state.artifacts.images.length,
-          state.artifacts.downloadControls.length,
-        ].join('::');
-        if (key !== lastStateKey) {
-          lastStateKey = key;
-          const parts = [];
-          parts.push(state.isGenerating ? 'generating' : 'idle');
-          if (control) parts.push(control);
-          if (activity) parts.push(activity);
-          if (state.artifacts.links.length || state.artifacts.images.length || state.artifacts.downloadControls.length) {
-            parts.push(`artifacts links=${state.artifacts.links.length} images=${state.artifacts.images.length} downloads=${state.artifacts.downloadControls.length}`);
-          }
-          info(`[state] ${parts.join(' | ')}`);
-        }
+        stateEmitter.emit(state);
       }
+
+      if (!args.stream) return;
 
       if (typeof event.text === 'string' && event.text.startsWith(lastText)) {
         const delta = event.text.slice(lastText.length);
@@ -1157,7 +1328,7 @@ function createStreamPrinter() {
       }
     },
     finish() {
-      if (lastText && !lastText.endsWith('\n')) process.stdout.write('\n');
+      if (args.stream && lastText && !lastText.endsWith('\n')) process.stdout.write('\n');
     },
   };
 }
@@ -1225,6 +1396,33 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   throw new Error(`Timed out after ${timeout}ms waiting for assistant response`);
 }
 
+async function watchTargetAppState(page, args) {
+  refreshSessionTranscript(page, args);
+  const initialState = await getTargetAppState(page);
+  const baseline = stateBaseline(initialState);
+  const emitter = createStateEmitter({
+    jsonl: args.stateJsonl,
+    stream: process.stdout,
+    baseline,
+    getTranscriptPath: () => args.transcript || '',
+  });
+
+  const start = Date.now();
+  let event = emitter.emit(initialState, true);
+
+  while (true) {
+    if (args.waitReady && event.ready) return event;
+    if (args.waitReady && Date.now() - start >= args.timeout) {
+      throw new Error(`Timed out after ${args.timeout}ms waiting for ready assistant output`);
+    }
+
+    await page.waitForTimeout(args.stateInterval);
+    refreshSessionTranscript(page, args);
+    const state = await getTargetAppState(page);
+    event = emitter.emit(state);
+  }
+}
+
 async function ask(page, message, args) {
   refreshSessionTranscript(page, args);
   if (args.model) {
@@ -1242,13 +1440,15 @@ async function ask(page, message, args) {
       info(`[attach] composer attachments: ${state.composer.attachments.map((item) => item.text || item.aria || item.testid).join(' | ')}`);
     }
   }
+  const baselineState = await getTargetAppState(page).catch(() => null);
+  const watchBaseline = baselineState ? stateBaseline(baselineState) : null;
   const turnsBefore = await getConversationTurns(page);
   const baselineLastTurnId = turnsBefore.length ? turnsBefore[turnsBefore.length - 1].testid : '';
   await sendMessage(page, message);
   await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout: 10000 }).catch(() => {});
   refreshSessionTranscript(page, args);
   appendTranscript(args.transcript, 'user', message);
-  const streamer = args.stream ? createStreamPrinter() : null;
+  const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
   const response = await waitForAssistantResponse(
     page,
     message,
@@ -1679,6 +1879,11 @@ async function main() {
     if (args.status) {
       const state = await getTargetAppState(page);
       console.log(summarizeState(state));
+      return;
+    }
+
+    if (args.watchState) {
+      await watchTargetAppState(page, args);
       return;
     }
 

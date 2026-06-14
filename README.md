@@ -38,6 +38,15 @@ node CB.js --models
 node CB.js --stop
 ```
 
+Watch target app state for orchestration:
+
+```bash
+node CB.js --watch-state --state-jsonl
+node CB.js --watch-state --wait-ready --state-jsonl --timeout 120000
+```
+
+`--watch-state` polls the live page and emits state changes. `--wait-ready` exits when a new assistant turn has completed after the watcher baseline; the final JSONL event has `"phase":"ready"` and `"ready":true`, which can be used as a trigger for another agent to consume the transcript or latest assistant output.
+
 Send a prompt and stream the answer as target app produces it:
 
 ```bash
@@ -45,6 +54,7 @@ node CB.js --message "Summarize this in three bullets"
 ```
 
 Use `--no-stream` to wait silently and print the final answer only.
+Use `--state-jsonl` with a prompt to emit structured state events while still returning the answer.
 
 Select visible UI options before sending:
 
@@ -83,4 +93,8 @@ Run `node CB.js` and use:
 - `/stop`: click a visible stop/interrupt generation control.
 - `/stream on|off`: toggle live answer streaming.
 
+`CB` is text/file-only. It recognizes target app voice/dictation controls in `/status`, but deliberately does not click `Start dictation`, `Start Voice`, or related microphone controls because the CLI cannot provide voice input.
+
 Multiline paste works directly at `CB>`. Long pasted text that target app converts into a composer attachment is surfaced through `/status`.
+
+Long Markdown prompts are matched back to target app turns with normalized text anchors, so code fences, inline backticks, ProseMirror spacing, and collapsed "show more" rendering do not block response capture.
