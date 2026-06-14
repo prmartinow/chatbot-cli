@@ -64,10 +64,10 @@ Save artifacts from the latest assistant turn:
 
 ```bash
 node CB.js --download-artifacts
-node CB.js --message "Give me a small JS example" --download-artifacts
+node CB.js --message "Give me a small JS example" --download-artifacts --show-artifacts
 ```
 
-Artifacts are written under `outputs/artifacts/<session>/<timestamp>/` and can include metadata, links, visible images, code blocks, and files exposed through download controls.
+Artifacts are written under `outputs/artifacts/<session>/<timestamp>/` and can include metadata, links, visible images, code blocks, and files exposed through download controls. Use `--show-artifacts` to print saved text/code artifacts in the terminal. If an assistant labels a code block with a preceding `FILE: name.ext` line, the CLI uses that filename instead of `code-block-N.txt`.
 
 ## Interactive Mode
 

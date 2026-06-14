@@ -18,6 +18,8 @@ const SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
 const PASTE_SETTLE_MS = 1000;
 const RESPONSE_POLL_MS = 3000;
 const RESPONSE_STABLE_FALLBACK_MS = 30000;
+const SEND_READY_TIMEOUT_MS = 120000;
+const NO_RESPONSE_RELOAD_MS = 90000;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const BRACKETED_PASTE_ON = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
@@ -62,6 +64,8 @@ Options:
   --stop          Click the visible stop/interrupt control, if target app is generating.
   --download-artifacts
                   Save artifacts from the latest assistant turn, or after the reply.
+  --show-artifacts
+                  Print saved text/code artifacts after downloading them.
   --no-stream     Wait silently and print the final response at the end.
   --help, -h      Show this help.
 
@@ -98,6 +102,7 @@ function parseArgs(argv) {
     models: false,
     stop: false,
     downloadArtifacts: false,
+    showArtifacts: false,
     stream: true,
   };
 
@@ -122,6 +127,7 @@ function parseArgs(argv) {
     else if (arg === '--models') args.models = true;
     else if (arg === '--stop') args.stop = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
+    else if (arg === '--show-artifacts') args.showArtifacts = true;
     else if (arg === '--no-stream') args.stream = false;
     else if (arg === '--help' || arg === '-h') {
       usage();
@@ -162,6 +168,36 @@ function formatSavedArtifact(item) {
   if (item.path) return `${item.type}: ${item.path}`;
   if (item.reason) return `${item.type}: ${item.reason}`;
   return `${item.type || 'artifact'}: ${JSON.stringify(item)}`;
+}
+
+function readDisplayFile(filePath, maxChars = 50000) {
+  const stat = fs.statSync(filePath);
+  if (stat.size > maxChars * 4) {
+    return `${fs.readFileSync(filePath, 'utf8').slice(0, maxChars)}\n[truncated: ${stat.size} bytes total]`;
+  }
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function printSavedArtifacts(saved) {
+  const printable = saved.filter((item) => item.path && [
+    'code',
+    'code-truncated',
+    'links',
+  ].includes(item.type));
+
+  if (!printable.length) {
+    console.log('No text/code artifacts to display.');
+    return;
+  }
+
+  for (const item of printable) {
+    console.log(`\n--- ${item.type}: ${item.path} ---`);
+    try {
+      console.log(readDisplayFile(item.path));
+    } catch (error) {
+      console.log(`[could not read artifact: ${error.message || error}]`);
+    }
+  }
 }
 
 async function readAllStdin() {
@@ -293,6 +329,30 @@ async function getSendButtonState(page) {
   }).catch(() => ({ exists: false, disabled: false, label: '' }));
 }
 
+async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
+  const start = Date.now();
+  let lastState = null;
+  let lastButton = null;
+
+  while (Date.now() - start < timeout) {
+    lastButton = await getSendButtonState(page);
+    lastState = await getTargetAppState(page).catch(() => null);
+    if (!lastButton.exists || !lastButton.disabled) {
+      return { button: lastButton, state: lastState };
+    }
+    await page.waitForTimeout(1000);
+  }
+
+  const attachmentSummary = lastState?.composer?.attachments?.length
+    ? ` Attachments: ${lastState.composer.attachments.map((item) => item.text || item.aria || item.testid).join(' | ')}.`
+    : '';
+  const longTextSummary = lastState?.composer?.textChars >= 10000
+    ? ` Composer contains long text (${lastState.composer.textChars} chars).`
+    : '';
+  const label = lastButton?.label ? ` Last send control: ${lastButton.label}.` : '';
+  throw new Error(`Prompt was not submitted because the send button stayed disabled after ${timeout}ms. Files may still be uploading or unsupported by this browser profile.${label}${attachmentSummary}${longTextSummary}`);
+}
+
 async function sendMessage(page, message) {
   const composer = await findComposer(page);
   await composer.click({ timeout: 10000 });
@@ -306,7 +366,7 @@ async function sendMessage(page, message) {
   const sendButton = await getSendButtonState(page);
   if (!sendButton.exists) return;
   if (sendButton.disabled) {
-    throw new Error('Prompt was not submitted because the send button is disabled. The attachment may still be uploading, or this browser profile may not have file-upload access.');
+    await waitForSendReady(page);
   }
 
   await page.locator('#composer-submit-button, [data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]')
@@ -317,9 +377,11 @@ async function sendMessage(page, message) {
 
 function responseAfterMessage(turns, message, baselineLastTurnId) {
   let userIndex = -1;
+  const normalizedMessage = message.trim();
   for (let i = turns.length - 1; i >= 0; i--) {
     const turn = turns[i];
-    if (turn.role === 'user' && turn.text.trim() === message.trim()) {
+    const turnText = turn.text.trim();
+    if (turn.role === 'user' && (turnText === normalizedMessage || turnText.includes(normalizedMessage))) {
       userIndex = i;
       break;
     }
@@ -334,6 +396,18 @@ function responseAfterMessage(turns, message, baselineLastTurnId) {
 
   const assistant = turns.slice(userIndex + 1).find((turn) => turn.role === 'assistant' && turn.text);
   return assistant ? assistant.text : '';
+}
+
+function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
+  const normalizedMessage = message.trim();
+  const baselineIndex = baselineLastTurnId
+    ? turns.findIndex((turn) => turn.testid === baselineLastTurnId)
+    : -1;
+  return turns.some((turn, index) => {
+    if (index <= baselineIndex || turn.role !== 'user') return false;
+    const turnText = turn.text.trim();
+    return turnText === normalizedMessage || turnText.includes(normalizedMessage);
+  });
 }
 
 async function getGenerationState(page) {
@@ -697,35 +771,65 @@ async function extractLatestAssistantFiles(page) {
       }
     }
 
-    const codeTexts = [...root.querySelectorAll('pre')]
+    const codeItems = [...root.querySelectorAll('pre')]
       .filter(isVisible)
-      .map((el) => {
+      .map((el, index) => {
         const code = el.querySelector('code');
-        return code ? (code.innerText || code.textContent || '') : (el.innerText || el.textContent || '');
+        const text = code ? (code.innerText || code.textContent || '') : (el.innerText || el.textContent || '');
+        const language = (code?.className || '').match(/language-([a-zA-Z0-9_-]+)/)?.[1] || '';
+        let suggestedName = '';
+        let cursor = el.previousElementSibling;
+        for (let i = 0; cursor && i < 5; i++) {
+          const previousText = textOf(cursor);
+          const match = previousText.match(/FILE:\s*([^\s`]+(?:\.[^\s`]+)?)/i);
+          if (match) {
+            suggestedName = match[1];
+            break;
+          }
+          cursor = cursor.previousElementSibling;
+        }
+        if (!suggestedName && language) {
+          const ext = {
+            markdown: 'md',
+            md: 'md',
+            javascript: 'js',
+            js: 'js',
+            json: 'json',
+            html: 'html',
+            xml: 'xml',
+            text: 'txt',
+            txt: 'txt',
+          }[language.toLowerCase()] || 'txt';
+          suggestedName = `code-block-${index + 1}.${ext}`;
+        }
+        return {
+          text,
+          suggestedName: suggestedName || `code-block-${index + 1}.txt`,
+        };
       })
-      .map((text) => text.trim())
-      .filter(Boolean);
-    const dedupedCodeTexts = [];
-    for (const text of codeTexts) {
-      const existingIndex = dedupedCodeTexts.findIndex((existing) => existing === text
-        || existing.endsWith(text)
-        || text.endsWith(existing));
+      .map((item) => ({ ...item, text: item.text.trim() }))
+      .filter((item) => item.text);
+    const dedupedCodeItems = [];
+    for (const item of codeItems) {
+      const existingIndex = dedupedCodeItems.findIndex((existing) => existing.text === item.text
+        || existing.text.endsWith(item.text)
+        || item.text.endsWith(existing.text));
       if (existingIndex === -1) {
-        dedupedCodeTexts.push(text);
-      } else if (text.length < dedupedCodeTexts[existingIndex].length) {
-        dedupedCodeTexts[existingIndex] = text;
+        dedupedCodeItems.push(item);
+      } else if (item.text.length < dedupedCodeItems[existingIndex].text.length) {
+        dedupedCodeItems[existingIndex] = item;
       }
     }
 
-    dedupedCodeTexts
+    dedupedCodeItems
       .slice(0, 20)
-      .forEach((text, index) => {
+      .forEach((item, index) => {
         files.push({
           type: 'code',
           index: index + 1,
-          suggestedName: `code-block-${index + 1}.txt`,
-          text: text.slice(0, 1000000),
-          truncated: text.length > 1000000,
+          suggestedName: item.suggestedName || `code-block-${index + 1}.txt`,
+          text: item.text.slice(0, 1000000),
+          truncated: item.text.length > 1000000,
         });
       });
 
@@ -973,11 +1077,19 @@ async function attachFiles(page, filePaths) {
   }
 
   const setFiles = async () => {
-    const inputs = page.locator('input[type="file"]');
-    const count = await inputs.count().catch(() => 0);
-    if (!count) return false;
-    await inputs.last().setInputFiles(resolved, { timeout: 10000 });
-    return true;
+    const selectors = [
+      'input#upload-files[type="file"]',
+      'input[type="file"]:not([accept="image/*"])',
+      'input[type="file"]',
+    ];
+    for (const selector of selectors) {
+      const inputs = page.locator(selector);
+      const count = await inputs.count().catch(() => 0);
+      if (!count) continue;
+      await inputs.first().setInputFiles(resolved, { timeout: 10000 });
+      return true;
+    }
+    return false;
   };
 
   if (!await setFiles()) {
@@ -1055,6 +1167,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   let lastText = '';
   let stableSince = 0;
   let sawResponse = false;
+  let reloadedForMissingResponse = false;
 
   while (Date.now() - start < timeout) {
     const turns = await getConversationTurns(page);
@@ -1085,11 +1198,24 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
         return finalText || lastText;
       }
 
-      if (Date.now() - stableSince >= RESPONSE_STABLE_FALLBACK_MS) {
+      if (Date.now() - stableSince >= RESPONSE_STABLE_FALLBACK_MS && !state.isGenerating) {
         return text;
       }
     } else if (onUpdate && pageState) {
       onUpdate({ text: '', state: pageState });
+    }
+
+    if (!sawResponse
+      && !reloadedForMissingResponse
+      && Date.now() - start >= NO_RESPONSE_RELOAD_MS
+      && hasUserTurnAfterBaseline(turns, message, baselineLastTurnId)
+      && sessionIdFromUrl(page.url())
+      && pageState
+      && !pageState.isGenerating) {
+      reloadedForMissingResponse = true;
+      info('[state] no assistant turn visible while UI is idle; reloading target app once');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await settlePage(page);
     }
 
     await page.waitForTimeout(sawResponse ? RESPONSE_POLL_MS : 500);
@@ -1136,6 +1262,7 @@ async function ask(page, message, args) {
   if (args.downloadArtifacts) {
     const saved = await downloadLatestArtifacts(page, args);
     info(`[artifacts] saved ${saved.length} item(s): ${saved.map(formatSavedArtifact).join(', ')}`);
+    if (args.showArtifacts) printSavedArtifacts(saved);
   }
   return response;
 }
@@ -1485,6 +1612,7 @@ async function interactive(page, args) {
     if (input.type === 'command' && input.text === '/download') {
       const saved = await downloadLatestArtifacts(page, args);
       console.log(saved.map(formatSavedArtifact).join('\n'));
+      printSavedArtifacts(saved);
       continue;
     }
     if (input.type === 'command' && input.text === '/stop') {
@@ -1569,6 +1697,7 @@ async function main() {
     if (args.downloadArtifacts && typeof args.message !== 'string') {
       const saved = await downloadLatestArtifacts(page, args);
       console.log(saved.map(formatSavedArtifact).join('\n'));
+      if (args.showArtifacts) printSavedArtifacts(saved);
       return;
     }
 
