@@ -66,6 +66,8 @@ Attach files before sending:
 
 ```bash
 node CB.js --attach ./notes.txt --message "Use the attached notes"
+node CB.js --attach ./clip.mp3 --message "Describe the audio"
+node CB.js --attach ./clip.mp4 --message "Describe the video"
 ```
 
 If the target app page accepts the file chip but keeps the send button disabled, the CLI exits with a clear error instead of waiting for the full response timeout.
@@ -75,9 +77,10 @@ Save artifacts from the latest assistant turn:
 ```bash
 node CB.js --download-artifacts
 node CB.js --message "Give me a small JS example" --download-artifacts --show-artifacts
+node CB.js --message "Generate a square image with the text CB IMAGE TEST" --download-artifacts
 ```
 
-Artifacts are written under `outputs/artifacts/<session>/<timestamp>/` and can include metadata, links, visible images, code blocks, and files exposed through download controls. Use `--show-artifacts` to print saved text/code artifacts in the terminal. If an assistant labels a code block with a preceding `FILE: name.ext` line, the CLI uses that filename instead of `code-block-N.txt`.
+Artifacts are written under `outputs/artifacts/<session>/<timestamp>/` and can include metadata, links, visible images, code blocks, and files exposed through download controls. Generated target app images are saved from the latest assistant turn as local image files. Use `--show-artifacts` to print saved text/code artifacts in the terminal. If an assistant labels a code block with a preceding `FILE: name.ext` line, the CLI uses that filename instead of `code-block-N.txt`.
 
 ## Interactive Mode
 

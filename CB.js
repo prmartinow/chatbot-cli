@@ -282,16 +282,20 @@ async function findTargetAppPage(browser) {
 
 async function getConversationTurns(page) {
   return page.evaluate(() => {
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
     return [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .map((turn, index) => {
         const roleEl = turn.matches('[data-message-author-role]')
           ? turn
           : turn.querySelector('[data-message-author-role]');
+        const role = roleEl?.getAttribute('data-message-author-role')
+          || turn.getAttribute('data-turn')
+          || '';
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
-          role: roleEl ? roleEl.getAttribute('data-message-author-role') : '',
-          text: roleEl ? roleEl.innerText.trim() : turn.innerText.trim(),
+          role,
+          text: role === 'assistant' ? textOf(turn) : textOf(roleEl || turn),
         };
       })
       .filter((turn) => turn.role && turn.text);
@@ -511,10 +515,13 @@ async function getTargetAppState(page) {
         const roleEl = turn.matches('[data-message-author-role]')
           ? turn
           : turn.querySelector('[data-message-author-role]');
+        const role = roleEl?.getAttribute('data-message-author-role')
+          || turn.getAttribute('data-turn')
+          || '';
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
-          role: roleEl ? roleEl.getAttribute('data-message-author-role') : '',
+          role,
           text: roleEl ? textOf(roleEl) : textOf(turn),
         };
       })
@@ -526,11 +533,15 @@ async function getTargetAppState(page) {
         const roleEl = turn.matches('[data-message-author-role]')
           ? turn
           : turn.querySelector('[data-message-author-role]');
-        return roleEl && roleEl.getAttribute('data-message-author-role') === 'assistant';
+        const role = roleEl?.getAttribute('data-message-author-role')
+          || turn.getAttribute('data-turn')
+          || '';
+        return role === 'assistant';
       });
 
     const scoped = latestAssistantTurn;
     const latestAssistantText = latestAssistantTurn ? textOf(latestAssistantTurn) : '';
+    const seenImageSrcs = new Set();
     const links = scoped
       ? [...scoped.querySelectorAll('a[href]')]
         .filter(isVisible)
@@ -548,6 +559,11 @@ async function getTargetAppState(page) {
           height: img.naturalHeight || img.height || 0,
         }))
         .filter((img) => img.src)
+        .filter((img) => {
+          if (seenImageSrcs.has(img.src)) return false;
+          seenImageSrcs.add(img.src);
+          return true;
+        })
         .slice(0, 50)
       : [];
     const downloadControls = scoped
@@ -870,7 +886,10 @@ async function markLatestAssistantTurn(page) {
         const roleEl = turn.matches('[data-message-author-role]')
           ? turn
           : turn.querySelector('[data-message-author-role]');
-        return roleEl && roleEl.getAttribute('data-message-author-role') === 'assistant';
+        const role = roleEl?.getAttribute('data-message-author-role')
+          || turn.getAttribute('data-turn')
+          || '';
+        return role === 'assistant';
       });
     if (!latest) return false;
     latest.setAttribute('data-cb-latest-assistant', 'true');
@@ -914,9 +933,16 @@ async function extractLatestAssistantFiles(page) {
     };
 
     const files = [];
+    const seenImageSrcs = new Set();
     const images = [...root.querySelectorAll('img[src]')]
       .filter(isVisible)
       .filter((img) => (img.naturalWidth || img.width || 0) >= 64 || (img.naturalHeight || img.height || 0) >= 64)
+      .filter((img) => {
+        const src = img.currentSrc || img.src;
+        if (!src || seenImageSrcs.has(src)) return false;
+        seenImageSrcs.add(src);
+        return true;
+      })
       .slice(0, 10);
 
     for (let i = 0; i < images.length; i++) {
