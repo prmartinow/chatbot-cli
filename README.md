@@ -34,9 +34,16 @@ Inspect the current target app page:
 
 ```bash
 node CB.js --status
+node CB.js --status --state-jsonl
 node CB.js --models
 node CB.js --stop
 ```
+
+`--models` opens the live model picker and Configure dialog, then reports the
+current header, selected composer button, visible mode rows, reasoning-effort
+flyout options, and the Configure dialog's model list. These labels are scraped
+from the current UI because model names and picker layout change over time,
+including headers such as `Latest` or `Legacy`.
 
 Watch target app state for orchestration:
 
@@ -59,8 +66,16 @@ Use `--state-jsonl` with a prompt to emit structured state events while still re
 Select visible UI options before sending:
 
 ```bash
-node CB.js --model "GPT-4o" --reasoning "Auto" --message "hello"
+node CB.js --model "5.5 Pro Extended" --message "hello"
+node CB.js --model "Thinking Heavy" --message "hello"
+printf "/model 5.5 Pro Extended\n/status\n/exit\n" | node CB.js
 ```
+
+For current target app picker shapes, model labels can include a model version,
+mode, and effort, for example `5.5 Pro Extended` or `5.5 Thinking Heavy`.
+`/status --state-jsonl` includes a lightweight `modelSelection` object and,
+when status performs the deeper picker inspection, a compact `modelConfig`
+object with the live model list and effort options.
 
 Attach files before sending:
 

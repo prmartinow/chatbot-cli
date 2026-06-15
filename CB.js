@@ -113,6 +113,7 @@ function parseArgs(argv) {
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
+    scriptedInput: null,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -683,10 +684,66 @@ async function getTargetAppState(page) {
   });
 }
 
-function summarizeState(state) {
+function compactModelConfig(config) {
+  if (!config) return null;
+  if (config.error) return { error: config.error };
+  return {
+    button: config.button || '',
+    current: {
+      label: config.current?.label || '',
+      model: config.current?.model || '',
+    },
+    modes: (config.modes || []).map((row) => ({
+      label: row.label || '',
+      mode: row.mode || '',
+      effort: row.effort || '',
+      checked: row.checked || '',
+      effortOptions: row.effortOptions || [],
+    })),
+    configureAvailable: Boolean(config.configureAvailable),
+    configure: config.configure ? {
+      title: config.configure.title || '',
+      model: config.configure.model || '',
+      modelOptions: config.configure.modelOptions || [],
+      modes: config.configure.modes || [],
+      selectedMode: config.configure.selectedMode || '',
+      effort: config.configure.effort || '',
+      effortOptions: config.configure.effortOptions || [],
+    } : null,
+  };
+}
+
+function summarizeState(state, modelConfig = null) {
   const lines = [];
+  const config = compactModelConfig(modelConfig);
   lines.push(`URL: ${state.url}`);
   lines.push(`Model: ${state.model || 'unknown'}`);
+  if (config?.error) {
+    lines.push(`Model config: unavailable (${config.error})`);
+  } else if (config) {
+    const current = config.current?.label || config.current?.model || '';
+    const selected = config.button || state.model || '';
+    const modeLabels = (config.modes || [])
+      .map((row) => {
+        if (!row.label) return '';
+        const suffix = row.effortOptions?.length ? ` (efforts: ${row.effortOptions.join(', ')})` : '';
+        return `${row.label}${suffix}`;
+      })
+      .filter(Boolean);
+    if (current || selected) {
+      lines.push(`Model config: ${[current, selected ? `selected ${selected}` : ''].filter(Boolean).join('; ')}`);
+    }
+    if (modeLabels.length) lines.push(`Model modes: ${modeLabels.join(' | ')}`);
+    if (config.configure?.modelOptions?.length) {
+      lines.push(`Available models: ${config.configure.modelOptions.join(', ')}`);
+    }
+    if (config.configure?.modes?.length) {
+      lines.push(`Configure modes: ${config.configure.modes.join(', ')}`);
+    }
+    if (config.configure?.effortOptions?.length) {
+      lines.push(`Configure effort options: ${config.configure.effortOptions.join(', ')}`);
+    }
+  }
   lines.push(`Generating: ${state.isGenerating ? 'yes' : 'no'}`);
   if (state.generationControls.length) {
     lines.push(`Generation controls: ${state.generationControls.map((item) => item.text).join(' | ')}`);
@@ -746,6 +803,8 @@ function stateBaseline(state) {
 function buildStateEvent(state, baseline = null, transcriptPath = '') {
   const latestTurn = state.lastTurns?.[state.lastTurns.length - 1] || null;
   const latestAssistant = latestTurnByRole(state, 'assistant');
+  const modelSelection = parseModelSelection(state.model || '');
+  const modelConfig = compactModelConfig(state.modelConfig || null);
   const latestAssistantSignature = turnSignature(latestAssistant);
   const assistantAdvanced = Boolean(latestAssistant && baseline && (
     latestAssistantSignature !== baseline.latestAssistantSignature
@@ -774,6 +833,13 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     title: state.title,
     transcript: transcriptPath,
     model: state.model || '',
+    modelSelection: {
+      button: state.model || '',
+      model: modelSelection.model || modelConfig?.current?.model || modelConfig?.configure?.model || '',
+      mode: modelSelection.mode || '',
+      effort: modelSelection.effort || '',
+    },
+    modelConfig,
     generating: state.isGenerating,
     generationControls: (state.generationControls || []).map((item) => item.text).filter(Boolean),
     voiceControls: (state.voiceControls || []).map((item) => item.aria || item.title || item.text || item.testid).filter(Boolean),
@@ -810,6 +876,10 @@ function stateEventKey(event) {
     event.turns.latestAssistant?.chars || 0,
     event.composer.textChars,
     event.composer.attachments.join('|'),
+    event.model,
+    event.modelSelection.model,
+    event.modelSelection.mode,
+    event.modelSelection.effort,
     event.generationControls.join('|'),
     event.activity.join('|'),
     event.artifacts.links,
@@ -827,6 +897,8 @@ function formatStateEvent(event) {
   ];
   if (event.sessionId) parts.push(`session=${event.sessionId}`);
   if (event.model) parts.push(`model=${event.model}`);
+  if (event.modelSelection.mode) parts.push(`mode=${event.modelSelection.mode}`);
+  if (event.modelSelection.effort) parts.push(`effort=${event.modelSelection.effort}`);
   if (event.generationControls.length) parts.push(`control=${event.generationControls.join(' | ')}`);
   if (event.activity.length) parts.push(`activity=${event.activity.join(' | ')}`);
   if (event.turns.latest) parts.push(`latest=${event.turns.latest.role || 'unknown'}:${event.turns.latest.chars}`);
@@ -1195,62 +1267,368 @@ async function markModelSwitcher(page) {
   });
 }
 
+async function hasOpenModelMenu(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    return [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"], [data-testid^="model-switcher-"], [data-testid="model-configure-modal"]')]
+      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure|intelligence|model)\b/i.test([
+        el.getAttribute('data-testid') || '',
+        el.getAttribute('aria-label') || '',
+        textOf(el),
+      ].join(' ')));
+  }).catch(() => false);
+}
+
+async function waitForModelMenu(page, timeout = 5000) {
+  await page.waitForFunction(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    return [...document.querySelectorAll('[role="menu"], [data-testid^="model-switcher-"], [data-testid="model-configure-modal"]')]
+      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure)\b/i.test([
+        el.getAttribute('data-testid') || '',
+        textOf(el),
+      ].join(' ')));
+  }, null, { timeout });
+}
+
 async function openModelSwitcher(page) {
+  if (await hasOpenModelMenu(page)) return 'open';
   const label = await markModelSwitcher(page);
   if (!label) return '';
   await page.locator('[data-cb-model-switcher="true"]').click({ timeout: 5000 });
-  await page.waitForTimeout(700);
+  await waitForModelMenu(page).catch(() => page.waitForTimeout(700));
   return label;
 }
 
-async function listModelOptions(page) {
-  if (!await openModelSwitcher(page)) return [];
-  const options = await page.evaluate(() => {
+function parseModelSelection(text) {
+  const normalized = normalizeModelLabel(text);
+  const modelMatch = normalized.match(/\b(?:gpt\s*)?((?:[45](?:\.\d+)?)|o\d+)\b/);
+  const effortMatch = normalized.match(/\b(light|standard|extended|heavy)\b/);
+  let mode = '';
+  if (/\binstant\b/.test(normalized)) mode = 'Instant';
+  else if (/\bthinking\b/.test(normalized)) mode = 'Thinking';
+  else if (/\bpro\b/.test(normalized)) mode = 'Pro';
+
+  return {
+    raw: text,
+    normalized,
+    model: modelMatch ? modelMatch[1] : '',
+    mode,
+    effort: effortMatch ? effortMatch[1][0].toUpperCase() + effortMatch[1].slice(1) : '',
+  };
+}
+
+function parseModeAndEffort(text) {
+  const normalized = normalizeModelLabel(text);
+  const selection = parseModelSelection(text);
+  if (!selection.mode) {
+    if (/^instant\b/.test(normalized)) selection.mode = 'Instant';
+    else if (/^thinking\b/.test(normalized)) selection.mode = 'Thinking';
+    else if (/^pro\b/.test(normalized)) selection.mode = 'Pro';
+  }
+  return selection;
+}
+
+async function getModelMenuState(page) {
+  return page.evaluate(() => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
-    const menuRoots = [...document.querySelectorAll([
-      '[role="menu"]',
-      '[role="listbox"]',
-      '[data-radix-popper-content-wrapper]',
-      '[data-headlessui-portal]',
-      '[data-testid*="model"]',
-    ].join(','))]
+    const rectOf = (el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      };
+    };
+    const modelRows = [...document.querySelectorAll('[data-testid^="model-switcher-"]')]
       .filter(isVisible)
-      .filter((el) => !el.matches('[data-testid="model-switcher-dropdown-button"]'));
+      .filter((el) => {
+        const testid = el.getAttribute('data-testid') || '';
+        return testid !== 'model-switcher-dropdown-button'
+          && !testid.includes('thinking-effort')
+          && textOf(el);
+      })
+      .map((el) => {
+        const text = textOf(el);
+        const mode = (text.match(/\b(Instant|Thinking|Pro)\b/i)?.[1] || '').replace(/^./, (s) => s.toUpperCase());
+        const effort = (text.match(/•\s*(Light|Standard|Extended|Heavy)\b/i)?.[1] || '').replace(/^./, (s) => s.toUpperCase());
+        const testid = el.getAttribute('data-testid') || '';
+        const effortButton = [...document.querySelectorAll('[data-testid]')]
+          .find((button) => (button.getAttribute('data-testid') || '') === `${testid}-thinking-effort`)
+          || el.querySelector('[data-model-picker-thinking-effort-action="true"], button[aria-label="Effort"]');
+        return {
+          label: text,
+          mode,
+          effort,
+          testid,
+          role: el.getAttribute('role') || '',
+          checked: el.getAttribute('aria-checked') || el.getAttribute('data-state') || '',
+          effortTestid: effortButton?.getAttribute('data-testid') || '',
+          rect: rectOf(el),
+        };
+      });
 
-    if (!menuRoots.length) return [];
-
-    const rawOptionTexts = menuRoots.flatMap((root) => {
-      const rootParts = textOf(root).split(/[\n•]/).map((text) => text.trim());
-      const childParts = [...root.querySelectorAll('[role="menuitem"], [role="option"], button, a, [role="button"], div')]
+    const menuRoots = [...document.querySelectorAll('[role="menu"]')]
       .filter(isVisible)
-        .map((el) => textOf(el));
-      return [...rootParts, ...childParts];
-    });
+      .filter((el) => modelRows.some((row) => el.contains(document.querySelector(`[data-testid="${row.testid}"]`))));
+    const menuRoot = menuRoots[0] || null;
+    const header = menuRoot
+      ? [...menuRoot.querySelectorAll('div,span')]
+        .filter(isVisible)
+        .map(textOf)
+        .find((text) => /^(Latest|Legacy)\s*•\s*/i.test(text) || /^(Latest|Legacy)\b/i.test(text))
+        || ''
+      : '';
+    const currentModel = header.match(/\b((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1] || '';
+    const configure = [...document.querySelectorAll('[data-testid="model-configure-modal"], [role="menuitem"]')]
+      .filter(isVisible)
+      .map((el) => ({
+        label: textOf(el),
+        testid: el.getAttribute('data-testid') || '',
+        rect: rectOf(el),
+      }))
+      .find((item) => /\bconfigure\b/i.test(item.label) || item.testid === 'model-configure-modal') || null;
 
-    const optionTexts = [];
-    for (const rawText of rawOptionTexts) {
-      const expanded = rawText
-        .replace(/\s+•\s+/g, '\n')
-        .replace(/\b(Extended)\s+(Configure\.\.\.)$/i, '$1\n$2')
-        .split('\n')
-        .map((text) => text.trim())
-        .filter(Boolean);
-      optionTexts.push(...expanded);
-    }
-
-    return optionTexts
-      .filter((text) => text && text.length <= 160)
-      .filter((text) => !/^target app$/i.test(text))
-      .filter((text) => !/\b(log in|sign up|pricing|plans)\b/i.test(text))
-      .filter((text) => !/•/.test(text))
-      .filter((text) => !/^(instant|thinking|pro)$/i.test(text))
-      .filter((text) => !/^\d+(\.\d+)?$/.test(text))
-      .filter((text, index, arr) => arr.indexOf(text) === index)
-      .slice(0, 80);
+    return {
+      current: {
+        label: header,
+        model: currentModel,
+      },
+      rows: modelRows,
+      configure,
+    };
   });
+}
+
+async function clickMarkedVisibleOption(page, label, options = {}) {
+  const marked = await page.evaluate(({ label: rawLabel, preferPopup }) => {
+    const label = String(rawLabel || '').trim().toLowerCase();
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    document.querySelectorAll('[data-cb-visible-option]').forEach((el) => {
+      el.removeAttribute('data-cb-visible-option');
+    });
+    const candidates = [...document.querySelectorAll('[role="option"], [role="menuitemradio"], [role="menuitem"], [role="radio"], button, [role="button"], div')]
+      .filter(isVisible)
+      .map((el) => {
+        const text = textOf(el);
+        const exact = text.toLowerCase() === label;
+        const starts = text.toLowerCase().startsWith(`${label} `);
+        const contains = text.toLowerCase().includes(label);
+        if (!exact && !starts && !contains) return null;
+        const rect = el.getBoundingClientRect();
+        let score = 0;
+        if (exact) score += 100;
+        else if (starts) score += 60;
+        else if (contains) score += 20;
+        if (/^(option|menuitemradio|menuitem|radio)$/i.test(el.getAttribute('role') || '')) score += 50;
+        if (el.closest('[role="menu"], [role="listbox"], [role="dialog"]')) score += 20;
+        if (preferPopup && rect.x > 1000) score += 20;
+        if (text.length > 120) score -= 50;
+        return { el, score };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    if (!best) return false;
+    best.el.setAttribute('data-cb-visible-option', 'true');
+    return true;
+  }, { label, preferPopup: Boolean(options.preferPopup) });
+
+  if (!marked) return false;
+  await page.locator('[data-cb-visible-option="true"]').first().click({ timeout: 5000 });
+  await page.waitForTimeout(500);
+  return true;
+}
+
+async function readVisibleChoiceOptions(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    return [...document.querySelectorAll('[role="menuitemradio"], [role="option"]')]
+      .filter(isVisible)
+      .map(textOf)
+      .filter((text) => text && text.length <= 80)
+      .filter((text, index, arr) => arr.indexOf(text) === index);
+  });
+}
+
+async function readEffortOptionsForRow(page, row) {
+  if (!row?.testid || !row.effortTestid) return [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await openModelSwitcher(page);
+    await page.locator(`[data-testid="${row.testid}"]`).hover({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(150);
+    const effortButton = page.locator(`[data-testid="${row.effortTestid}"]`).first();
+    if (!await effortButton.count().catch(() => 0)) return [];
+    await effortButton.click({ timeout: 5000, force: true });
+    await page.waitForTimeout(300);
+    const options = (await readVisibleChoiceOptions(page))
+      .filter((option) => /^(Light|Standard|Extended|Heavy)$/i.test(option));
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(200);
+    if (options.length) return options;
+  }
+  return [];
+}
+
+async function setEffortForMenuRow(page, row, effort) {
+  if (!row?.testid || !row.effortTestid) throw new Error(`No effort control found for ${row?.label || 'model row'}`);
+  await openModelSwitcher(page);
+  await page.locator(`[data-testid="${row.testid}"]`).hover({ timeout: 5000 });
+  await page.waitForTimeout(150);
+  await page.locator(`[data-testid="${row.effortTestid}"]`).click({ timeout: 5000, force: true });
+  await page.waitForTimeout(300);
+  if (!await clickMarkedVisibleOption(page, effort, { preferPopup: true })) {
+    throw new Error(`No visible effort option matching: ${effort}`);
+  }
+}
+
+async function openConfigureModalFromMenu(page) {
+  const dialog = page.locator('[role="dialog"]').filter({ hasText: /Intelligence|Model/i }).first();
+  if (await dialog.isVisible().catch(() => false)) return;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await openModelSwitcher(page);
+    const configure = page.locator('[data-testid="model-configure-modal"]').first();
+    let clicked = false;
+    if (await configure.isVisible().catch(() => false)) {
+      clicked = await configure.click({ timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
+    } else if (!await clickMarkedVisibleOption(page, 'Configure...')) {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(250);
+      continue;
+    } else {
+      clicked = true;
+    }
+    if (!clicked) {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(250);
+      continue;
+    }
+    await dialog.waitFor({ state: 'visible', timeout: 5000 });
+    await page.waitForTimeout(300);
+    return;
+  }
+  throw new Error('No Configure option found in model picker');
+}
+
+async function getConfigureModalState(page, includeDropdowns = false) {
+  const modal = await page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const dialog = [...document.querySelectorAll('[role="dialog"]')]
+      .find((el) => isVisible(el) && /\b(Intelligence|Model)\b/i.test(textOf(el)));
+    if (!dialog) return null;
+    const combos = [...dialog.querySelectorAll('[role="combobox"], button')]
+      .filter(isVisible)
+      .map((el) => ({ text: textOf(el), role: el.getAttribute('role') || '' }))
+      .filter((item) => item.text && item.text.length <= 80);
+    const radios = [...dialog.querySelectorAll('[role="radio"], button')]
+      .filter(isVisible)
+      .map((el) => ({
+        text: textOf(el),
+        checked: el.getAttribute('aria-checked') || el.getAttribute('data-state') || '',
+      }))
+      .filter((item) => /\b(Instant|Thinking|Pro)\b/i.test(item.text));
+    const model = combos.find((item) => /\b(?:[45](?:\.\d+)?|o\d+)\b/i.test(item.text))?.text || '';
+    const effort = [...combos].reverse().find((item) => /\b(Light|Standard|Extended|Heavy)\b/i.test(item.text))?.text || '';
+    return {
+      title: textOf(dialog.querySelector('h1,h2,header') || dialog).slice(0, 80),
+      model,
+      modes: radios.map((item) => item.text.replace(/\s+For\b.*$/i, '').trim()).filter(Boolean),
+      selectedMode: radios.find((item) => /^(true|checked|on)$/i.test(item.checked))?.text.replace(/\s+For\b.*$/i, '').trim() || '',
+      effort,
+    };
+  });
+
+  if (!modal || !includeDropdowns) return modal;
+
+  const modelOptions = [];
+  const effortOptions = [];
+  const modelCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
+    .filter({ hasText: /\b(?:[45](?:\.\d+)?|o\d+)\b/ }).first();
+  if (await modelCombo.count().catch(() => 0)) {
+    await modelCombo.click({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    modelOptions.push(...(await readVisibleChoiceOptions(page)).filter((option) => /\b(?:[45](?:\.\d+)?|o\d+)\b/i.test(option)));
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(200);
+  }
+  const effortCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
+    .filter({ hasText: /\b(Light|Standard|Extended|Heavy)\b/ }).last();
+  if (await effortCombo.count().catch(() => 0)) {
+    await effortCombo.click({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    effortOptions.push(...(await readVisibleChoiceOptions(page)).filter((option) => /^(Light|Standard|Extended|Heavy)$/i.test(option)));
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(200);
+  }
+
+  return {
+    ...modal,
+    modelOptions: [...new Set(modelOptions)],
+    effortOptions: [...new Set(effortOptions)],
+  };
+}
+
+async function inspectModelConfigurator(page, options = {}) {
+  await openModelSwitcher(page);
+  const menu = await getModelMenuState(page);
+  const buttonState = await getTargetAppState(page).catch(() => null);
+  const result = {
+    button: buttonState?.model || '',
+    current: menu.current,
+    modes: menu.rows,
+    configureAvailable: Boolean(menu.configure),
+  };
+
+  if (options.includeDetails) {
+    for (const row of result.modes) {
+      row.effortOptions = await readEffortOptionsForRow(page, row);
+    }
+    await openConfigureModalFromMenu(page);
+    result.configure = await getConfigureModalState(page, true);
+    if (result.configure?.effortOptions?.length) {
+      const selectedMode = normalizeModelLabel(result.configure.selectedMode);
+      const selectedRow = result.modes.find((row) => row.checked === 'true'
+        || selectedMode.includes(normalizeModelLabel(row.mode)));
+      if (selectedRow && !selectedRow.effortOptions.length) {
+        selectedRow.effortOptions = result.configure.effortOptions;
+      }
+    }
+  }
+
   await page.keyboard.press('Escape').catch(() => {});
-  return options;
+  await page.keyboard.press('Escape').catch(() => {});
+  return result;
+}
+
+async function listModelOptions(page) {
+  const config = await inspectModelConfigurator(page, { includeDetails: true });
+  const lines = [];
+  if (config.current?.label) lines.push(`Current: ${config.current.label}`);
+  if (config.button) lines.push(`Selected: ${config.button}`);
+  for (const row of config.modes || []) {
+    const suffix = row.effortOptions?.length ? ` (efforts: ${row.effortOptions.join(', ')})` : '';
+    lines.push(`${row.label}${suffix}`);
+  }
+  if (config.configureAvailable) lines.push('Configure...');
+  if (config.configure?.modelOptions?.length) {
+    lines.push(`Configure models: ${config.configure.modelOptions.join(', ')}`);
+  }
+  if (config.configure?.modes?.length) {
+    lines.push(`Configure modes: ${config.configure.modes.join(', ')}`);
+  }
+  if (config.configure?.effortOptions?.length) {
+    lines.push(`Configure effort options: ${config.configure.effortOptions.join(', ')}`);
+  }
+  return lines.filter((line, index, arr) => arr.indexOf(line) === index);
 }
 
 async function listReasoningOptions(page) {
@@ -1260,24 +1638,98 @@ async function listReasoningOptions(page) {
     .filter(Boolean);
 }
 
+function normalizeModelLabel(text) {
+  return String(text || '')
+    .replace(/\u2022/g, ' ')
+    .replace(/[^a-zA-Z0-9.]+/g, ' ')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
 async function clickOptionByText(page, text) {
-  const option = page.getByText(text, { exact: false }).first();
-  await option.click({ timeout: 5000 });
+  if (await clickMarkedVisibleOption(page, text)) return;
+  throw new Error(`No visible option matching: ${text}`);
+}
+
+async function selectInConfigureModal(page, selection) {
+  await openConfigureModalFromMenu(page);
+
+  if (selection.model) {
+    const modelCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
+      .filter({ hasText: /\b(?:[45](?:\.\d+)?|o\d+)\b/ }).first();
+    if (!await modelCombo.count().catch(() => 0)) throw new Error('No model dropdown found in Configure modal');
+    await modelCombo.click({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    if (!await clickMarkedVisibleOption(page, selection.model, { preferPopup: true })) {
+      throw new Error(`No model option matching: ${selection.model}`);
+    }
+  }
+
+  if (selection.mode) {
+    const modeClicked = await clickMarkedVisibleOption(page, selection.mode);
+    if (!modeClicked) throw new Error(`No mode option matching: ${selection.mode}`);
+  }
+
+  if (selection.effort) {
+    const effortCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
+      .filter({ hasText: /\b(Light|Standard|Extended|Heavy)\b/ }).last();
+    if (!await effortCombo.count().catch(() => 0)) throw new Error('No effort dropdown found in Configure modal');
+    await effortCombo.click({ timeout: 5000 });
+    await page.waitForTimeout(300);
+    if (!await clickMarkedVisibleOption(page, selection.effort, { preferPopup: true })) {
+      throw new Error(`No effort option matching: ${selection.effort}`);
+    }
+  }
+
+  await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(500);
 }
 
 async function selectModel(page, label) {
+  const selection = parseModelSelection(label);
   if (!await openModelSwitcher(page)) throw new Error('No visible model picker found');
-  await clickOptionByText(page, label);
+  let state = await getModelMenuState(page);
+  const currentModel = state.current?.model || '';
+  const needsConfigure = Boolean(selection.model && (!currentModel || selection.model !== currentModel));
+  if (needsConfigure) {
+    await selectInConfigureModal(page, selection);
+    return;
+  }
+
+  const targetMode = selection.mode
+    || (selection.effort ? parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '').mode : '');
+  const row = targetMode
+    ? state.rows.find((item) => item.mode.toLowerCase() === targetMode.toLowerCase())
+    : state.rows.find((item) => normalizeModelLabel(item.label).includes(selection.normalized));
+
+  if (!row) {
+    if (selection.model || selection.mode || selection.effort) {
+      await selectInConfigureModal(page, selection);
+      return;
+    }
+    await clickOptionByText(page, label);
+    return;
+  }
+
+  if (selection.effort && row.effort.toLowerCase() !== selection.effort.toLowerCase()) {
+    await setEffortForMenuRow(page, row, selection.effort);
+    await openModelSwitcher(page);
+    state = await getModelMenuState(page);
+  }
+
+  const freshRow = state.rows.find((item) => item.testid === row.testid) || row;
+  await page.locator(`[data-testid="${freshRow.testid}"]`).first().click({ timeout: 5000 });
+  await page.waitForTimeout(700);
 }
 
 async function selectReasoning(page, label) {
-  const state = await getTargetAppState(page);
-  const control = state.reasoningControls.find((item) => /reasoning|think|extended|fast|auto/i.test([item.text, item.aria, item.title, item.testid].join(' ')));
-  if (!control) throw new Error('No visible reasoning control found');
-  await page.getByText(control.text || control.aria || control.title || control.testid, { exact: false }).first().click({ timeout: 5000 });
-  await page.waitForTimeout(500);
-  await clickOptionByText(page, label);
+  const selection = parseModelSelection(label);
+  if (!selection.mode && selection.effort) {
+    const state = await getTargetAppState(page).catch(() => null);
+    selection.mode = parseModeAndEffort(state?.model || '').mode;
+  }
+  await selectModel(page, [selection.mode, selection.effort].filter(Boolean).join(' ') || label);
 }
 
 async function attachFiles(page, filePaths) {
@@ -1491,6 +1943,16 @@ async function ask(page, message, args) {
     if (args.showArtifacts) printSavedArtifacts(saved);
   }
   return response;
+}
+
+async function inspectStatusModelConfig(page) {
+  try {
+    return await inspectModelConfigurator(page, { includeDetails: true });
+  } catch (error) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+    return { error: error.message || String(error) };
+  }
 }
 
 function drainReadable(stream) {
@@ -1718,6 +2180,22 @@ function readPromptInput(prompt) {
   });
 }
 
+function parseScriptedInputs(text) {
+  const body = String(text || '').trim();
+  if (!body) return [];
+  const lines = body.split(/\r?\n/);
+  const hasCommands = lines.some((line) => isInteractiveCommand(line.trim()));
+  if (!hasCommands) return [{ type: 'message', text: body }];
+
+  return lines
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => ({
+      type: isInteractiveCommand(line) ? 'command' : 'message',
+      text: line,
+    }));
+}
+
 function readMultilineInput() {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1770,9 +2248,13 @@ async function interactive(page, args) {
   console.log(`Transcript: ${args.transcript}`);
   console.log('Type /exit to quit. Use /status, /models, /attach <path>, /artifacts, or /stream off. Multiline paste works at CB>.');
   let pendingAttachments = [];
+  const scriptedInputs = args.scriptedInput === null ? null : parseScriptedInputs(args.scriptedInput);
 
   while (true) {
-    const input = await readPromptInput('CB> ');
+    const input = scriptedInputs
+      ? scriptedInputs.shift() || { type: 'command', text: '/exit' }
+      : await readPromptInput('CB> ');
+    if (scriptedInputs) console.log(`CB> ${input.text}`);
 
     if (input.type === 'command' && (input.text === '/exit' || input.text === '/quit')) break;
     if (input.type === 'command' && input.text === '/transcript') {
@@ -1781,7 +2263,8 @@ async function interactive(page, args) {
     }
     if (input.type === 'command' && input.text === '/status') {
       const state = await getTargetAppState(page);
-      console.log(summarizeState(state));
+      const modelConfig = await inspectStatusModelConfig(page);
+      console.log(summarizeState(state, modelConfig));
       continue;
     }
     if (input.type === 'command' && input.text === '/models') {
@@ -1894,6 +2377,8 @@ async function main() {
 
   if (args.message === '-') {
     args.message = await readAllStdin();
+  } else if (!args.message && !process.stdin.isTTY) {
+    args.scriptedInput = await readAllStdin();
   }
 
   const browser = await chromium.connectOverCDP(args.cdp);
@@ -1904,7 +2389,13 @@ async function main() {
 
     if (args.status) {
       const state = await getTargetAppState(page);
-      console.log(summarizeState(state));
+      const modelConfig = await inspectStatusModelConfig(page);
+      state.modelConfig = compactModelConfig(modelConfig);
+      if (args.stateJsonl) {
+        console.log(JSON.stringify(buildStateEvent(state, null, args.transcript || '')));
+      } else {
+        console.log(summarizeState(state, modelConfig));
+      }
       return;
     }
 
