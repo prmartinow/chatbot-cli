@@ -282,25 +282,38 @@ async function findTargetAppPage(browser) {
 }
 
 async function getConversationTurns(page) {
-  return page.evaluate(() => {
+  const turns = await page.evaluate(() => {
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
     return [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .map((turn, index) => {
-        const roleEl = turn.matches('[data-message-author-role]')
-          ? turn
-          : turn.querySelector('[data-message-author-role]');
-        const role = roleEl?.getAttribute('data-message-author-role')
+        const roleEls = turn.matches('[data-message-author-role]')
+          ? [turn]
+          : [...turn.querySelectorAll('[data-message-author-role]')];
+        const role = roleEls[0]?.getAttribute('data-message-author-role')
           || turn.getAttribute('data-turn')
           || '';
+        const roleTexts = roleEls.map(textOf).filter(Boolean);
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
           role,
-          text: role === 'assistant' ? textOf(turn) : textOf(roleEl || turn),
+          text: roleTexts[0] || textOf(turn),
+          roleTexts,
+          turnText: textOf(turn),
         };
       })
-      .filter((turn) => turn.role && turn.text);
+      .filter((turn) => turn.role && (turn.text || turn.turnText));
   });
+  return turns
+    .map((turn) => ({
+      index: turn.index,
+      testid: turn.testid,
+      role: turn.role,
+      text: turn.role === 'assistant'
+        ? assistantResponseText(turn.roleTexts?.length ? turn.roleTexts : turn.text, turn.turnText)
+        : turn.text,
+    }))
+    .filter((turn) => turn.role && turn.text);
 }
 
 async function getAssistantTurns(page) {
@@ -414,7 +427,8 @@ function responseAfterMessage(turns, message, baselineLastTurnId) {
 
   if (userIndex === -1) return '';
 
-  const assistant = turns.slice(userIndex + 1).find((turn) => turn.role === 'assistant' && turn.text);
+  const assistant = turns.slice(userIndex + 1)
+    .find((turn) => turn.role === 'assistant' && turn.text && !isProgressOnlyText(turn.text));
   return assistant ? assistant.text : '';
 }
 
@@ -430,6 +444,48 @@ function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
 
 function normalizeTurnText(text) {
   return (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isProgressOnlyText(text) {
+  const normalized = normalizeTurnText(text).replace(/[.。…]+$/g, '').trim();
+  if (!normalized) return true;
+  if (normalized.length > 180) return false;
+
+  return /^(targetapp|(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
+    || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
+    || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
+    || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
+}
+
+function stripLeadingProgressPrefix(text) {
+  const normalized = normalizeTurnText(text);
+  const thought = normalized.match(/^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?\s+(.+)$/i);
+  if (thought && !isProgressOnlyText(thought[1])) return thought[1].trim();
+  return normalized;
+}
+
+function substantiveAssistantTexts(roleTexts) {
+  const texts = (Array.isArray(roleTexts) ? roleTexts : [roleTexts])
+    .map(normalizeTurnText)
+    .filter((text) => text && !isProgressOnlyText(text));
+  const deduped = [];
+  for (const text of texts) {
+    const existingIndex = deduped.findIndex((existing) => existing === text
+      || existing.includes(text)
+      || text.includes(existing));
+    if (existingIndex === -1) {
+      deduped.push(text);
+    } else if (text.length > deduped[existingIndex].length) {
+      deduped[existingIndex] = text;
+    }
+  }
+  return deduped;
+}
+
+function assistantResponseText(roleTexts, turnText) {
+  const substantive = substantiveAssistantTexts(roleTexts);
+  if (substantive.length) return substantive.join('\n\n');
+  return stripLeadingProgressPrefix(turnText);
 }
 
 function turnMatchesMessage(turnText, message) {
@@ -477,6 +533,39 @@ async function getTargetAppState(page) {
   return page.evaluate(() => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const isProgressOnly = (text) => {
+      const normalized = (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().replace(/[.。…]+$/g, '').trim();
+      if (!normalized) return true;
+      if (normalized.length > 180) return false;
+      return /^(targetapp|(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
+        || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
+        || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
+        || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
+    };
+    const stripProgressPrefix = (text) => {
+      const normalized = (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const thought = normalized.match(/^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?\s+(.+)$/i);
+      if (thought && !isProgressOnly(thought[1])) return thought[1].trim();
+      return normalized;
+    };
+    const assistantTextOf = (roleTexts, turnText) => {
+      const deduped = [];
+      for (const text of roleTexts.map((item) => (item || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean)) {
+        if (isProgressOnly(text)) continue;
+        const existingIndex = deduped.findIndex((existing) => existing === text
+          || existing.includes(text)
+          || text.includes(existing));
+        if (existingIndex === -1) {
+          deduped.push(text);
+        } else if (text.length > deduped[existingIndex].length) {
+          deduped[existingIndex] = text;
+        }
+      }
+      return deduped.length ? deduped.join('\n\n') : stripProgressPrefix(turnText);
+    };
+    const roleElsOf = (turn) => (turn.matches('[data-message-author-role]')
+      ? [turn]
+      : [...turn.querySelectorAll('[data-message-author-role]')]);
     const controlText = (el) => [
       el.getAttribute('data-testid') || '',
       el.getAttribute('aria-label') || '',
@@ -513,17 +602,21 @@ async function getTargetAppState(page) {
 
     const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .map((turn, index) => {
-        const roleEl = turn.matches('[data-message-author-role]')
-          ? turn
-          : turn.querySelector('[data-message-author-role]');
-        const role = roleEl?.getAttribute('data-message-author-role')
+        const roleEls = roleElsOf(turn);
+        const role = roleEls[0]?.getAttribute('data-message-author-role')
           || turn.getAttribute('data-turn')
           || '';
+        const roleTexts = roleEls.map(textOf).filter(Boolean);
+        const turnText = textOf(turn);
+        const text = role === 'assistant'
+          ? assistantTextOf(roleTexts, turnText)
+          : (roleTexts[0] || turnText);
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
           role,
-          text: roleEl ? textOf(roleEl) : textOf(turn),
+          text,
+          roleNodeCount: roleTexts.length,
         };
       })
       .filter((turn) => turn.role || turn.text);
@@ -531,17 +624,16 @@ async function getTargetAppState(page) {
     const latestAssistantTurn = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .reverse()
       .find((turn) => {
-        const roleEl = turn.matches('[data-message-author-role]')
-          ? turn
-          : turn.querySelector('[data-message-author-role]');
-        const role = roleEl?.getAttribute('data-message-author-role')
+        const roleEls = roleElsOf(turn);
+        const role = roleEls[0]?.getAttribute('data-message-author-role')
           || turn.getAttribute('data-turn')
           || '';
         return role === 'assistant';
       });
 
     const scoped = latestAssistantTurn;
-    const latestAssistantText = latestAssistantTurn ? textOf(latestAssistantTurn) : '';
+    const latestAssistantRoleTexts = latestAssistantTurn ? roleElsOf(latestAssistantTurn).map(textOf).filter(Boolean) : [];
+    const latestAssistantText = latestAssistantTurn ? assistantTextOf(latestAssistantRoleTexts, textOf(latestAssistantTurn)) : '';
     const seenImageSrcs = new Set();
     const links = scoped
       ? [...scoped.querySelectorAll('a[href]')]
@@ -632,7 +724,7 @@ async function getTargetAppState(page) {
       .filter(isVisible)
       .map(textOf)
       .filter((text) => text && text.length <= 180)
-      .filter((text) => /\b(thinking|thought|reasoning|searching|searched|browsing|reading|analyzing|working|creating|generating|running|tool|uploading|attached)\b/i.test(text))
+      .filter((text) => /\b(thinking|thought|reasoning|searching|searched|browsing|reading|analyzing|working|creating|generating|running|tool|uploading|processing|finalizing|attached)\b/i.test(text))
       .filter((text, index, arr) => arr.indexOf(text) === index)
       .slice(-20);
 
@@ -667,6 +759,7 @@ async function getTargetAppState(page) {
         index: turn.index,
         testid: turn.testid,
         role: turn.role,
+        roleNodeCount: turn.roleNodeCount || 0,
         chars: turn.text.length,
         preview: turn.text.slice(0, 240),
       })),
@@ -779,6 +872,7 @@ function compactTurn(turn) {
     index: turn.index,
     testid: turn.testid,
     role: turn.role,
+    roleNodeCount: turn.roleNodeCount || 0,
     chars: turn.chars,
     preview: turn.preview,
   };
@@ -811,11 +905,20 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     || latestAssistant.chars > baseline.latestAssistantChars
     || latestAssistant.index > baseline.latestTurnIndex
   ));
-  const ready = Boolean(!state.isGenerating && assistantAdvanced);
+  const progressOnlyAssistant = Boolean(assistantAdvanced
+    && isProgressOnlyText(latestAssistant?.preview || state.latestAssistant?.preview || ''));
+  const progressActivityWithoutAssistant = Boolean(!assistantAdvanced
+    && latestTurn?.role !== 'assistant'
+    && (state.activityTexts || []).some(isProgressOnlyText));
+  const activeProgress = Boolean(state.isGenerating
+    || state.generationControls?.length
+    || progressOnlyAssistant
+    || progressActivityWithoutAssistant);
+  const ready = Boolean(!activeProgress && assistantAdvanced);
   const composerBusy = Boolean(state.composer?.textChars || state.composer?.attachments?.length);
   const phase = ready
     ? 'ready'
-    : state.isGenerating
+    : activeProgress
       ? 'generating'
       : latestTurn?.role === 'user'
         ? 'waiting'
@@ -1821,8 +1924,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   while (Date.now() - start < timeout) {
     const turns = await getConversationTurns(page);
     const text = responseAfterMessage(turns, message, baselineLastTurnId);
-    const lower = text.toLowerCase();
-    const placeholder = !text || lower === 'targetapp' || lower === 'thinking';
+    const placeholder = !text || isProgressOnlyText(text);
     const pageState = await getTargetAppState(page).catch(() => null);
 
     if (!placeholder) {

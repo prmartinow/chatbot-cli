@@ -53,6 +53,8 @@ node CB.js --watch-state --wait-ready --state-jsonl --timeout 120000
 ```
 
 `--watch-state` polls the live page and emits state changes. `--wait-ready` exits when a new assistant turn has completed after the watcher baseline; the final JSONL event has `"phase":"ready"` and `"ready":true`, which can be used as a trigger for another agent to consume the transcript or latest assistant output.
+Progress-only assistant text such as `Finalizing answer`, `Thinking`, or `Thought for ...` is treated as in-flight state, not as a completed answer or transcript export.
+When target app renders multiple assistant message nodes inside one turn, CB stitches the substantive nodes and ignores progress-only placeholders, so short prefaces do not hide the final answer.
 
 Send a prompt and stream the answer as target app produces it:
 
