@@ -37,6 +37,8 @@ node CB.js --status
 node CB.js --status --state-jsonl
 node CB.js --models
 node CB.js --stop
+node CB.js --latest-assistant
+node CB.js --sync-transcript
 ```
 
 `--models` opens the live model picker and Configure dialog, then reports the
@@ -55,6 +57,20 @@ node CB.js --watch-state --wait-ready --state-jsonl --timeout 120000
 `--watch-state` polls the live page and emits state changes. `--wait-ready` exits when a new assistant turn has completed after the watcher baseline; the final JSONL event has `"phase":"ready"` and `"ready":true`, which can be used as a trigger for another agent to consume the transcript or latest assistant output.
 Progress-only assistant text such as `Finalizing answer`, `Thinking`, or `Thought for ...` is treated as in-flight state, not as a completed answer or transcript export.
 When target app renders multiple assistant message nodes inside one turn, CB stitches the substantive nodes and ignores progress-only placeholders, so short prefaces do not hide the final answer.
+Every CB invocation reconciles the active target app DOM into the session transcript and updates the conversation index before doing new work. If a prior `--message` process timed out or was killed after the user prompt was accepted, run `--sync-transcript` once the browser shows the completed answer. This appends any missing completed DOM turns to the session transcript, marks matching pending rounds recovered, and updates the index. Use `--latest-assistant` when another agent needs the full latest response text instead of the short `/status` preview.
+
+Schedule sequential work:
+
+```bash
+node CB.js --schedule --new-conversation --alias research-a --message "Start the analysis"
+node CB.js --schedule --conversation research-a --message "Follow up after the first answer"
+node CB.js --run-queue --cdp http://127.0.0.1:9241
+node CB.js --queue-status
+```
+
+`--run-queue` processes scheduled prompts in global queue order. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
+
+Scheduler and conversation state is private output data under `outputs/scheduler/`: `queue.json`, `conversation-index.json`, and `rounds.json` are the readable current state, while their `.jsonl` companions are append-only event journals.
 
 Send a prompt and stream the answer as target app produces it:
 
@@ -70,6 +86,8 @@ Select visible UI options before sending:
 ```bash
 node CB.js --model "5.5 Pro Extended" --message "hello"
 node CB.js --model "Thinking Heavy" --message "hello"
+node CB.js --conversation 6a3338bc-81a0-83ec-a28f-28a763a2bc1b --message "Follow up in this session"
+node CB.js --new-conversation --alias scratch-a --message "Start a fresh session and index it"
 printf "/model 5.5 Pro Extended\n/status\n/exit\n" | node CB.js
 ```
 

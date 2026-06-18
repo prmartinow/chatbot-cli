@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 
 function loadPlaywright() {
   const override = process.env.CHATBOT_PLAYWRIGHT_CORE_PATH;
@@ -21,6 +22,14 @@ const RESPONSE_STABLE_FALLBACK_MS = 30000;
 const SEND_READY_TIMEOUT_MS = 120000;
 const NO_RESPONSE_RELOAD_MS = 90000;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
+const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
+const QUEUE_STATE_PATH = path.join(SCHEDULER_DIR, 'queue.json');
+const QUEUE_EVENTS_PATH = path.join(SCHEDULER_DIR, 'queue.jsonl');
+const CONVERSATION_INDEX_PATH = path.join(SCHEDULER_DIR, 'conversation-index.json');
+const CONVERSATION_EVENTS_PATH = path.join(SCHEDULER_DIR, 'conversation-index.jsonl');
+const ROUND_STATE_PATH = path.join(SCHEDULER_DIR, 'rounds.json');
+const ROUND_EVENTS_PATH = path.join(SCHEDULER_DIR, 'rounds.jsonl');
+const SCHEDULER_LOCK_PATH = path.join(SCHEDULER_DIR, '.lock');
 const BRACKETED_PASTE_ON = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
 const PASTE_START = '\x1b[200~';
@@ -65,6 +74,19 @@ Options:
   --state-jsonl   Emit state updates as JSON Lines instead of human text.
   --state-interval
                   Poll interval in ms for state watching. Default: ${RESPONSE_POLL_MS}
+  --sync-transcript
+                  Append any completed live DOM turns missing from the session transcript.
+  --latest-assistant
+                  Print the full latest assistant response from the live DOM, then exit.
+  --schedule      Enqueue --message for later sequential execution, then exit.
+  --run-queue     Run scheduled prompts sequentially, waiting for each answer.
+  --queue-watch   With --run-queue, keep polling for newly scheduled jobs.
+  --queue-status  Print scheduled job and conversation-index state, then exit.
+  --queue-limit   With --run-queue, stop after this many jobs. Default: all.
+  --conversation  Target session id or scheduled alias. Use "current" for the active tab.
+  --new-conversation
+                  Start a new target app conversation before the prompt.
+  --alias         Alias to assign to a new or existing conversation in the scheduler index.
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
   --download-artifacts
@@ -108,6 +130,16 @@ function parseArgs(argv) {
     waitReady: false,
     stateJsonl: false,
     stateInterval: RESPONSE_POLL_MS,
+    syncTranscript: false,
+    latestAssistant: false,
+    schedule: false,
+    runQueue: false,
+    queueWatch: false,
+    queueStatus: false,
+    queueLimit: 0,
+    conversation: '',
+    newConversation: false,
+    alias: '',
     models: false,
     stop: false,
     downloadArtifacts: false,
@@ -138,6 +170,16 @@ function parseArgs(argv) {
     else if (arg === '--wait-ready') args.waitReady = true;
     else if (arg === '--state-jsonl') args.stateJsonl = true;
     else if (arg === '--state-interval') args.stateInterval = Number(next());
+    else if (arg === '--sync-transcript') args.syncTranscript = true;
+    else if (arg === '--latest-assistant') args.latestAssistant = true;
+    else if (arg === '--schedule') args.schedule = true;
+    else if (arg === '--run-queue') args.runQueue = true;
+    else if (arg === '--queue-watch') args.queueWatch = true;
+    else if (arg === '--queue-status') args.queueStatus = true;
+    else if (arg === '--queue-limit') args.queueLimit = Number(next());
+    else if (arg === '--conversation') args.conversation = next();
+    else if (arg === '--new-conversation') args.newConversation = true;
+    else if (arg === '--alias') args.alias = next();
     else if (arg === '--models') args.models = true;
     else if (arg === '--stop') args.stop = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -157,7 +199,11 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.stateInterval) || args.stateInterval <= 0) {
     throw new Error('--state-interval must be a positive number');
   }
+  if (!Number.isFinite(args.queueLimit) || args.queueLimit < 0) {
+    throw new Error('--queue-limit must be zero or a positive number');
+  }
   if (args.waitReady) args.watchState = true;
+  if (args.queueWatch) args.runQueue = true;
 
   if (args.transcript) args.transcript = path.resolve(args.transcript);
   args.attachments = args.attachments.map((filePath) => path.resolve(filePath));
@@ -237,6 +283,88 @@ function appendTranscript(filePath, role, text) {
   fs.appendFileSync(filePath, entry, 'utf8');
 }
 
+function parseTranscriptEntries(text) {
+  const matches = [...String(text || '').matchAll(/^\[([^\]]+)\] (USER|ASSISTANT)\n/gm)];
+  return matches.map((match, index) => {
+    const contentStart = match.index + match[0].length;
+    const contentEnd = index + 1 < matches.length ? matches[index + 1].index : text.length;
+    return {
+      at: match[1],
+      role: match[2].toLowerCase(),
+      text: text.slice(contentStart, contentEnd).replace(/\s+$/g, ''),
+    };
+  }).filter((entry) => entry.role && entry.text);
+}
+
+function transcriptEntryMatchesTurn(entry, turn) {
+  if (!entry || !turn || entry.role !== turn.role) return false;
+  if (entry.role === 'assistant' && isProgressOnlyText(entry.text)) return false;
+  return turnMatchesMessage(turn.text, entry.text);
+}
+
+function findTranscriptSyncStart(entries, turns) {
+  if (!entries.length) return 0;
+
+  for (let entryIndex = entries.length - 1; entryIndex >= 0; entryIndex--) {
+    const entry = entries[entryIndex];
+    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex--) {
+      if (transcriptEntryMatchesTurn(entry, turns[turnIndex])) return turnIndex + 1;
+    }
+  }
+
+  return -1;
+}
+
+function transcriptAlreadyHasTurn(entries, turn) {
+  return entries.some((entry) => entry.role === turn.role && turnMatchesMessage(turn.text, entry.text));
+}
+
+async function syncTranscriptFromPage(page, args) {
+  refreshSessionTranscript(page, args);
+  ensureTranscript(args.transcript);
+
+  const turns = (await getConversationTurns(page))
+    .filter((turn) => turn.role === 'user' || turn.role === 'assistant')
+    .filter((turn) => turn.role !== 'assistant' || !isProgressOnlyText(turn.text));
+  const transcriptText = fs.readFileSync(args.transcript, 'utf8');
+  const entries = parseTranscriptEntries(transcriptText);
+  const startIndex = findTranscriptSyncStart(entries, turns);
+
+  if (startIndex === -1) {
+    throw new Error(`Could not match existing transcript tail to live target app turns: ${args.transcript}`);
+  }
+
+  const appended = [];
+  for (const turn of turns.slice(startIndex)) {
+    if (transcriptAlreadyHasTurn(entries, turn)) continue;
+    appendTranscript(args.transcript, turn.role, turn.text);
+    entries.push({ role: turn.role, text: turn.text, at: new Date().toISOString() });
+    appended.push({
+      role: turn.role,
+      chars: turn.text.length,
+      testid: turn.testid || '',
+    });
+  }
+
+  return {
+    transcript: args.transcript,
+    sessionId: sessionIdFromUrl(page.url()),
+    turnCount: turns.length,
+    appended,
+  };
+}
+
+async function latestAssistantText(page) {
+  const turns = await getConversationTurns(page);
+  const turn = [...turns].reverse()
+    .find((item) => item.role === 'assistant' && item.text && !isProgressOnlyText(item.text));
+  return turn?.text || '';
+}
+
+function messageHash(message) {
+  return crypto.createHash('sha256').update(String(message || '')).digest('hex');
+}
+
 function sessionIdFromUrl(url) {
   try {
     const parsed = new URL(url);
@@ -267,6 +395,544 @@ function refreshSessionTranscript(page, args) {
   }
 
   return args.transcript;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function randomId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function ensureSchedulerDir() {
+  fs.mkdirSync(SCHEDULER_DIR, { recursive: true });
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+function atomicWriteJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function appendJsonl(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, 'utf8');
+}
+
+function loadQueueState() {
+  const state = readJsonFile(QUEUE_STATE_PATH, { version: 1, updatedAt: '', jobs: [] });
+  if (!Array.isArray(state.jobs)) state.jobs = [];
+  return state;
+}
+
+function saveQueueState(state) {
+  state.version = 1;
+  state.updatedAt = nowIso();
+  atomicWriteJson(QUEUE_STATE_PATH, state);
+}
+
+function loadConversationIndex() {
+  const index = readJsonFile(CONVERSATION_INDEX_PATH, { version: 1, updatedAt: '', conversations: [] });
+  if (!Array.isArray(index.conversations)) index.conversations = [];
+  return index;
+}
+
+function saveConversationIndex(index) {
+  index.version = 1;
+  index.updatedAt = nowIso();
+  atomicWriteJson(CONVERSATION_INDEX_PATH, index);
+}
+
+function loadRoundState() {
+  const state = readJsonFile(ROUND_STATE_PATH, { version: 1, updatedAt: '', rounds: [] });
+  if (!Array.isArray(state.rounds)) state.rounds = [];
+  return state;
+}
+
+function saveRoundState(state) {
+  state.version = 1;
+  state.updatedAt = nowIso();
+  atomicWriteJson(ROUND_STATE_PATH, state);
+}
+
+function processExists(pid) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+function acquireSchedulerLock() {
+  ensureSchedulerDir();
+  try {
+    const fd = fs.openSync(SCHEDULER_LOCK_PATH, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: nowIso() }), 'utf8');
+    return () => {
+      try { fs.closeSync(fd); } catch {}
+      try { fs.unlinkSync(SCHEDULER_LOCK_PATH); } catch {}
+    };
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let stale = false;
+    try {
+      const lock = JSON.parse(fs.readFileSync(SCHEDULER_LOCK_PATH, 'utf8'));
+      stale = !processExists(Number(lock.pid));
+    } catch {
+      stale = true;
+    }
+    if (!stale) {
+      throw new Error(`Scheduler state is locked by another CB process (${SCHEDULER_LOCK_PATH})`);
+    }
+    fs.unlinkSync(SCHEDULER_LOCK_PATH);
+    return acquireSchedulerLock();
+  }
+}
+
+function withSchedulerLock(fn) {
+  const release = acquireSchedulerLock();
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+function normalizeAlias(alias, label = 'alias') {
+  const value = String(alias || '').trim();
+  if (!value) return '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error(`Invalid ${label}: use 1-128 characters from letters, numbers, dot, underscore, colon, or dash`);
+  }
+  return value;
+}
+
+function isCurrentConversationRef(ref) {
+  return /^(current|active|this)$/i.test(String(ref || '').trim());
+}
+
+function findConversationByAlias(index, alias) {
+  if (!alias) return null;
+  return index.conversations.find((item) => item.alias === alias) || null;
+}
+
+function findConversationBySessionId(index, sessionId) {
+  if (!sessionId) return null;
+  return index.conversations.find((item) => item.sessionId === sessionId) || null;
+}
+
+function upsertConversation(index, patch) {
+  const now = nowIso();
+  const alias = patch.alias || '';
+  const sessionId = patch.sessionId || '';
+  let record = null;
+
+  if (alias) record = findConversationByAlias(index, alias);
+  if (!record && sessionId) record = findConversationBySessionId(index, sessionId);
+  if (!record) {
+    record = {
+      alias,
+      sessionId,
+      status: sessionId ? 'active' : 'pending',
+      createdAt: now,
+      updatedAt: now,
+      url: '',
+      title: '',
+      transcript: '',
+      cdp: '',
+      firstJobId: '',
+      lastJobId: '',
+    };
+    index.conversations.push(record);
+  }
+
+  Object.assign(record, patch, {
+    alias: alias || record.alias || '',
+    sessionId: sessionId || record.sessionId || '',
+    status: patch.status || (sessionId || record.sessionId ? 'active' : 'pending'),
+    updatedAt: now,
+  });
+  return record;
+}
+
+async function indexCurrentConversation(page, args, event = 'conversation_observed', extra = {}) {
+  const { suppressAlias = false, indexAlias, ...recordExtra } = extra;
+  const sessionId = sessionIdFromUrl(page.url());
+  if (!sessionId) return null;
+
+  refreshSessionTranscript(page, args);
+  const title = await page.title().catch(() => '');
+  const turns = await getConversationTurns(page).catch(() => []);
+  const latestAssistant = [...turns].reverse()
+    .find((turn) => turn.role === 'assistant' && turn.text && !isProgressOnlyText(turn.text));
+
+  return withSchedulerLock(() => {
+    const index = loadConversationIndex();
+    const record = upsertConversation(index, {
+      alias: normalizeAlias(suppressAlias ? '' : ((indexAlias ?? args.alias) || ''), 'conversation alias'),
+      sessionId,
+      status: 'active',
+      url: page.url(),
+      title,
+      transcript: args.transcript || transcriptPathForSession(sessionId),
+      cdp: args.cdp,
+      turnCount: turns.length,
+      latestAssistantChars: latestAssistant?.text?.length || 0,
+      lastObservedAt: nowIso(),
+      ...recordExtra,
+    });
+    saveConversationIndex(index);
+    appendJsonl(CONVERSATION_EVENTS_PATH, {
+      type: event,
+      at: record.updatedAt,
+      conversation: record,
+    });
+    return record;
+  });
+}
+
+function registerPendingRound(args, page, message, baselineLastTurnId) {
+  const sessionId = sessionIdFromUrl(page.url());
+  const transcript = args.transcript || (sessionId ? transcriptPathForSession(sessionId) : '');
+  const id = randomId('round');
+  const now = nowIso();
+  const round = {
+    id,
+    status: 'pending',
+    createdAt: now,
+    updatedAt: now,
+    pid: process.pid,
+    sessionId,
+    url: page.url(),
+    transcript,
+    cdp: args.cdp,
+    baselineLastTurnId,
+    messageHash: messageHash(message),
+    messageChars: message.length,
+    messageHead: normalizeTurnText(message).slice(0, 240),
+    messageTail: normalizeTurnText(message).slice(-240),
+    responseChars: 0,
+    lastError: '',
+  };
+
+  withSchedulerLock(() => {
+    const state = loadRoundState();
+    state.rounds.push(round);
+    saveRoundState(state);
+    appendJsonl(ROUND_EVENTS_PATH, {
+      type: 'round_pending',
+      at: now,
+      round,
+    });
+  });
+  return round;
+}
+
+function updateRound(roundId, patch, eventType = 'round_updated') {
+  if (!roundId) return null;
+  return withSchedulerLock(() => {
+    const state = loadRoundState();
+    const round = state.rounds.find((item) => item.id === roundId);
+    if (!round) return null;
+    Object.assign(round, patch, { updatedAt: nowIso() });
+    saveRoundState(state);
+    appendJsonl(ROUND_EVENTS_PATH, {
+      type: eventType,
+      at: round.updatedAt,
+      round,
+    });
+    return round;
+  });
+}
+
+function transcriptUserEntryMatchesRound(entry, round) {
+  if (!entry || entry.role !== 'user') return false;
+  if (messageHash(entry.text) === round.messageHash) return true;
+  const text = normalizeTurnText(entry.text);
+  const head = normalizeTurnText(round.messageHead || '');
+  const tail = normalizeTurnText(round.messageTail || '');
+  if (head && tail && text.includes(head) && text.includes(tail)) return true;
+  return head && head.length < 240 && text.includes(head);
+}
+
+function responseAfterRound(entries, round) {
+  let userIndex = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (transcriptUserEntryMatchesRound(entries[i], round)) {
+      userIndex = i;
+      break;
+    }
+  }
+  if (userIndex === -1) return '';
+
+  const assistant = entries.slice(userIndex + 1)
+    .find((entry) => entry.role === 'assistant' && entry.text && !isProgressOnlyText(entry.text));
+  return assistant?.text || '';
+}
+
+function reconcilePendingRoundsFromTranscript(args) {
+  if (!args.transcript || !fs.existsSync(args.transcript)) return [];
+  const sessionId = path.basename(args.transcript, path.extname(args.transcript));
+  const entries = parseTranscriptEntries(fs.readFileSync(args.transcript, 'utf8'));
+  if (!entries.length) return [];
+
+  return withSchedulerLock(() => {
+    const state = loadRoundState();
+    const completed = [];
+    for (const round of state.rounds) {
+      if (round.status !== 'pending') continue;
+      if (round.sessionId && round.sessionId !== sessionId) continue;
+      const finalResponse = responseAfterRound(entries, round);
+      if (!finalResponse) continue;
+      Object.assign(round, {
+        status: 'done',
+        responseChars: finalResponse.length,
+        transcript: args.transcript,
+        completedAt: nowIso(),
+        updatedAt: nowIso(),
+        lastError: '',
+      });
+      completed.push(round);
+      appendJsonl(ROUND_EVENTS_PATH, {
+        type: 'round_recovered',
+        at: round.updatedAt,
+        round,
+      });
+    }
+    if (completed.length) saveRoundState(state);
+    return completed;
+  });
+}
+
+async function reconcileCurrentConversation(page, args, options = {}) {
+  refreshSessionTranscript(page, args);
+  let sync = null;
+  try {
+    sync = await syncTranscriptFromPage(page, args);
+  } catch (error) {
+    if (options.verbose) info(`[sync] ${error.message || error}`);
+  }
+  const recoveredRounds = reconcilePendingRoundsFromTranscript(args);
+  const conversation = await indexCurrentConversation(page, args, 'conversation_observed', {
+    suppressAlias: Boolean(options.suppressAlias),
+    recoveredRoundCount: recoveredRounds.length,
+    syncedTurnCount: sync?.appended?.length || 0,
+  }).catch((error) => {
+    if (options.verbose) info(`[index] ${error.message || error}`);
+    return null;
+  });
+  return { sync, recoveredRounds, conversation };
+}
+
+function parseConversationRef(ref, index) {
+  const value = String(ref || '').trim();
+  if (!value || isCurrentConversationRef(value)) {
+    return { kind: 'current', ref: value || 'current', alias: '', sessionId: '' };
+  }
+  if (SESSION_ID_RE.test(value)) {
+    return { kind: 'session', ref: value, alias: '', sessionId: value };
+  }
+  const alias = normalizeAlias(value, 'conversation alias');
+  const record = findConversationByAlias(index, alias);
+  return {
+    kind: 'alias',
+    ref: alias,
+    alias,
+    sessionId: record?.sessionId || '',
+  };
+}
+
+function scheduleNeedsCurrentPage(args) {
+  if (!args.schedule) return false;
+  if (args.newConversation) return false;
+  if (!args.conversation) return true;
+  return isCurrentConversationRef(args.conversation);
+}
+
+function targetDescription(target) {
+  if (target.newConversation) return `new conversation alias=${target.alias}`;
+  if (target.sessionId && target.alias) return `${target.alias} (${target.sessionId})`;
+  if (target.sessionId) return target.sessionId;
+  if (target.alias) return `${target.alias} (pending)`;
+  return 'current';
+}
+
+function enqueueScheduledJob(args, page = null) {
+  const message = String(args.message || '').trim();
+  if (!message) throw new Error('No message provided');
+  const jobId = randomId('job');
+
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const index = loadConversationIndex();
+    let target = null;
+    let conversationRecord = null;
+
+    if (args.newConversation) {
+      const ref = args.conversation && !SESSION_ID_RE.test(args.conversation) && !isCurrentConversationRef(args.conversation)
+        ? args.conversation
+        : '';
+      const alias = normalizeAlias(args.alias || ref || `new-${jobId}`, 'conversation alias');
+      target = {
+        newConversation: true,
+        alias,
+        sessionId: '',
+      };
+      conversationRecord = upsertConversation(index, {
+        alias,
+        sessionId: '',
+        status: 'pending',
+        cdp: args.cdp,
+        firstJobId: findConversationByAlias(index, alias)?.firstJobId || jobId,
+        lastJobId: jobId,
+      });
+    } else {
+      const parsed = parseConversationRef(args.conversation || 'current', index);
+      let sessionId = parsed.sessionId;
+      if (parsed.kind === 'current') {
+        if (!page) throw new Error('Scheduling for the current conversation requires a live target app page');
+        sessionId = sessionIdFromUrl(page.url());
+        if (!sessionId) {
+          throw new Error('The active target app tab has no conversation id yet. Use --new-conversation --alias <name> to schedule a future conversation.');
+        }
+      }
+
+      const alias = normalizeAlias(args.alias || parsed.alias || '', 'conversation alias');
+      target = {
+        newConversation: false,
+        alias,
+        sessionId,
+      };
+      if (sessionId || alias) {
+        conversationRecord = upsertConversation(index, {
+          alias,
+          sessionId,
+          status: sessionId ? 'active' : 'pending',
+          url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : '',
+          transcript: sessionId ? transcriptPathForSession(sessionId) : '',
+          cdp: args.cdp,
+          firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || jobId,
+          lastJobId: jobId,
+        });
+      }
+    }
+
+    const seq = queue.jobs.reduce((max, job) => Math.max(max, Number(job.seq) || 0), 0) + 1;
+    const now = nowIso();
+    const job = {
+      id: jobId,
+      seq,
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+      target,
+      message,
+      attachments: args.attachments || [],
+      model: args.model || '',
+      reasoning: args.reasoning || '',
+      cdp: args.cdp,
+      options: {
+        timeout: args.timeout,
+        downloadArtifacts: Boolean(args.downloadArtifacts),
+        showArtifacts: Boolean(args.showArtifacts),
+        stream: Boolean(args.stream),
+      },
+      attempts: 0,
+      lastError: '',
+      result: null,
+    };
+
+    queue.jobs.push(job);
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, {
+      type: 'job_enqueued',
+      at: now,
+      job,
+    });
+    if (conversationRecord) {
+      saveConversationIndex(index);
+      appendJsonl(CONVERSATION_EVENTS_PATH, {
+        type: 'conversation_scheduled',
+        at: now,
+        conversation: conversationRecord,
+        jobId,
+      });
+    }
+    return job;
+  });
+}
+
+function printScheduledJob(job, jsonl = false) {
+  if (jsonl) {
+    console.log(JSON.stringify({ type: 'scheduled_job', job }));
+    return;
+  }
+  console.log(`Scheduled ${job.id} #${job.seq} -> ${targetDescription(job.target)}`);
+}
+
+function queueSnapshot() {
+  return {
+    queue: loadQueueState(),
+    conversations: loadConversationIndex(),
+    rounds: loadRoundState(),
+  };
+}
+
+function printQueueStatus(args) {
+  const snapshot = queueSnapshot();
+  if (args.stateJsonl) {
+    console.log(JSON.stringify({
+      type: 'scheduler_status',
+      at: nowIso(),
+      queue: snapshot.queue,
+      conversations: snapshot.conversations,
+      rounds: snapshot.rounds,
+    }));
+    return;
+  }
+
+  const jobs = snapshot.queue.jobs.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const counts = jobs.reduce((acc, job) => {
+    acc[job.status] = (acc[job.status] || 0) + 1;
+    return acc;
+  }, {});
+  console.log(`Scheduler: ${jobs.length} job(s) pending=${counts.pending || 0} running=${counts.running || 0} done=${counts.done || 0} failed=${counts.failed || 0}`);
+  for (const job of jobs.slice(-20)) {
+    const suffix = job.lastError ? ` error=${job.lastError}` : '';
+    console.log(`#${job.seq} ${job.id} ${job.status} target=${targetDescription(job.target)} chars=${(job.message || '').length}${suffix}`);
+  }
+
+  const conversations = snapshot.conversations.conversations.slice()
+    .sort((a, b) => String(a.updatedAt || '').localeCompare(String(b.updatedAt || '')));
+  console.log(`Conversations: ${conversations.length}`);
+  for (const item of conversations.slice(-20)) {
+    console.log(`${item.alias || '(no alias)'} status=${item.status} session=${item.sessionId || '(pending)'} transcript=${item.transcript || ''}`);
+  }
+
+  const rounds = snapshot.rounds.rounds.slice()
+    .sort((a, b) => String(a.updatedAt || '').localeCompare(String(b.updatedAt || '')));
+  const roundCounts = rounds.reduce((acc, round) => {
+    acc[round.status] = (acc[round.status] || 0) + 1;
+    return acc;
+  }, {});
+  console.log(`Rounds: ${rounds.length} pending=${roundCounts.pending || 0} done=${roundCounts.done || 0} failed=${roundCounts.failed || 0}`);
+  for (const round of rounds.slice(-20)) {
+    const suffix = round.lastError ? ` error=${round.lastError}` : '';
+    console.log(`${round.id} ${round.status} session=${round.sessionId || '(pending)'} chars=${round.messageChars || 0} response=${round.responseChars || 0}${suffix}`);
+  }
 }
 
 async function findTargetAppPage(browser) {
@@ -1879,6 +2545,253 @@ async function settlePage(page) {
   await page.waitForTimeout(500);
 }
 
+async function openNewConversation(page) {
+  await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await settlePage(page);
+}
+
+async function openConversationBySessionId(page, sessionId) {
+  if (!SESSION_ID_RE.test(sessionId || '')) throw new Error(`Invalid target app session id: ${sessionId}`);
+  if (sessionIdFromUrl(page.url()) === sessionId) {
+    await settlePage(page);
+    return;
+  }
+  await page.goto(`https://configured-target.invalid/c/${sessionId}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await settlePage(page);
+}
+
+async function prepareConversationForPrompt(page, args) {
+  if (args.newConversation) {
+    await openNewConversation(page);
+    return;
+  }
+  if (!args.conversation || isCurrentConversationRef(args.conversation)) {
+    return;
+  }
+
+  const index = loadConversationIndex();
+  const parsed = parseConversationRef(args.conversation, index);
+  const sessionId = parsed.sessionId;
+  if (!sessionId) {
+    throw new Error(`Conversation "${args.conversation}" is not resolved to a target app session id yet`);
+  }
+  await openConversationBySessionId(page, sessionId);
+}
+
+function recordPromptConversation(args, page, response) {
+  const sessionId = sessionIdFromUrl(page.url());
+  if (!sessionId && !args.alias) return null;
+  return withSchedulerLock(() => {
+    const index = loadConversationIndex();
+    const alias = normalizeAlias(args.alias || '', 'conversation alias');
+    const record = upsertConversation(index, {
+      alias,
+      sessionId,
+      status: sessionId ? 'active' : 'pending',
+      url: page.url(),
+      transcript: sessionId ? transcriptPathForSession(sessionId) : '',
+      cdp: args.cdp,
+      lastResponseChars: response.length,
+    });
+    saveConversationIndex(index);
+    appendJsonl(CONVERSATION_EVENTS_PATH, {
+      type: 'conversation_observed',
+      at: record.updatedAt,
+      conversation: record,
+    });
+    return record;
+  });
+}
+
+function resolveRunnableTarget(job, index) {
+  if (job.target?.newConversation) {
+    return { action: 'new', sessionId: '', alias: job.target.alias || '' };
+  }
+  if (job.target?.sessionId) {
+    return { action: 'open', sessionId: job.target.sessionId, alias: job.target.alias || '' };
+  }
+  if (job.target?.alias) {
+    const record = findConversationByAlias(index, job.target.alias);
+    if (record?.sessionId) {
+      return { action: 'open', sessionId: record.sessionId, alias: job.target.alias };
+    }
+    return {
+      action: 'blocked',
+      reason: `conversation alias "${job.target.alias}" has not been resolved to a target app session id yet`,
+    };
+  }
+  return { action: 'blocked', reason: 'job has no conversation target' };
+}
+
+function takeNextScheduledJob() {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const index = loadConversationIndex();
+    const next = queue.jobs
+      .filter((job) => job.status === 'pending')
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0))[0] || null;
+    if (!next) return { job: null, blocked: null };
+
+    const target = resolveRunnableTarget(next, index);
+    if (target.action === 'blocked') {
+      return { job: null, blocked: { job: next, reason: target.reason } };
+    }
+
+    next.status = 'running';
+    next.updatedAt = nowIso();
+    next.attempts = (next.attempts || 0) + 1;
+    next.lastError = '';
+    next.run = {
+      startedAt: next.updatedAt,
+      pid: process.pid,
+      target,
+    };
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, {
+      type: 'job_started',
+      at: next.updatedAt,
+      jobId: next.id,
+      seq: next.seq,
+      target,
+    });
+    return { job: next, blocked: null };
+  });
+}
+
+function finishScheduledJob(jobId, patch, eventType) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find((item) => item.id === jobId);
+    if (!job) throw new Error(`Scheduled job disappeared: ${jobId}`);
+    Object.assign(job, patch, { updatedAt: nowIso() });
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, {
+      type: eventType,
+      at: job.updatedAt,
+      jobId,
+      seq: job.seq,
+      status: job.status,
+      result: job.result || null,
+      error: job.lastError || '',
+    });
+    return job;
+  });
+}
+
+function recordResolvedConversation(job, page, response) {
+  const sessionId = sessionIdFromUrl(page.url());
+  if (!sessionId) return null;
+  return withSchedulerLock(() => {
+    const index = loadConversationIndex();
+    const alias = job.target?.alias || '';
+    const record = upsertConversation(index, {
+      alias,
+      sessionId,
+      status: 'active',
+      url: page.url(),
+      title: '',
+      transcript: transcriptPathForSession(sessionId),
+      cdp: job.cdp || '',
+      firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || job.id,
+      lastJobId: job.id,
+      lastResponseChars: response.length,
+    });
+    saveConversationIndex(index);
+    appendJsonl(CONVERSATION_EVENTS_PATH, {
+      type: 'conversation_resolved',
+      at: record.updatedAt,
+      conversation: record,
+      jobId: job.id,
+    });
+    return record;
+  });
+}
+
+async function runScheduledJob(page, job, runnerArgs) {
+  const target = job.run?.target || resolveRunnableTarget(job, loadConversationIndex());
+  if (target.action === 'new') {
+    info(`[queue] #${job.seq} ${job.id}: starting new conversation${target.alias ? ` alias=${target.alias}` : ''}`);
+    await openNewConversation(page);
+  } else if (target.action === 'open') {
+    info(`[queue] #${job.seq} ${job.id}: opening conversation ${target.sessionId}${target.alias ? ` alias=${target.alias}` : ''}`);
+    await openConversationBySessionId(page, target.sessionId);
+  } else {
+    throw new Error(target.reason || 'scheduled job target is not runnable');
+  }
+
+  const jobArgs = {
+    ...runnerArgs,
+    transcript: null,
+    transcriptOverride: false,
+    attachments: job.attachments || [],
+    model: job.model || '',
+    reasoning: job.reasoning || '',
+    timeout: job.options?.timeout || runnerArgs.timeout,
+    downloadArtifacts: Boolean(job.options?.downloadArtifacts),
+    showArtifacts: Boolean(job.options?.showArtifacts),
+    stream: runnerArgs.stream && job.options?.stream !== false,
+  };
+  const response = await ask(page, job.message, jobArgs);
+  const conversation = recordResolvedConversation(job, page, response);
+  const sessionId = sessionIdFromUrl(page.url());
+  return {
+    completedAt: nowIso(),
+    sessionId,
+    alias: job.target?.alias || '',
+    url: page.url(),
+    transcript: jobArgs.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
+    responseChars: response.length,
+    conversation,
+  };
+}
+
+async function runScheduledQueue(page, args) {
+  let completed = 0;
+  while (true) {
+    if (args.queueLimit && completed >= args.queueLimit) return;
+
+    const { job, blocked } = takeNextScheduledJob();
+    if (!job) {
+      if (blocked) {
+        const message = `[queue] blocked at #${blocked.job.seq} ${blocked.job.id}: ${blocked.reason}`;
+        if (!args.queueWatch) {
+          console.error(message);
+          return;
+        }
+        info(message);
+      } else if (!args.queueWatch) {
+        info('[queue] no pending jobs');
+        return;
+      }
+      await page.waitForTimeout(args.stateInterval);
+      continue;
+    }
+
+    try {
+      const result = await runScheduledJob(page, job, args);
+      finishScheduledJob(job.id, {
+        status: 'done',
+        result,
+        lastError: '',
+      }, 'job_completed');
+      completed += 1;
+      info(`[queue] #${job.seq} ${job.id}: done session=${result.sessionId || '(none)'} transcript=${result.transcript}`);
+    } catch (error) {
+      const message = error.message || String(error);
+      finishScheduledJob(job.id, {
+        status: 'failed',
+        lastError: message,
+        result: {
+          failedAt: nowIso(),
+          url: page.url(),
+        },
+      }, 'job_failed');
+      console.error(`[queue] #${job.seq} ${job.id}: failed: ${message}`);
+      completed += 1;
+    }
+  }
+}
+
 function createStreamPrinter(args, baseline = null) {
   let lastText = '';
   const stateEmitter = createStateEmitter({
@@ -1972,7 +2885,13 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     await page.waitForTimeout(sawResponse ? RESPONSE_POLL_MS : 500);
   }
 
-  if (lastText) return lastText;
+  if (lastText) {
+    const finalText = responseAfterMessage(await getConversationTurns(page), message, baselineLastTurnId);
+    const finalState = await getTargetAppState(page).catch(() => null)
+      || await getGenerationState(page);
+    if (finalText && !finalState.isGenerating) return finalText;
+    throw new Error(`Timed out after ${timeout}ms while target app was still generating. Partial assistant text was not appended; run CB --sync-transcript after the browser finishes.`);
+  }
   throw new Error(`Timed out after ${timeout}ms waiting for assistant response`);
 }
 
@@ -2004,6 +2923,7 @@ async function watchTargetAppState(page, args) {
 }
 
 async function ask(page, message, args) {
+  await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch(() => {});
   refreshSessionTranscript(page, args);
   if (args.model) {
     info(`[model] selecting ${args.model}`);
@@ -2027,18 +2947,42 @@ async function ask(page, message, args) {
   await sendMessage(page, message);
   await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout: 10000 }).catch(() => {});
   refreshSessionTranscript(page, args);
+  await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
+  const round = registerPendingRound(args, page, message, baselineLastTurnId);
   appendTranscript(args.transcript, 'user', message);
   const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
-  const response = await waitForAssistantResponse(
-    page,
-    message,
-    baselineLastTurnId,
-    args.timeout,
-    streamer ? (event) => streamer.update(event) : null,
-  );
+  let response = '';
+  try {
+    response = await waitForAssistantResponse(
+      page,
+      message,
+      baselineLastTurnId,
+      args.timeout,
+      streamer ? (event) => streamer.update(event) : null,
+    );
+  } catch (error) {
+    updateRound(round.id, {
+      status: 'pending',
+      lastError: error.message || String(error),
+      url: page.url(),
+      transcript: args.transcript,
+    }, 'round_waiting_for_recovery');
+    throw error;
+  }
   if (streamer) streamer.finish();
   refreshSessionTranscript(page, args);
   appendTranscript(args.transcript, 'assistant', response);
+  updateRound(round.id, {
+    status: 'done',
+    responseChars: response.length,
+    completedAt: nowIso(),
+    url: page.url(),
+    transcript: args.transcript,
+    lastError: '',
+  }, 'round_completed');
+  await indexCurrentConversation(page, args, 'conversation_round_completed', {
+    lastResponseChars: response.length,
+  }).catch(() => {});
   if (args.downloadArtifacts) {
     const saved = await downloadLatestArtifacts(page, args);
     info(`[artifacts] saved ${saved.length} item(s): ${saved.map(formatSavedArtifact).join(', ')}`);
@@ -2483,11 +3427,75 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  if (args.queueStatus) {
+    printQueueStatus(args);
+    return;
+  }
+
+  if (args.schedule && !scheduleNeedsCurrentPage(args)) {
+    const job = enqueueScheduledJob(args);
+    printScheduledJob(job, args.stateJsonl);
+    return;
+  }
+
   const browser = await chromium.connectOverCDP(args.cdp);
   try {
     const page = await findTargetAppPage(browser);
     await settlePage(page);
     refreshSessionTranscript(page, args);
+    if (!args.syncTranscript) {
+      await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch((error) => {
+        info(`[sync] ${error.message || error}`);
+      });
+    }
+
+    if (args.schedule) {
+      const job = enqueueScheduledJob(args, page);
+      printScheduledJob(job, args.stateJsonl);
+      return;
+    }
+
+    if (args.runQueue) {
+      await runScheduledQueue(page, args);
+      return;
+    }
+
+    if (args.syncTranscript) {
+      const result = await syncTranscriptFromPage(page, args);
+      const recoveredRounds = reconcilePendingRoundsFromTranscript(args);
+      await indexCurrentConversation(page, args, 'conversation_sync', {
+        recoveredRoundCount: recoveredRounds.length,
+        syncedTurnCount: result.appended.length,
+      }).catch((error) => {
+        info(`[index] ${error.message || error}`);
+      });
+      const text = args.latestAssistant ? await latestAssistantText(page) : '';
+      if (args.stateJsonl) {
+        console.log(JSON.stringify({
+          type: 'transcript_sync',
+          at: new Date().toISOString(),
+          recoveredRounds: recoveredRounds.map((round) => ({
+            id: round.id,
+            sessionId: round.sessionId,
+            responseChars: round.responseChars,
+          })),
+          ...result,
+        }));
+      } else {
+        console.error(`Synced transcript: ${result.transcript}`);
+        console.error(`Appended ${result.appended.length} turn(s): ${result.appended.map((item) => `${item.role}:${item.chars}`).join(', ') || 'none'}`);
+        console.error(`Recovered ${recoveredRounds.length} pending round(s)`);
+      }
+      if (args.latestAssistant) console.log(text);
+      return;
+    }
+
+    if (args.latestAssistant) {
+      const text = await latestAssistantText(page);
+      if (!text) throw new Error('No completed assistant response found in the live target app DOM');
+      console.log(text);
+      return;
+    }
 
     if (args.status) {
       const state = await getTargetAppState(page);
@@ -2528,7 +3536,9 @@ async function main() {
     if (typeof args.message === 'string') {
       const message = args.message.trim();
       if (!message) throw new Error('No message provided');
+      await prepareConversationForPrompt(page, args);
       const response = await ask(page, message, args);
+      recordPromptConversation(args, page, response);
       if (!args.stream) console.log(response);
       console.error(`Saved transcript: ${args.transcript}`);
       return;
