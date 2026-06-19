@@ -2813,6 +2813,10 @@ function scheduledJobIsRecoverable(status) {
   return ['running', 'waiting', 'needs_recovery', 'failed'].includes(status);
 }
 
+function scheduledJobNeedsReconciliation(status) {
+  return scheduledJobIsRecoverable(status) || status === 'done';
+}
+
 function queueHoldStatusForError(message) {
   if (/Timed out after \d+ms while target app was still generating/i.test(message)) return 'waiting';
   if (/modal-subscription-failure|intercepts pointer events|Prompt was not submitted|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
@@ -2828,6 +2832,7 @@ function recoverQueueStateFromRounds(page, args, context) {
     const changedRounds = [];
     const changedConversations = [];
     const now = nowIso();
+    const indexBefore = JSON.stringify(index.conversations);
     const transcriptEntries = new Map();
     const finalResponseForRound = (round) => {
       const transcript = round.sessionId === context.activeSessionId
@@ -2841,11 +2846,12 @@ function recoverQueueStateFromRounds(page, args, context) {
     };
 
     for (const job of queue.jobs) {
-      if (!scheduledJobIsRecoverable(job.status)) continue;
+      if (!scheduledJobNeedsReconciliation(job.status)) continue;
       const round = findRoundForJob(roundState.rounds, job);
-      if (!round) continue;
+      const sessionId = round?.sessionId || job.result?.sessionId || '';
+      if (!round && !sessionId) continue;
 
-      const activeRound = context.activeSessionId && round.sessionId === context.activeSessionId;
+      const activeRound = context.activeSessionId && round?.sessionId === context.activeSessionId;
       if (activeRound && context.isGenerating) {
         const message = `target app is still generating for session ${context.activeSessionId}; run CB --recover-queue after it finishes.`;
         if (job.status !== 'waiting' || job.lastError !== message) {
@@ -2876,8 +2882,8 @@ function recoverQueueStateFromRounds(page, args, context) {
         continue;
       }
 
-      const finalResponse = finalResponseForRound(round);
-      if (finalResponse && finalResponse.length > (round.responseChars || 0)) {
+      const finalResponse = round ? finalResponseForRound(round) : '';
+      if (round && finalResponse && finalResponse.length > (round.responseChars || 0)) {
         Object.assign(round, {
           status: 'done',
           responseChars: finalResponse.length,
@@ -2888,28 +2894,36 @@ function recoverQueueStateFromRounds(page, args, context) {
         changedRounds.push({ type: 'round_recovered', round });
       }
 
-      if (round.status !== 'done' || !round.responseChars) continue;
+      if (round && (round.status !== 'done' || !round.responseChars)) continue;
 
-      const sessionId = round.sessionId || context.activeSessionId || '';
+      const finalResponseChars = Math.max(
+        round?.responseChars || 0,
+        job.result?.responseChars || 0,
+      );
       const transcript = sessionId === context.activeSessionId
         ? args.transcript
-        : (round.transcript || (sessionId ? transcriptPathForSession(sessionId) : args.transcript));
-      Object.assign(job, {
-        status: 'done',
-        lastError: '',
-        result: {
-          completedAt: round.completedAt || now,
-          recoveredAt: now,
-          recoveredBy: 'CB --recover-queue',
-          sessionId,
-          alias: job.target?.alias || '',
-          url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : context.url,
-          transcript,
-          responseChars: round.responseChars,
-        },
-        updatedAt: now,
-      });
-      changedJobs.push({ type: 'job_recovered', job });
+        : (round?.transcript || job.result?.transcript || (sessionId ? transcriptPathForSession(sessionId) : args.transcript));
+      const existingResponseChars = job.result?.responseChars || 0;
+      if (job.status !== 'done' || finalResponseChars > existingResponseChars || job.lastError) {
+        const previousStatus = job.status;
+        Object.assign(job, {
+          status: 'done',
+          lastError: '',
+          result: {
+            ...(job.result || {}),
+            completedAt: job.result?.completedAt || round?.completedAt || now,
+            recoveredAt: now,
+            recoveredBy: 'CB --recover-queue',
+            sessionId,
+            alias: job.target?.alias || '',
+            url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : context.url,
+            transcript,
+            responseChars: finalResponseChars,
+          },
+          updatedAt: now,
+        });
+        changedJobs.push({ type: previousStatus === 'done' ? 'job_reconciled' : 'job_recovered', job });
+      }
 
       if (sessionId) {
         const alias = job.target?.alias || '';
@@ -2922,7 +2936,7 @@ function recoverQueueStateFromRounds(page, args, context) {
           cdp: args.cdp,
           firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || job.id,
           lastJobId: job.id,
-          lastResponseChars: round.responseChars,
+          lastResponseChars: finalResponseChars,
         });
         changedConversations.push(record);
       }
@@ -2930,7 +2944,7 @@ function recoverQueueStateFromRounds(page, args, context) {
 
     if (changedJobs.length) saveQueueState(queue);
     if (changedRounds.length) saveRoundState(roundState);
-    if (changedConversations.length) saveConversationIndex(index);
+    if (changedConversations.length || JSON.stringify(index.conversations) !== indexBefore) saveConversationIndex(index);
     for (const change of changedJobs) {
       appendJsonl(QUEUE_EVENTS_PATH, {
         type: change.type,
