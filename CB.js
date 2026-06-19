@@ -18,6 +18,7 @@ const DEFAULT_CDP = process.env.CHATBOT_CDP_URL || 'http://127.0.0.1:9222';
 const SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
 const PASTE_SETTLE_MS = 1000;
 const RESPONSE_POLL_MS = 3000;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 180000;
 const RESPONSE_STABLE_FALLBACK_MS = 30000;
 const SEND_READY_TIMEOUT_MS = 120000;
 const NO_RESPONSE_RELOAD_MS = 90000;
@@ -62,7 +63,8 @@ function usage() {
 Options:
   --message, -m   Send one message, print the response, append transcript, then exit.
                  Use "-" to read the message from stdin.
-  --timeout       Response timeout in ms. Default: 180000
+  --timeout       Response timeout in ms. Default: 180000 for one-shot prompts;
+                  default is no timeout for --run-queue. Use 0 for no timeout.
   --cdp           Chromium DevTools URL. Default: ${DEFAULT_CDP}
   --transcript    Transcript path override. Default: outputs/<session-id>.txt
   --attach        File path to attach before sending. Repeat for multiple files.
@@ -82,6 +84,8 @@ Options:
   --run-queue     Run scheduled prompts sequentially, waiting for each answer.
   --queue-watch   With --run-queue, keep polling for newly scheduled jobs.
   --queue-status  Print scheduled job and conversation-index state, then exit.
+  --recover-queue
+                  Sync the active conversation and reconcile queued/running job state.
   --queue-limit   With --run-queue, stop after this many jobs. Default: all.
   --conversation  Target session id or scheduled alias. Use "current" for the active tab.
   --new-conversation
@@ -118,7 +122,8 @@ Interactive commands:
 function parseArgs(argv) {
   const args = {
     message: null,
-    timeout: 180000,
+    timeout: DEFAULT_RESPONSE_TIMEOUT_MS,
+    timeoutExplicit: false,
     cdp: DEFAULT_CDP,
     transcript: null,
     transcriptOverride: false,
@@ -136,6 +141,7 @@ function parseArgs(argv) {
     runQueue: false,
     queueWatch: false,
     queueStatus: false,
+    recoverQueue: false,
     queueLimit: 0,
     conversation: '',
     newConversation: false,
@@ -156,7 +162,10 @@ function parseArgs(argv) {
     };
 
     if (arg === '--message' || arg === '-m') args.message = next();
-    else if (arg === '--timeout') args.timeout = Number(next());
+    else if (arg === '--timeout') {
+      args.timeout = Number(next());
+      args.timeoutExplicit = true;
+    }
     else if (arg === '--cdp') args.cdp = next();
     else if (arg === '--transcript') {
       args.transcript = next();
@@ -176,6 +185,7 @@ function parseArgs(argv) {
     else if (arg === '--run-queue') args.runQueue = true;
     else if (arg === '--queue-watch') args.queueWatch = true;
     else if (arg === '--queue-status') args.queueStatus = true;
+    else if (arg === '--recover-queue') args.recoverQueue = true;
     else if (arg === '--queue-limit') args.queueLimit = Number(next());
     else if (arg === '--conversation') args.conversation = next();
     else if (arg === '--new-conversation') args.newConversation = true;
@@ -193,8 +203,8 @@ function parseArgs(argv) {
     }
   }
 
-  if (!Number.isFinite(args.timeout) || args.timeout <= 0) {
-    throw new Error('--timeout must be a positive number');
+  if (!Number.isFinite(args.timeout) || args.timeout < 0) {
+    throw new Error('--timeout must be zero or a positive number');
   }
   if (!Number.isFinite(args.stateInterval) || args.stateInterval <= 0) {
     throw new Error('--state-interval must be a positive number');
@@ -299,6 +309,7 @@ function parseTranscriptEntries(text) {
 function transcriptEntryMatchesTurn(entry, turn) {
   if (!entry || !turn || entry.role !== turn.role) return false;
   if (entry.role === 'assistant' && isProgressOnlyText(entry.text)) return false;
+  if (entry.role === 'assistant') return turnMatchesMessage(entry.text, turn.text);
   return turnMatchesMessage(turn.text, entry.text);
 }
 
@@ -316,16 +327,42 @@ function findTranscriptSyncStart(entries, turns) {
 }
 
 function transcriptAlreadyHasTurn(entries, turn) {
-  return entries.some((entry) => entry.role === turn.role && turnMatchesMessage(turn.text, entry.text));
+  return entries.some((entry) => {
+    if (entry.role !== turn.role) return false;
+    if (turn.role === 'assistant') return turnMatchesMessage(entry.text, turn.text);
+    return turnMatchesMessage(turn.text, entry.text);
+  });
 }
 
-async function syncTranscriptFromPage(page, args) {
+async function getCombinedGenerationState(page, state = null) {
+  const generation = await getGenerationState(page);
+  const controls = (state?.generationControls || [])
+    .map((item) => item.text || item.testid || '')
+    .filter(Boolean);
+  return {
+    isGenerating: Boolean(state?.isGenerating || controls.length || generation.isGenerating),
+    control: generation.control || controls.join(' | '),
+  };
+}
+
+async function syncTranscriptFromPage(page, args, options = {}) {
   refreshSessionTranscript(page, args);
   ensureTranscript(args.transcript);
 
-  const turns = (await getConversationTurns(page))
+  const generation = options.generation || await getCombinedGenerationState(page, options.state || null);
+  let turns = (await getConversationTurns(page))
     .filter((turn) => turn.role === 'user' || turn.role === 'assistant')
     .filter((turn) => turn.role !== 'assistant' || !isProgressOnlyText(turn.text));
+  const skipped = [];
+  if (generation.isGenerating && turns[turns.length - 1]?.role === 'assistant') {
+    const [turn] = turns.splice(turns.length - 1, 1);
+    skipped.push({
+      role: turn.role,
+      chars: turn.text.length,
+      testid: turn.testid || '',
+      reason: 'active_generation',
+    });
+  }
   const transcriptText = fs.readFileSync(args.transcript, 'utf8');
   const entries = parseTranscriptEntries(transcriptText);
   const startIndex = findTranscriptSyncStart(entries, turns);
@@ -351,6 +388,7 @@ async function syncTranscriptFromPage(page, args) {
     sessionId: sessionIdFromUrl(page.url()),
     turnCount: turns.length,
     appended,
+    skipped,
   };
 }
 
@@ -678,14 +716,15 @@ function responseAfterRound(entries, round) {
   }
   if (userIndex === -1) return '';
 
-  const assistant = entries.slice(userIndex + 1)
-    .find((entry) => entry.role === 'assistant' && entry.text && !isProgressOnlyText(entry.text));
-  return assistant?.text || '';
+  return entries.slice(userIndex + 1)
+    .filter((entry) => entry.role === 'assistant' && entry.text && !isProgressOnlyText(entry.text))
+    .reduce((best, entry) => (entry.text.length >= best.length ? entry.text : best), '');
 }
 
-function reconcilePendingRoundsFromTranscript(args) {
+function reconcilePendingRoundsFromTranscript(args, options = {}) {
   if (!args.transcript || !fs.existsSync(args.transcript)) return [];
   const sessionId = path.basename(args.transcript, path.extname(args.transcript));
+  const skipSessionIds = new Set(options.skipSessionIds || []);
   const entries = parseTranscriptEntries(fs.readFileSync(args.transcript, 'utf8'));
   if (!entries.length) return [];
 
@@ -694,6 +733,8 @@ function reconcilePendingRoundsFromTranscript(args) {
     const completed = [];
     for (const round of state.rounds) {
       if (round.status !== 'pending') continue;
+      const roundSessionId = round.sessionId || sessionId;
+      if (skipSessionIds.has(roundSessionId)) continue;
       if (round.sessionId && round.sessionId !== sessionId) continue;
       const finalResponse = responseAfterRound(entries, round);
       if (!finalResponse) continue;
@@ -719,13 +760,18 @@ function reconcilePendingRoundsFromTranscript(args) {
 
 async function reconcileCurrentConversation(page, args, options = {}) {
   refreshSessionTranscript(page, args);
+  const state = await getTargetAppState(page).catch(() => null);
+  const generation = await getCombinedGenerationState(page, state);
+  const activeSessionId = sessionIdFromUrl(page.url());
   let sync = null;
   try {
-    sync = await syncTranscriptFromPage(page, args);
+    sync = await syncTranscriptFromPage(page, args, { state, generation });
   } catch (error) {
     if (options.verbose) info(`[sync] ${error.message || error}`);
   }
-  const recoveredRounds = reconcilePendingRoundsFromTranscript(args);
+  const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {
+    skipSessionIds: generation.isGenerating && activeSessionId ? [activeSessionId] : [],
+  });
   const conversation = await indexCurrentConversation(page, args, 'conversation_observed', {
     suppressAlias: Boolean(options.suppressAlias),
     recoveredRoundCount: recoveredRounds.length,
@@ -768,6 +814,10 @@ function targetDescription(target) {
   if (target.sessionId) return target.sessionId;
   if (target.alias) return `${target.alias} (pending)`;
   return 'current';
+}
+
+function isDoneScheduledJob(job) {
+  return job?.status === 'done' || job?.status === 'skipped';
 }
 
 function enqueueScheduledJob(args, page = null) {
@@ -846,6 +896,7 @@ function enqueueScheduledJob(args, page = null) {
       cdp: args.cdp,
       options: {
         timeout: args.timeout,
+        timeoutExplicit: Boolean(args.timeoutExplicit),
         downloadArtifacts: Boolean(args.downloadArtifacts),
         showArtifacts: Boolean(args.showArtifacts),
         stream: Boolean(args.stream),
@@ -909,8 +960,13 @@ function printQueueStatus(args) {
     acc[job.status] = (acc[job.status] || 0) + 1;
     return acc;
   }, {});
-  console.log(`Scheduler: ${jobs.length} job(s) pending=${counts.pending || 0} running=${counts.running || 0} done=${counts.done || 0} failed=${counts.failed || 0}`);
-  for (const job of jobs.slice(-20)) {
+  console.log(`Scheduler: ${jobs.length} job(s) pending=${counts.pending || 0} running=${counts.running || 0} waiting=${counts.waiting || 0} needs_recovery=${counts.needs_recovery || 0} done=${counts.done || 0} failed=${counts.failed || 0}`);
+  const recentJobs = jobs.slice(-20);
+  const firstOpen = jobs.find((job) => !isDoneScheduledJob(job));
+  const visibleJobs = firstOpen && !recentJobs.some((job) => job.id === firstOpen.id)
+    ? [firstOpen, ...recentJobs]
+    : recentJobs;
+  for (const job of visibleJobs) {
     const suffix = job.lastError ? ` error=${job.lastError}` : '';
     console.log(`#${job.seq} ${job.id} ${job.status} target=${targetDescription(job.target)} chars=${(job.message || '').length}${suffix}`);
   }
@@ -2627,10 +2683,18 @@ function takeNextScheduledJob() {
   return withSchedulerLock(() => {
     const queue = loadQueueState();
     const index = loadConversationIndex();
-    const next = queue.jobs
-      .filter((job) => job.status === 'pending')
-      .sort((a, b) => (a.seq || 0) - (b.seq || 0))[0] || null;
+    const ordered = queue.jobs.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    const next = ordered.find((job) => !isDoneScheduledJob(job)) || null;
     if (!next) return { job: null, blocked: null };
+    if (next.status !== 'pending') {
+      return {
+        job: null,
+        blocked: {
+          job: next,
+          reason: `job #${next.seq} is ${next.status}; recover or reset it before continuing`,
+        },
+      };
+    }
 
     const target = resolveRunnableTarget(next, index);
     if (target.action === 'blocked') {
@@ -2707,6 +2771,243 @@ function recordResolvedConversation(job, page, response) {
   });
 }
 
+function jobMatchesRound(job, round) {
+  if (!job || !round) return false;
+  if (messageHash(job.message || '') === round.messageHash) return true;
+  const text = normalizeTurnText(job.message || '');
+  const head = normalizeTurnText(round.messageHead || '');
+  const tail = normalizeTurnText(round.messageTail || '');
+  if (head && tail && text.includes(head) && text.includes(tail)) return true;
+  return head && head.length < 240 && text.includes(head);
+}
+
+function findRoundForJob(rounds, job) {
+  return [...rounds].reverse().find((round) => jobMatchesRound(job, round)) || null;
+}
+
+function scheduledJobIsRecoverable(status) {
+  return ['running', 'waiting', 'needs_recovery', 'failed'].includes(status);
+}
+
+function queueHoldStatusForError(message) {
+  if (/Timed out after \d+ms while target app was still generating/i.test(message)) return 'waiting';
+  if (/modal-subscription-failure|intercepts pointer events|Prompt was not submitted|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
+  return 'failed';
+}
+
+function recoverQueueStateFromRounds(page, args, context) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const roundState = loadRoundState();
+    const index = loadConversationIndex();
+    const changedJobs = [];
+    const changedRounds = [];
+    const changedConversations = [];
+    const now = nowIso();
+    const transcriptEntries = new Map();
+    const finalResponseForRound = (round) => {
+      const transcript = round.sessionId === context.activeSessionId
+        ? args.transcript
+        : (round.transcript || '');
+      if (!transcript || !fs.existsSync(transcript)) return '';
+      if (!transcriptEntries.has(transcript)) {
+        transcriptEntries.set(transcript, parseTranscriptEntries(fs.readFileSync(transcript, 'utf8')));
+      }
+      return responseAfterRound(transcriptEntries.get(transcript), round);
+    };
+
+    for (const job of queue.jobs) {
+      if (!scheduledJobIsRecoverable(job.status)) continue;
+      const round = findRoundForJob(roundState.rounds, job);
+      if (!round) continue;
+
+      const activeRound = context.activeSessionId && round.sessionId === context.activeSessionId;
+      if (activeRound && context.isGenerating) {
+        const message = `target app is still generating for session ${context.activeSessionId}; run CB --recover-queue after it finishes.`;
+        if (job.status !== 'waiting' || job.lastError !== message) {
+          Object.assign(job, {
+            status: 'waiting',
+            lastError: message,
+            result: {
+              waitingAt: now,
+              sessionId: context.activeSessionId,
+              url: context.url,
+              transcript: args.transcript,
+              recoverable: true,
+            },
+            updatedAt: now,
+          });
+          changedJobs.push({ type: 'job_waiting', job });
+        }
+        if (round.status !== 'pending' || round.lastError !== message) {
+          Object.assign(round, {
+            status: 'pending',
+            responseChars: 0,
+            completedAt: '',
+            lastError: message,
+            updatedAt: now,
+          });
+          changedRounds.push({ type: 'round_waiting', round });
+        }
+        continue;
+      }
+
+      const finalResponse = finalResponseForRound(round);
+      if (finalResponse && finalResponse.length > (round.responseChars || 0)) {
+        Object.assign(round, {
+          status: 'done',
+          responseChars: finalResponse.length,
+          completedAt: round.completedAt || now,
+          lastError: '',
+          updatedAt: now,
+        });
+        changedRounds.push({ type: 'round_recovered', round });
+      }
+
+      if (round.status !== 'done' || !round.responseChars) continue;
+
+      const sessionId = round.sessionId || context.activeSessionId || '';
+      const transcript = sessionId === context.activeSessionId
+        ? args.transcript
+        : (round.transcript || (sessionId ? transcriptPathForSession(sessionId) : args.transcript));
+      Object.assign(job, {
+        status: 'done',
+        lastError: '',
+        result: {
+          completedAt: round.completedAt || now,
+          recoveredAt: now,
+          recoveredBy: 'CB --recover-queue',
+          sessionId,
+          alias: job.target?.alias || '',
+          url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : context.url,
+          transcript,
+          responseChars: round.responseChars,
+        },
+        updatedAt: now,
+      });
+      changedJobs.push({ type: 'job_recovered', job });
+
+      if (sessionId) {
+        const alias = job.target?.alias || '';
+        const record = upsertConversation(index, {
+          alias,
+          sessionId,
+          status: 'active',
+          url: `https://configured-target.invalid/c/${sessionId}`,
+          transcript,
+          cdp: args.cdp,
+          firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || job.id,
+          lastJobId: job.id,
+          lastResponseChars: round.responseChars,
+        });
+        changedConversations.push(record);
+      }
+    }
+
+    if (changedJobs.length) saveQueueState(queue);
+    if (changedRounds.length) saveRoundState(roundState);
+    if (changedConversations.length) saveConversationIndex(index);
+    for (const change of changedJobs) {
+      appendJsonl(QUEUE_EVENTS_PATH, {
+        type: change.type,
+        at: change.job.updatedAt,
+        jobId: change.job.id,
+        seq: change.job.seq,
+        status: change.job.status,
+        result: change.job.result || null,
+        error: change.job.lastError || '',
+      });
+    }
+    for (const change of changedRounds) {
+      appendJsonl(ROUND_EVENTS_PATH, {
+        type: change.type,
+        at: change.round.updatedAt,
+        round: change.round,
+      });
+    }
+    for (const conversation of changedConversations) {
+      appendJsonl(CONVERSATION_EVENTS_PATH, {
+        type: 'conversation_recovered',
+        at: conversation.updatedAt,
+        conversation,
+      });
+    }
+
+    const firstOpen = queue.jobs
+      .slice()
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0))
+      .find((job) => !isDoneScheduledJob(job)) || null;
+    return {
+      changedJobs: changedJobs.map((change) => ({
+        id: change.job.id,
+        seq: change.job.seq,
+        status: change.job.status,
+        sessionId: change.job.result?.sessionId || '',
+      })),
+      changedRounds: changedRounds.map((change) => ({
+        id: change.round.id,
+        status: change.round.status,
+        sessionId: change.round.sessionId || '',
+      })),
+      firstOpen: firstOpen ? {
+        id: firstOpen.id,
+        seq: firstOpen.seq,
+        status: firstOpen.status,
+        alias: firstOpen.target?.alias || '',
+      } : null,
+      blocked: firstOpen && firstOpen.status !== 'pending'
+        ? `job #${firstOpen.seq} is ${firstOpen.status}`
+        : '',
+    };
+  });
+}
+
+async function recoverScheduledQueue(page, args) {
+  refreshSessionTranscript(page, args);
+  const state = await getTargetAppState(page).catch(() => null);
+  const generation = await getCombinedGenerationState(page, state);
+  const activeSessionId = sessionIdFromUrl(page.url());
+  const sync = await syncTranscriptFromPage(page, args, { state, generation });
+  const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {
+    skipSessionIds: generation.isGenerating && activeSessionId ? [activeSessionId] : [],
+  });
+  const queueRecovery = recoverQueueStateFromRounds(page, args, {
+    activeSessionId,
+    isGenerating: generation.isGenerating,
+    url: page.url(),
+  });
+
+  return {
+    type: 'queue_recovery',
+    at: nowIso(),
+    sessionId: activeSessionId,
+    url: page.url(),
+    generating: generation.isGenerating,
+    transcript: args.transcript,
+    sync,
+    recoveredRounds: recoveredRounds.map((round) => ({
+      id: round.id,
+      sessionId: round.sessionId,
+      responseChars: round.responseChars,
+    })),
+    ...queueRecovery,
+  };
+}
+
+function printQueueRecovery(result, jsonl = false) {
+  if (jsonl) {
+    console.log(JSON.stringify(result));
+    return;
+  }
+  console.error(`Recovered queue state for ${result.sessionId || '(no session)'} generating=${result.generating ? 'yes' : 'no'}`);
+  console.error(`Transcript: ${result.transcript}`);
+  console.error(`Synced ${result.sync.appended.length} appended turn(s), skipped ${result.sync.skipped.length} active turn(s)`);
+  console.error(`Recovered ${result.recoveredRounds.length} round(s), changed ${result.changedJobs.length} job(s)`);
+  if (result.blocked) console.error(`Queue blocked: ${result.blocked}`);
+  else if (result.firstOpen) console.error(`Next job: #${result.firstOpen.seq} ${result.firstOpen.status} ${result.firstOpen.alias}`);
+  else console.error('Queue complete');
+}
+
 async function runScheduledJob(page, job, runnerArgs) {
   const target = job.run?.target || resolveRunnableTarget(job, loadConversationIndex());
   if (target.action === 'new') {
@@ -2719,6 +3020,13 @@ async function runScheduledJob(page, job, runnerArgs) {
     throw new Error(target.reason || 'scheduled job target is not runnable');
   }
 
+  const scheduledTimeout = Number(job.options?.timeout) || 0;
+  const scheduledTimeoutExplicit = Boolean(job.options?.timeoutExplicit);
+  const timeout = runnerArgs.timeoutExplicit
+    ? runnerArgs.timeout
+    : scheduledTimeoutExplicit
+      ? scheduledTimeout
+      : 0;
   const jobArgs = {
     ...runnerArgs,
     transcript: null,
@@ -2726,7 +3034,7 @@ async function runScheduledJob(page, job, runnerArgs) {
     attachments: job.attachments || [],
     model: job.model || '',
     reasoning: job.reasoning || '',
-    timeout: job.options?.timeout || runnerArgs.timeout,
+    timeout,
     downloadArtifacts: Boolean(job.options?.downloadArtifacts),
     showArtifacts: Boolean(job.options?.showArtifacts),
     stream: runnerArgs.stream && job.options?.stream !== false,
@@ -2778,16 +3086,19 @@ async function runScheduledQueue(page, args) {
       info(`[queue] #${job.seq} ${job.id}: done session=${result.sessionId || '(none)'} transcript=${result.transcript}`);
     } catch (error) {
       const message = error.message || String(error);
+      const status = queueHoldStatusForError(message);
+      const eventType = status === 'failed' ? 'job_failed' : 'job_held';
       finishScheduledJob(job.id, {
-        status: 'failed',
+        status,
         lastError: message,
         result: {
-          failedAt: nowIso(),
+          heldAt: nowIso(),
           url: page.url(),
+          recoverable: status !== 'failed',
         },
-      }, 'job_failed');
-      console.error(`[queue] #${job.seq} ${job.id}: failed: ${message}`);
-      completed += 1;
+      }, eventType);
+      console.error(`[queue] #${job.seq} ${job.id}: ${status}: ${message}`);
+      return;
     }
   }
 }
@@ -2829,12 +3140,13 @@ function createStreamPrinter(args, baseline = null) {
 
 async function waitForAssistantResponse(page, message, baselineLastTurnId, timeout, onUpdate = null) {
   const start = Date.now();
+  const noTimeout = timeout === 0 || timeout === Infinity;
   let lastText = '';
   let stableSince = 0;
   let sawResponse = false;
   let reloadedForMissingResponse = false;
 
-  while (Date.now() - start < timeout) {
+  while (noTimeout || Date.now() - start < timeout) {
     const turns = await getConversationTurns(page);
     const text = responseAfterMessage(turns, message, baselineLastTurnId);
     const placeholder = !text || isProgressOnlyText(text);
@@ -2849,17 +3161,16 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
 
       if (onUpdate) onUpdate({ text, state: pageState });
 
-      const state = pageState
-        ? { isGenerating: pageState.isGenerating }
-        : await getGenerationState(page);
+      const state = await getCombinedGenerationState(page, pageState);
       if (!state.isGenerating) {
         await page.waitForTimeout(500);
         const finalText = responseAfterMessage(await getConversationTurns(page), message, baselineLastTurnId);
-        if (onUpdate) {
-          const finalState = await getTargetAppState(page).catch(() => null);
-          onUpdate({ text: finalText || lastText, state: finalState });
+        const finalState = await getTargetAppState(page).catch(() => null);
+        const finalGeneration = await getCombinedGenerationState(page, finalState);
+        if (!finalGeneration.isGenerating) {
+          if (onUpdate) onUpdate({ text: finalText || lastText, state: finalState });
+          return finalText || lastText;
         }
-        return finalText || lastText;
       }
 
       if (Date.now() - stableSince >= RESPONSE_STABLE_FALLBACK_MS && !state.isGenerating) {
@@ -2875,7 +3186,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
       && hasUserTurnAfterBaseline(turns, message, baselineLastTurnId)
       && sessionIdFromUrl(page.url())
       && pageState
-      && !pageState.isGenerating) {
+      && !(await getCombinedGenerationState(page, pageState)).isGenerating) {
       reloadedForMissingResponse = true;
       info('[state] no assistant turn visible while UI is idle; reloading target app once');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
@@ -2888,8 +3199,8 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   if (lastText) {
     const finalText = responseAfterMessage(await getConversationTurns(page), message, baselineLastTurnId);
     const finalState = await getTargetAppState(page).catch(() => null)
-      || await getGenerationState(page);
-    if (finalText && !finalState.isGenerating) return finalText;
+    const finalGeneration = await getCombinedGenerationState(page, finalState);
+    if (finalText && !finalGeneration.isGenerating) return finalText;
     throw new Error(`Timed out after ${timeout}ms while target app was still generating. Partial assistant text was not appended; run CB --sync-transcript after the browser finishes.`);
   }
   throw new Error(`Timed out after ${timeout}ms waiting for assistant response`);
@@ -2907,11 +3218,12 @@ async function watchTargetAppState(page, args) {
   });
 
   const start = Date.now();
+  const noTimeout = args.timeout === 0 || args.timeout === Infinity;
   let event = emitter.emit(initialState, true);
 
   while (true) {
     if (args.waitReady && event.ready) return event;
-    if (args.waitReady && Date.now() - start >= args.timeout) {
+    if (args.waitReady && !noTimeout && Date.now() - start >= args.timeout) {
       throw new Error(`Timed out after ${args.timeout}ms waiting for ready assistant output`);
     }
 
@@ -3456,13 +3768,29 @@ async function main() {
     }
 
     if (args.runQueue) {
+      const recovery = await recoverScheduledQueue(page, args);
+      if (recovery.blocked) {
+        printQueueRecovery(recovery, args.stateJsonl);
+        return;
+      }
       await runScheduledQueue(page, args);
       return;
     }
 
+    if (args.recoverQueue) {
+      const recovery = await recoverScheduledQueue(page, args);
+      printQueueRecovery(recovery, args.stateJsonl);
+      return;
+    }
+
     if (args.syncTranscript) {
-      const result = await syncTranscriptFromPage(page, args);
-      const recoveredRounds = reconcilePendingRoundsFromTranscript(args);
+      const state = await getTargetAppState(page).catch(() => null);
+      const generation = await getCombinedGenerationState(page, state);
+      const result = await syncTranscriptFromPage(page, args, { state, generation });
+      const activeSessionId = sessionIdFromUrl(page.url());
+      const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {
+        skipSessionIds: generation.isGenerating && activeSessionId ? [activeSessionId] : [],
+      });
       await indexCurrentConversation(page, args, 'conversation_sync', {
         recoveredRoundCount: recoveredRounds.length,
         syncedTurnCount: result.appended.length,

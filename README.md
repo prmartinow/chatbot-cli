@@ -65,10 +65,13 @@ Schedule sequential work:
 node CB.js --schedule --new-conversation --alias research-a --message "Start the analysis"
 node CB.js --schedule --conversation research-a --message "Follow up after the first answer"
 node CB.js --run-queue --cdp http://127.0.0.1:9241
+node CB.js --recover-queue --cdp http://127.0.0.1:9241
 node CB.js --queue-status
 ```
 
-`--run-queue` processes scheduled prompts in global queue order. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
+`--run-queue` processes scheduled prompts in strict queue order. It only considers the first non-done job: `running`, `waiting`, `needs_recovery`, or `failed` jobs block later pending work until they are recovered, reset, or intentionally skipped. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. If target app is still generating when a timeout fires, the job is held as `waiting` and the runner stops instead of marking it failed and continuing. Pre-send UI blockers such as subscription modals are held as `needs_recovery`. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
+
+`--recover-queue` never sends a new prompt. It syncs the active target app conversation, skips any in-flight assistant preface while the stop control is visible, updates matching rounds/jobs after the final answer is complete, and reports the first queue blocker or next pending job. Scheduler completion is driven by target app state, not by a timer: queued jobs have no response timeout by default, and older jobs that only stored the default `180000` timeout do not inherit it. Use `--timeout <ms>` only as an explicit watchdog, or `--timeout 0` to force no timeout.
 
 Scheduler and conversation state is private output data under `outputs/scheduler/`: `queue.json`, `conversation-index.json`, and `rounds.json` are the readable current state, while their `.jsonl` companions are append-only event journals.
 
