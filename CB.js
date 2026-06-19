@@ -53,6 +53,16 @@ const COMMANDS = new Set([
   '/download',
   '/stop',
 ]);
+const BLOCKING_MODAL_SELECTORS = [
+  '#modal-conversation-history-rate-limit',
+  '[data-testid="modal-conversation-history-rate-limit"]',
+  '#modal-subscription-failure',
+  '[data-testid="modal-subscription-failure"]',
+  '[id^="modal-"][id*="rate-limit"]',
+  '[data-testid^="modal-"][data-testid*="rate-limit"]',
+  '[id^="modal-"][id*="subscription"]',
+  '[data-testid^="modal-"][data-testid*="subscription"]',
+];
 
 function usage() {
   console.log(`Usage:
@@ -1113,6 +1123,9 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
   while (Date.now() - start < timeout) {
     lastButton = await getSendButtonState(page);
     lastState = await getTargetAppState(page).catch(() => null);
+    if (lastState?.blockingModal) {
+      throw new Error(blockingModalErrorMessage(lastState.blockingModal, 'while waiting for the send button'));
+    }
     if (!lastButton.exists || !lastButton.disabled) {
       return { button: lastButton, state: lastState };
     }
@@ -1130,13 +1143,24 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
 }
 
 async function sendMessage(page, message) {
+  await assertNoBlockingModal(page, 'before finding the composer');
   const composer = await findComposer(page);
-  await composer.click({ timeout: 10000 });
+  try {
+    await assertNoBlockingModal(page, 'before focusing the composer');
+    await composer.click({ timeout: 10000 });
+  } catch (error) {
+    const modal = await getBlockingModal(page);
+    if (modal) throw new Error(blockingModalErrorMessage(modal, 'while focusing the composer'));
+    throw error;
+  }
   await page.keyboard.insertText(message);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(700);
 
   const state = await getTargetAppState(page).catch(() => null);
+  if (state?.blockingModal) {
+    throw new Error(blockingModalErrorMessage(state.blockingModal, 'after inserting the prompt'));
+  }
   if (!state?.composer?.textChars) return;
 
   const sendButton = await getSendButtonState(page);
@@ -1145,9 +1169,16 @@ async function sendMessage(page, message) {
     await waitForSendReady(page);
   }
 
-  await page.locator('#composer-submit-button, [data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]')
-    .first()
-    .click({ timeout: 5000 });
+  try {
+    await assertNoBlockingModal(page, 'before clicking the send button');
+    await page.locator('#composer-submit-button, [data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]')
+      .first()
+      .click({ timeout: 5000 });
+  } catch (error) {
+    const modal = await getBlockingModal(page);
+    if (modal) throw new Error(blockingModalErrorMessage(modal, 'while clicking the send button'));
+    throw error;
+  }
   await page.waitForTimeout(700);
 }
 
@@ -1196,6 +1227,77 @@ function isProgressOnlyText(text) {
     || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
     || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
     || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
+}
+
+function blockingModalKindFromMeta(meta) {
+  const joined = [
+    meta?.id || '',
+    meta?.testid || '',
+    meta?.role || '',
+    meta?.text || '',
+  ].join(' ');
+  if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
+    return 'conversation_history_rate_limit';
+  }
+  if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+    return 'subscription_modal';
+  }
+  return 'blocking_modal';
+}
+
+function blockingModalSummary(modal) {
+  if (!modal) return '';
+  const text = normalizeTurnText(modal.text || '').slice(0, 500);
+  const name = modal.kind || blockingModalKindFromMeta(modal);
+  const id = modal.id ? `#${modal.id}` : '';
+  const testid = modal.testid ? `data-testid="${modal.testid}"` : '';
+  const labels = [id, testid].filter(Boolean).join(' ');
+  return [name, labels, text ? `text="${text}"` : ''].filter(Boolean).join(' ');
+}
+
+function blockingModalErrorMessage(modal, context = 'before sending') {
+  const summary = blockingModalSummary(modal) || 'blocking modal';
+  return `target app UI blocker detected ${context}: ${summary}. No prompt was submitted; wait for the modal to clear, then recover or resume the queue.`;
+}
+
+async function getBlockingModal(page) {
+  return page.evaluate((selectors) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const kindOf = (meta) => {
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.text || ''].join(' ');
+      if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
+        return 'conversation_history_rate_limit';
+      }
+      if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+        return 'subscription_modal';
+      }
+      return 'blocking_modal';
+    };
+
+    for (const selector of selectors) {
+      for (const candidate of document.querySelectorAll(selector)) {
+        const modal = candidate.closest('[role="dialog"],[aria-modal="true"],[id^="modal-"],[data-testid^="modal-"]') || candidate;
+        if (!isVisible(modal)) continue;
+        const result = {
+          id: modal.id || candidate.id || '',
+          testid: modal.getAttribute('data-testid') || candidate.getAttribute('data-testid') || '',
+          role: modal.getAttribute('role') || '',
+          ariaModal: modal.getAttribute('aria-modal') || '',
+          text: textOf(modal),
+        };
+        return { ...result, kind: kindOf(result) };
+      }
+    }
+
+    return null;
+  }, BLOCKING_MODAL_SELECTORS).catch(() => null);
+}
+
+async function assertNoBlockingModal(page, context) {
+  const modal = await getBlockingModal(page);
+  if (modal) throw new Error(blockingModalErrorMessage(modal, context));
+  return null;
 }
 
 function stripLeadingProgressPrefix(text) {
@@ -1271,9 +1373,36 @@ async function getGenerationState(page) {
 }
 
 async function getTargetAppState(page) {
-  return page.evaluate(() => {
+  return page.evaluate((blockingModalSelectors) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const blockingModalKindOf = (meta) => {
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.text || ''].join(' ');
+      if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
+        return 'conversation_history_rate_limit';
+      }
+      if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+        return 'subscription_modal';
+      }
+      return 'blocking_modal';
+    };
+    const blockingModal = (() => {
+      for (const selector of blockingModalSelectors) {
+        for (const candidate of document.querySelectorAll(selector)) {
+          const modal = candidate.closest('[role="dialog"],[aria-modal="true"],[id^="modal-"],[data-testid^="modal-"]') || candidate;
+          if (!isVisible(modal)) continue;
+          const result = {
+            id: modal.id || candidate.id || '',
+            testid: modal.getAttribute('data-testid') || candidate.getAttribute('data-testid') || '',
+            role: modal.getAttribute('role') || '',
+            ariaModal: modal.getAttribute('aria-modal') || '',
+            text: textOf(modal),
+          };
+          return { ...result, kind: blockingModalKindOf(result) };
+        }
+      }
+      return null;
+    })();
     const isProgressOnly = (text) => {
       const normalized = (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().replace(/[.。…]+$/g, '').trim();
       if (!normalized) return true;
@@ -1483,6 +1612,7 @@ async function getTargetAppState(page) {
       url: location.href,
       title: document.title,
       model: modelButton ? (modelButton.text || modelButton.aria || modelButton.testid) : '',
+      blockingModal,
       reasoningControls,
       isGenerating: generationControls.length > 0,
       generationControls,
@@ -1515,7 +1645,7 @@ async function getTargetAppState(page) {
         codeBlocks,
       },
     };
-  });
+  }, BLOCKING_MODAL_SELECTORS);
 }
 
 function compactModelConfig(config) {
@@ -1579,6 +1709,9 @@ function summarizeState(state, modelConfig = null) {
     }
   }
   lines.push(`Generating: ${state.isGenerating ? 'yes' : 'no'}`);
+  if (state.blockingModal) {
+    lines.push(`UI blocker: ${blockingModalSummary(state.blockingModal)}`);
+  }
   if (state.generationControls.length) {
     lines.push(`Generation controls: ${state.generationControls.map((item) => item.text).join(' | ')}`);
   }
@@ -1651,6 +1784,7 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
   const progressActivityWithoutAssistant = Boolean(!assistantAdvanced
     && latestTurn?.role !== 'assistant'
     && (state.activityTexts || []).some(isProgressOnlyText));
+  const blockedByModal = Boolean(state.blockingModal);
   const activeProgress = Boolean(state.isGenerating
     || state.generationControls?.length
     || progressOnlyAssistant
@@ -1659,7 +1793,9 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
   const composerBusy = Boolean(state.composer?.textChars || state.composer?.attachments?.length);
   const phase = ready
     ? 'ready'
-    : activeProgress
+    : blockedByModal
+      ? 'blocked'
+      : activeProgress
       ? 'generating'
       : latestTurn?.role === 'user'
         ? 'waiting'
@@ -1684,6 +1820,12 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
       effort: modelSelection.effort || '',
     },
     modelConfig,
+    blockingModal: state.blockingModal ? {
+      kind: state.blockingModal.kind || blockingModalKindFromMeta(state.blockingModal),
+      id: state.blockingModal.id || '',
+      testid: state.blockingModal.testid || '',
+      text: normalizeTurnText(state.blockingModal.text || '').slice(0, 500),
+    } : null,
     generating: state.isGenerating,
     generationControls: (state.generationControls || []).map((item) => item.text).filter(Boolean),
     voiceControls: (state.voiceControls || []).map((item) => item.aria || item.title || item.text || item.testid).filter(Boolean),
@@ -1724,6 +1866,10 @@ function stateEventKey(event) {
     event.modelSelection.model,
     event.modelSelection.mode,
     event.modelSelection.effort,
+    event.blockingModal?.kind || '',
+    event.blockingModal?.id || '',
+    event.blockingModal?.testid || '',
+    event.blockingModal?.text || '',
     event.generationControls.join('|'),
     event.activity.join('|'),
     event.artifacts.links,
@@ -1743,6 +1889,7 @@ function formatStateEvent(event) {
   if (event.model) parts.push(`model=${event.model}`);
   if (event.modelSelection.mode) parts.push(`mode=${event.modelSelection.mode}`);
   if (event.modelSelection.effort) parts.push(`effort=${event.modelSelection.effort}`);
+  if (event.blockingModal) parts.push(`blocker=${blockingModalSummary(event.blockingModal)}`);
   if (event.generationControls.length) parts.push(`control=${event.generationControls.join(' | ')}`);
   if (event.activity.length) parts.push(`activity=${event.activity.join(' | ')}`);
   if (event.turns.latest) parts.push(`latest=${event.turns.latest.role || 'unknown'}:${event.turns.latest.chars}`);
@@ -2852,7 +2999,7 @@ function scheduledJobNeedsReconciliation(status) {
 
 function queueHoldStatusForError(message) {
   if (/Timed out after \d+ms while target app was still generating/i.test(message)) return 'waiting';
-  if (/modal-subscription-failure|intercepts pointer events|Prompt was not submitted|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
+  if (/target app UI blocker|modal-conversation-history-rate-limit|conversation_history_rate_limit|modal-subscription-failure|subscription_modal|intercepts pointer events|Prompt was not submitted|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
   return 'failed';
 }
 
