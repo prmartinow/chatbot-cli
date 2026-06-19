@@ -572,6 +572,11 @@ function findConversationBySessionId(index, sessionId) {
   return index.conversations.find((item) => item.sessionId === sessionId) || null;
 }
 
+function sessionIdFromTranscriptPath(transcriptPath) {
+  const id = path.basename(String(transcriptPath || ''), path.extname(String(transcriptPath || '')));
+  return SESSION_ID_RE.test(id) ? id : '';
+}
+
 function upsertConversation(index, patch) {
   const now = nowIso();
   const alias = patch.alias || '';
@@ -596,8 +601,11 @@ function upsertConversation(index, patch) {
       lastJobId: '',
     };
     index.conversations.push(record);
-  } else if (sessionRecords.length > 1) {
-    const duplicates = sessionRecords.filter((item) => item !== record && (!item.alias || item.alias === alias));
+  } else {
+    const duplicates = index.conversations.filter((item) => item !== record && (
+      (sessionId && item.sessionId === sessionId && (!item.alias || item.alias === alias))
+      || (alias && item.alias === alias)
+    ));
     for (const duplicate of duplicates) {
       for (const [key, value] of Object.entries(duplicate)) {
         if (value && (record[key] === '' || record[key] === null || record[key] === undefined)) {
@@ -2797,16 +2805,41 @@ function recordResolvedConversation(job, page, response) {
 
 function jobMatchesRound(job, round) {
   if (!job || !round) return false;
-  if (messageHash(job.message || '') === round.messageHash) return true;
+  const jobHash = messageHash(job.message || '');
+  if (round.messageHash) return jobHash === round.messageHash;
   const text = normalizeTurnText(job.message || '');
   const head = normalizeTurnText(round.messageHead || '');
   const tail = normalizeTurnText(round.messageTail || '');
   if (head && tail && text.includes(head) && text.includes(tail)) return true;
-  return head && head.length < 240 && text.includes(head);
+  return false;
 }
 
-function findRoundForJob(rounds, job) {
-  return [...rounds].reverse().find((round) => jobMatchesRound(job, round)) || null;
+function expectedSessionIdForJob(job, index) {
+  if (!job) return '';
+  const alias = job.target?.alias || job.result?.alias || '';
+  const record = alias && index ? findConversationByAlias(index, alias) : null;
+  return record?.sessionId
+    || job.target?.sessionId
+    || job.result?.sessionId
+    || sessionIdFromTranscriptPath(job.result?.transcript)
+    || '';
+}
+
+function findRoundForJob(rounds, job, index = null) {
+  const candidates = [...rounds].reverse().filter((round) => jobMatchesRound(job, round));
+  if (!candidates.length) return null;
+
+  const expectedSessionId = expectedSessionIdForJob(job, index);
+  if (expectedSessionId) {
+    return candidates.find((round) => round.sessionId === expectedSessionId) || null;
+  }
+
+  const jobHash = messageHash(job.message || '');
+  const exactHashMatches = candidates.filter((round) => round.messageHash && round.messageHash === jobHash);
+  if (exactHashMatches.length === 1) return exactHashMatches[0];
+
+  const sessionMatches = candidates.filter((round) => round.sessionId);
+  return sessionMatches.length === 1 ? sessionMatches[0] : null;
 }
 
 function scheduledJobIsRecoverable(status) {
@@ -2847,7 +2880,7 @@ function recoverQueueStateFromRounds(page, args, context) {
 
     for (const job of queue.jobs) {
       if (!scheduledJobNeedsReconciliation(job.status)) continue;
-      const round = findRoundForJob(roundState.rounds, job);
+      const round = findRoundForJob(roundState.rounds, job, index);
       const sessionId = round?.sessionId || job.result?.sessionId || '';
       if (!round && !sessionId) continue;
 
@@ -2896,15 +2929,22 @@ function recoverQueueStateFromRounds(page, args, context) {
 
       if (round && (round.status !== 'done' || !round.responseChars)) continue;
 
-      const finalResponseChars = Math.max(
-        round?.responseChars || 0,
-        job.result?.responseChars || 0,
-      );
+      const finalResponseChars = round?.responseChars || job.result?.responseChars || 0;
       const transcript = sessionId === context.activeSessionId
         ? args.transcript
         : (round?.transcript || job.result?.transcript || (sessionId ? transcriptPathForSession(sessionId) : args.transcript));
       const existingResponseChars = job.result?.responseChars || 0;
-      if (job.status !== 'done' || finalResponseChars > existingResponseChars || job.lastError) {
+      const jobSessionMismatch = Boolean(sessionId && job.result?.sessionId && job.result.sessionId !== sessionId);
+      const jobTranscriptMismatch = Boolean(transcript && job.result?.transcript && job.result.transcript !== transcript);
+      const jobAliasMismatch = Boolean((job.target?.alias || '') && job.result?.alias && job.result.alias !== job.target.alias);
+      const jobResponseMismatch = Boolean(round && finalResponseChars && existingResponseChars && existingResponseChars !== finalResponseChars);
+      if (job.status !== 'done'
+        || finalResponseChars > existingResponseChars
+        || jobResponseMismatch
+        || jobSessionMismatch
+        || jobTranscriptMismatch
+        || jobAliasMismatch
+        || job.lastError) {
         const previousStatus = job.status;
         Object.assign(job, {
           status: 'done',
@@ -2937,6 +2977,7 @@ function recoverQueueStateFromRounds(page, args, context) {
           firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || job.id,
           lastJobId: job.id,
           lastResponseChars: finalResponseChars,
+          latestAssistantChars: finalResponseChars,
         });
         changedConversations.push(record);
       }
