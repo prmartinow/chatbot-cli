@@ -576,10 +576,11 @@ function upsertConversation(index, patch) {
   const now = nowIso();
   const alias = patch.alias || '';
   const sessionId = patch.sessionId || '';
-  let record = null;
+  const aliasRecord = alias ? findConversationByAlias(index, alias) : null;
+  const sessionRecords = sessionId ? index.conversations.filter((item) => item.sessionId === sessionId) : [];
+  const sessionRecord = sessionRecords[0] || null;
+  let record = aliasRecord || sessionRecord || null;
 
-  if (alias) record = findConversationByAlias(index, alias);
-  if (!record && sessionId) record = findConversationBySessionId(index, sessionId);
   if (!record) {
     record = {
       alias,
@@ -595,6 +596,16 @@ function upsertConversation(index, patch) {
       lastJobId: '',
     };
     index.conversations.push(record);
+  } else if (sessionRecords.length > 1) {
+    const duplicates = sessionRecords.filter((item) => item !== record && (!item.alias || item.alias === alias));
+    for (const duplicate of duplicates) {
+      for (const [key, value] of Object.entries(duplicate)) {
+        if (value && (record[key] === '' || record[key] === null || record[key] === undefined)) {
+          record[key] = value;
+        }
+      }
+    }
+    index.conversations = index.conversations.filter((item) => !duplicates.includes(item));
   }
 
   Object.assign(record, patch, {
@@ -2634,6 +2645,19 @@ async function prepareConversationForPrompt(page, args) {
   await openConversationBySessionId(page, sessionId);
 }
 
+async function prepareConversationForRead(page, args) {
+  if (!args.conversation || isCurrentConversationRef(args.conversation)) return;
+
+  const index = loadConversationIndex();
+  const parsed = parseConversationRef(args.conversation, index);
+  const sessionId = parsed.sessionId;
+  if (!sessionId) {
+    throw new Error(`Conversation "${args.conversation}" is not resolved to a target app session id yet`);
+  }
+  await openConversationBySessionId(page, sessionId);
+  refreshSessionTranscript(page, args);
+}
+
 function recordPromptConversation(args, page, response) {
   const sessionId = sessionIdFromUrl(page.url());
   if (!sessionId && !args.alias) return null;
@@ -3778,12 +3802,14 @@ async function main() {
     }
 
     if (args.recoverQueue) {
+      await prepareConversationForRead(page, args);
       const recovery = await recoverScheduledQueue(page, args);
       printQueueRecovery(recovery, args.stateJsonl);
       return;
     }
 
     if (args.syncTranscript) {
+      await prepareConversationForRead(page, args);
       const state = await getTargetAppState(page).catch(() => null);
       const generation = await getCombinedGenerationState(page, state);
       const result = await syncTranscriptFromPage(page, args, { state, generation });
@@ -3819,6 +3845,7 @@ async function main() {
     }
 
     if (args.latestAssistant) {
+      await prepareConversationForRead(page, args);
       const text = await latestAssistantText(page);
       if (!text) throw new Error('No completed assistant response found in the live target app DOM');
       console.log(text);
@@ -3826,6 +3853,7 @@ async function main() {
     }
 
     if (args.status) {
+      await prepareConversationForRead(page, args);
       const state = await getTargetAppState(page);
       const modelConfig = await inspectStatusModelConfig(page);
       state.modelConfig = compactModelConfig(modelConfig);
