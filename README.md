@@ -35,11 +35,19 @@ Inspect the current target app page:
 ```bash
 node CB.js --status
 node CB.js --status --state-jsonl
+node CB.js --status --deep-status
 node CB.js --models
 node CB.js --stop
 node CB.js --latest-assistant
 node CB.js --sync-transcript
 ```
+
+`--status` is a passive current-page DOM read for composer, generation, turn,
+artifact, and voice/dictation state. Use it while another target app response is in
+progress; it does not open model UI or run the startup settle/reconcile path.
+`--deep-status` additionally opens the model picker/configurator to inspect the
+live model/reasoning options; reserve that for model-picker debugging, not
+ordinary readiness checks.
 
 `--models` opens the live model picker and Configure dialog, then reports the
 current header, selected composer button, visible mode rows, reasoning-effort
@@ -96,9 +104,9 @@ printf "/model 5.5 Pro Extended\n/status\n/exit\n" | node CB.js
 
 For current target app picker shapes, model labels can include a model version,
 mode, and effort, for example `5.5 Pro Extended` or `5.5 Thinking Heavy`.
-`/status --state-jsonl` includes a lightweight `modelSelection` object and,
-when status performs the deeper picker inspection, a compact `modelConfig`
-object with the live model list and effort options.
+`--status --state-jsonl` includes a lightweight `modelSelection` object from
+the visible composer button. Add `--deep-status` only when you need a compact
+`modelConfig` object with the live model list and effort options.
 
 Attach files before sending:
 
@@ -125,6 +133,7 @@ Artifacts are written under `outputs/artifacts/<session>/<timestamp>/` and can i
 Run `node CB.js` and use:
 
 - `/status`: print model, composer, generation, and artifact state.
+- `/status deep`: inspect model picker/configurator details too.
 - `/models`: list visible model picker options.
 - `/reasoning`: list visible reasoning controls.
 - `/model <text>` and `/reasoning <text>`: click matching UI options.

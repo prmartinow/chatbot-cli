@@ -22,6 +22,7 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 180000;
 const RESPONSE_STABLE_FALLBACK_MS = 30000;
 const SEND_READY_TIMEOUT_MS = 120000;
 const NO_RESPONSE_RELOAD_MS = 90000;
+const CONVERSATION_HYDRATION_TIMEOUT_MS = 15000;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
 const QUEUE_STATE_PATH = path.join(SCHEDULER_DIR, 'queue.json');
@@ -39,6 +40,7 @@ const COMMAND_PREFIXES = [
   '/attach ',
   '/model ',
   '/reasoning ',
+  '/status ',
   '/stream ',
 ];
 const COMMANDS = new Set([
@@ -81,6 +83,8 @@ Options:
   --model         Select a model by visible label before sending.
   --reasoning     Select a reasoning mode by visible label before sending.
   --status        Print current target app page state and exit.
+  --deep-status   With --status, inspect the model picker/configurator.
+                  This opens UI menus; do not use for passive state checks.
   --watch-state   Poll target app state continuously for external orchestration.
   --wait-ready    With --watch-state, exit once a new assistant answer is complete.
   --state-jsonl   Emit state updates as JSON Lines instead of human text.
@@ -115,7 +119,8 @@ Interactive commands:
   /quit           Quit.
   /transcript     Print the transcript path.
   /multi          Optional manual multiline mode; paste at CB> works by default.
-  /status         Print model, composer, generation, and artifact state.
+  /status         Print passive composer, generation, and artifact state.
+  /status deep    Also inspect model picker/configurator; opens UI menus.
   /models         Open the model picker and list visible options.
   /reasoning      List visible reasoning controls.
   /model <text>   Select a model by visible label.
@@ -141,6 +146,7 @@ function parseArgs(argv) {
     model: '',
     reasoning: '',
     status: false,
+    deepStatus: false,
     watchState: false,
     waitReady: false,
     stateJsonl: false,
@@ -185,6 +191,7 @@ function parseArgs(argv) {
     else if (arg === '--model') args.model = next();
     else if (arg === '--reasoning') args.reasoning = next();
     else if (arg === '--status') args.status = true;
+    else if (arg === '--deep-status' || arg === '--inspect-model-config') args.deepStatus = true;
     else if (arg === '--watch-state') args.watchState = true;
     else if (arg === '--wait-ready') args.waitReady = true;
     else if (arg === '--state-jsonl') args.stateJsonl = true;
@@ -233,6 +240,22 @@ function parseArgs(argv) {
 function isInteractiveCommand(text) {
   if (COMMANDS.has(text)) return true;
   return COMMAND_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
+function isPassiveCurrentPageRead(args) {
+  const currentConversation = !args.conversation || isCurrentConversationRef(args.conversation);
+  return currentConversation
+    && !args.deepStatus
+    && !args.newConversation
+    && !args.syncTranscript
+    && !args.latestAssistant
+    && !args.recoverQueue
+    && !args.runQueue
+    && !args.models
+    && !args.stop
+    && !args.downloadArtifacts
+    && typeof args.message !== 'string'
+    && (args.status || args.watchState);
 }
 
 function useColor() {
@@ -2772,14 +2795,50 @@ async function openNewConversation(page) {
   await settlePage(page);
 }
 
+async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERSATION_HYDRATION_TIMEOUT_MS) {
+  if (!SESSION_ID_RE.test(sessionId || '')) {
+    return { hydrated: false, sessionId: '', turnCount: 0, roleNodeCount: 0 };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let last = { hydrated: false, sessionId: '', turnCount: 0, roleNodeCount: 0 };
+  while (Date.now() <= deadline) {
+    last = await page.evaluate((expectedSessionId) => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const sessionIdFromLocation = () => {
+        const parts = location.pathname.split('/').filter(Boolean);
+        const cIndex = parts.indexOf('c');
+        return cIndex !== -1 ? (parts[cIndex + 1] || '') : '';
+      };
+      const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].filter(isVisible);
+      const roleNodes = [...document.querySelectorAll('[data-message-author-role]')].filter(isVisible);
+      const sessionId = sessionIdFromLocation();
+      return {
+        hydrated: sessionId === expectedSessionId && (turns.length > 0 || roleNodes.length > 0),
+        sessionId,
+        turnCount: turns.length,
+        roleNodeCount: roleNodes.length,
+      };
+    }, sessionId).catch(() => last);
+
+    if (last.hydrated) return last;
+    if (Date.now() >= deadline) break;
+    await page.waitForTimeout(500);
+  }
+
+  return { ...last, hydrated: false, timedOut: true };
+}
+
 async function openConversationBySessionId(page, sessionId) {
   if (!SESSION_ID_RE.test(sessionId || '')) throw new Error(`Invalid target app session id: ${sessionId}`);
   if (sessionIdFromUrl(page.url()) === sessionId) {
     await settlePage(page);
+    await waitForConversationHydration(page, sessionId);
     return;
   }
   await page.goto(`https://configured-target.invalid/c/${sessionId}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await settlePage(page);
+  await waitForConversationHydration(page, sessionId);
 }
 
 async function prepareConversationForPrompt(page, args) {
@@ -3845,9 +3904,10 @@ async function interactive(page, args) {
       console.log(args.transcript);
       continue;
     }
-    if (input.type === 'command' && input.text === '/status') {
+    if (input.type === 'command' && (input.text === '/status' || input.text.startsWith('/status '))) {
+      const deepStatus = /\b(deep|config|models?|inspect)\b/i.test(input.text);
       const state = await getTargetAppState(page);
-      const modelConfig = await inspectStatusModelConfig(page);
+      const modelConfig = deepStatus ? await inspectStatusModelConfig(page) : null;
       console.log(summarizeState(state, modelConfig));
       continue;
     }
@@ -3979,12 +4039,17 @@ async function main() {
   const browser = await chromium.connectOverCDP(args.cdp);
   try {
     const page = await findTargetAppPage(browser);
-    await settlePage(page);
-    refreshSessionTranscript(page, args);
-    if (!args.syncTranscript) {
-      await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch((error) => {
-        info(`[sync] ${error.message || error}`);
-      });
+    const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
+    if (passiveCurrentPageRead) {
+      refreshSessionTranscript(page, args);
+    } else {
+      await settlePage(page);
+      refreshSessionTranscript(page, args);
+      if (!args.syncTranscript) {
+        await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch((error) => {
+          info(`[sync] ${error.message || error}`);
+        });
+      }
     }
 
     if (args.schedule) {
@@ -4057,8 +4122,8 @@ async function main() {
     if (args.status) {
       await prepareConversationForRead(page, args);
       const state = await getTargetAppState(page);
-      const modelConfig = await inspectStatusModelConfig(page);
-      state.modelConfig = compactModelConfig(modelConfig);
+      const modelConfig = args.deepStatus ? await inspectStatusModelConfig(page) : null;
+      if (modelConfig) state.modelConfig = compactModelConfig(modelConfig);
       if (args.stateJsonl) {
         console.log(JSON.stringify(buildStateEvent(state, null, args.transcript || '')));
       } else {
