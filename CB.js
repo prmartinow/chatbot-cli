@@ -15,6 +15,7 @@ const { chromium } = loadPlaywright();
 const APP_DIR = process.env.CHATBOT_CLI_HOME || __dirname;
 const OUTPUT_DIR = process.env.CHATBOT_TRANSCRIPT_DIR || path.join(APP_DIR, 'outputs');
 const DEFAULT_CDP = process.env.CHATBOT_CDP_URL || 'http://127.0.0.1:9222';
+const CDP_CONNECT_TIMEOUT_MS = Number(process.env.CHATBOT_CDP_CONNECT_TIMEOUT_MS || 60000);
 const SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
 const PASTE_SETTLE_MS = 1000;
 const RESPONSE_POLL_MS = 3000;
@@ -23,6 +24,8 @@ const RESPONSE_STABLE_FALLBACK_MS = 30000;
 const SEND_READY_TIMEOUT_MS = 120000;
 const NO_RESPONSE_RELOAD_MS = 90000;
 const CONVERSATION_HYDRATION_TIMEOUT_MS = 15000;
+const COMPOSER_INSERT_TIMEOUT_MS = 10000;
+const PROMPT_ACCEPTED_TIMEOUT_MS = 30000;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
 const QUEUE_STATE_PATH = path.join(SCHEDULER_DIR, 'queue.json');
@@ -78,6 +81,7 @@ Options:
   --timeout       Response timeout in ms. Default: 180000 for one-shot prompts;
                   default is no timeout for --run-queue. Use 0 for no timeout.
   --cdp           Chromium DevTools URL. Default: ${DEFAULT_CDP}
+  --new-tab       Open a separate target app tab for this invocation.
   --transcript    Transcript path override. Default: outputs/<session-id>.txt
   --attach        File path to attach before sending. Repeat for multiple files.
   --model         Select a model by visible label before sending.
@@ -140,6 +144,7 @@ function parseArgs(argv) {
     timeout: DEFAULT_RESPONSE_TIMEOUT_MS,
     timeoutExplicit: false,
     cdp: DEFAULT_CDP,
+    newTab: false,
     transcript: null,
     transcriptOverride: false,
     attachments: [],
@@ -183,6 +188,7 @@ function parseArgs(argv) {
       args.timeoutExplicit = true;
     }
     else if (arg === '--cdp') args.cdp = next();
+    else if (arg === '--new-tab') args.newTab = true;
     else if (arg === '--transcript') {
       args.transcript = next();
       args.transcriptOverride = true;
@@ -246,6 +252,7 @@ function isPassiveCurrentPageRead(args) {
   const currentConversation = !args.conversation || isCurrentConversationRef(args.conversation);
   return currentConversation
     && !args.deepStatus
+    && !args.newTab
     && !args.newConversation
     && !args.syncTranscript
     && !args.latestAssistant
@@ -1043,13 +1050,19 @@ function printQueueStatus(args) {
   }
 }
 
-async function findTargetAppPage(browser) {
-  for (const context of browser.contexts()) {
-    const page = context.pages().find((candidate) => candidate.url().startsWith('https://configured-target.invalid/'));
+async function findTargetAppPage(browser, args = {}) {
+  const context = browser.contexts()[0] || await browser.newContext();
+  if (args.newTab) {
+    const page = await context.newPage();
+    await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    return page;
+  }
+
+  for (const candidateContext of browser.contexts()) {
+    const page = candidateContext.pages().find((candidate) => candidate.url().startsWith('https://configured-target.invalid/'));
     if (page) return page;
   }
 
-  const context = browser.contexts()[0] || await browser.newContext();
   const page = await context.newPage();
   await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded' });
   return page;
@@ -1165,7 +1178,130 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
   throw new Error(`Prompt was not submitted because the send button stayed disabled after ${timeout}ms. Files may still be uploading or unsupported by this browser profile.${label}${attachmentSummary}${longTextSummary}`);
 }
 
-async function sendMessage(page, message) {
+async function getComposerDraftState(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const candidates = [...document.querySelectorAll('#prompt-textarea, [data-testid="composer-input"], textarea[placeholder], div[contenteditable="true"]')];
+    const visibleCandidates = candidates.filter(isVisible);
+    const composer = visibleCandidates[visibleCandidates.length - 1] || candidates[candidates.length - 1] || null;
+    const composerRoot = composer?.closest('form')
+      || composer?.closest('[data-testid*="composer"]')
+      || composer?.parentElement?.parentElement
+      || null;
+    const text = textOf(composer);
+    const attachments = composerRoot
+      ? [...composerRoot.querySelectorAll('[data-testid], [aria-label], button, [role="button"]')]
+        .filter(isVisible)
+        .map((el) => ({
+          testid: el.getAttribute('data-testid') || '',
+          aria: el.getAttribute('aria-label') || '',
+          title: el.getAttribute('title') || '',
+          text: textOf(el),
+        }))
+        .filter((item) => {
+          const joined = [item.testid, item.aria, item.title, item.text].join(' ');
+          if (/\b(add files|start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(joined)) return false;
+          return /\b(pasted text|pasted|attachment|file|upload|remove|pdf|docx?|image|csv|txt|\.txt|\.pdf|\.csv|\.png|\.jpe?g|\.webp)\b/i.test(joined);
+        })
+        .slice(0, 20)
+      : [];
+
+    return {
+      exists: Boolean(composer),
+      visible: isVisible(composer),
+      text,
+      textChars: text.length,
+      textPreview: text.slice(0, 240),
+      textTail: text.slice(-240),
+      attachments,
+    };
+  }).catch(() => ({
+    exists: false,
+    visible: false,
+    text: '',
+    textChars: 0,
+    textPreview: '',
+    textTail: '',
+    attachments: [],
+  }));
+}
+
+function composerDraftMatchesMessage(state, message) {
+  if (turnMatchesMessage(state?.text || '', message)) {
+    return { ok: true, kind: 'composer_text' };
+  }
+
+  const normalizedMessage = normalizeTurnText(message);
+  const attachmentText = (state?.attachments || [])
+    .map((item) => [item.testid, item.aria, item.title, item.text].filter(Boolean).join(' '))
+    .join(' ');
+  if (normalizedMessage.length >= 4000 && /\bpasted(?:\s+text)?\b/i.test(attachmentText)) {
+    return { ok: true, kind: 'pasted_text_attachment' };
+  }
+
+  return { ok: false, kind: '' };
+}
+
+function composerDraftSummary(state) {
+  if (!state) return 'composer state unavailable';
+  const attachments = (state.attachments || [])
+    .map((item) => item.text || item.aria || item.title || item.testid)
+    .filter(Boolean)
+    .join(' | ');
+  return [
+    `${state.textChars || 0} chars`,
+    state.textPreview ? `preview="${state.textPreview}"` : '',
+    state.textTail && state.textTail !== state.textPreview ? `tail="${state.textTail}"` : '',
+    attachments ? `attachments="${attachments}"` : '',
+  ].filter(Boolean).join(', ');
+}
+
+async function waitForComposerInsertion(page, message, timeout = COMPOSER_INSERT_TIMEOUT_MS) {
+  const start = Date.now();
+  let lastState = null;
+  let lastMatch = { ok: false, kind: '' };
+
+  while (Date.now() - start < timeout) {
+    await assertNoBlockingModal(page, 'while verifying inserted prompt text');
+    lastState = await getComposerDraftState(page);
+    lastMatch = composerDraftMatchesMessage(lastState, message);
+    if (lastMatch.ok) return { state: lastState, match: lastMatch };
+    await page.waitForTimeout(250);
+  }
+
+  throw new Error(`Prompt text insertion could not be verified after ${timeout}ms. Composer: ${composerDraftSummary(lastState)}. No prompt was submitted.`);
+}
+
+function findUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
+  const baselineIndex = baselineLastTurnId
+    ? turns.findIndex((turn) => turn.testid === baselineLastTurnId)
+    : -1;
+  return turns.find((turn, index) => index > baselineIndex
+    && turn.role === 'user'
+    && turnMatchesMessage(turn.text, message)) || null;
+}
+
+async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout = PROMPT_ACCEPTED_TIMEOUT_MS) {
+  const start = Date.now();
+  let lastTurns = [];
+  let lastComposer = null;
+
+  while (Date.now() - start < timeout) {
+    await assertNoBlockingModal(page, 'while verifying the prompt was accepted');
+    lastTurns = await getConversationTurns(page).catch(() => []);
+    const userTurn = findUserTurnAfterBaseline(lastTurns, message, baselineLastTurnId);
+    if (userTurn) return userTurn;
+    lastComposer = await getComposerDraftState(page);
+    await page.waitForTimeout(500);
+  }
+
+  const latest = lastTurns.length ? lastTurns[lastTurns.length - 1] : null;
+  const latestSummary = latest ? `${latest.role || 'unknown'}:${latest.testid || latest.index}:${(latest.text || '').slice(0, 240)}` : 'none';
+  throw new Error(`Prompt was not accepted by target app after ${timeout}ms: no matching user turn appeared after the baseline. Composer: ${composerDraftSummary(lastComposer)}. Latest turn: ${latestSummary}.`);
+}
+
+async function sendMessage(page, message, baselineLastTurnId = '') {
   await assertNoBlockingModal(page, 'before finding the composer');
   const composer = await findComposer(page);
   try {
@@ -1177,19 +1313,14 @@ async function sendMessage(page, message) {
     throw error;
   }
   await page.keyboard.insertText(message);
-  await page.keyboard.press('Enter');
-  await page.waitForTimeout(700);
+  await waitForComposerInsertion(page, message);
 
-  const state = await getTargetAppState(page).catch(() => null);
-  if (state?.blockingModal) {
-    throw new Error(blockingModalErrorMessage(state.blockingModal, 'after inserting the prompt'));
-  }
-  if (!state?.composer?.textChars) return;
+  const ready = await waitForSendReady(page);
 
-  const sendButton = await getSendButtonState(page);
-  if (!sendButton.exists) return;
-  if (sendButton.disabled) {
-    await waitForSendReady(page);
+  if (!ready.button.exists) {
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(700);
+    return waitForPromptAccepted(page, message, baselineLastTurnId);
   }
 
   try {
@@ -1203,6 +1334,7 @@ async function sendMessage(page, message) {
     throw error;
   }
   await page.waitForTimeout(700);
+  return waitForPromptAccepted(page, message, baselineLastTurnId);
 }
 
 function responseAfterMessage(turns, message, baselineLastTurnId) {
@@ -1228,13 +1360,7 @@ function responseAfterMessage(turns, message, baselineLastTurnId) {
 }
 
 function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
-  const baselineIndex = baselineLastTurnId
-    ? turns.findIndex((turn) => turn.testid === baselineLastTurnId)
-    : -1;
-  return turns.some((turn, index) => {
-    if (index <= baselineIndex || turn.role !== 'user') return false;
-    return turnMatchesMessage(turn.text, message);
-  });
+  return Boolean(findUserTurnAfterBaseline(turns, message, baselineLastTurnId));
 }
 
 function normalizeTurnText(text) {
@@ -2791,7 +2917,11 @@ async function settlePage(page) {
 }
 
 async function openNewConversation(page) {
-  await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  if (page.url().startsWith('https://configured-target.invalid/') && !sessionIdFromUrl(page.url())) {
+    await settlePage(page);
+    return;
+  }
+  await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await settlePage(page);
 }
 
@@ -3432,7 +3562,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   let reloadedForMissingResponse = false;
 
   while (noTimeout || Date.now() - start < timeout) {
-    const turns = await getConversationTurns(page);
+    const turns = await getConversationTurns(page).catch(() => []);
     const text = responseAfterMessage(turns, message, baselineLastTurnId);
     const placeholder = !text || isProgressOnlyText(text);
     const pageState = await getTargetAppState(page).catch(() => null);
@@ -3449,7 +3579,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
       const state = await getCombinedGenerationState(page, pageState);
       if (!state.isGenerating) {
         await page.waitForTimeout(500);
-        const finalText = responseAfterMessage(await getConversationTurns(page), message, baselineLastTurnId);
+        const finalText = responseAfterMessage(await getConversationTurns(page).catch(() => []), message, baselineLastTurnId);
         const finalState = await getTargetAppState(page).catch(() => null);
         const finalGeneration = await getCombinedGenerationState(page, finalState);
         if (!finalGeneration.isGenerating) {
@@ -3482,7 +3612,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   }
 
   if (lastText) {
-    const finalText = responseAfterMessage(await getConversationTurns(page), message, baselineLastTurnId);
+    const finalText = responseAfterMessage(await getConversationTurns(page).catch(() => []), message, baselineLastTurnId);
     const finalState = await getTargetAppState(page).catch(() => null)
     const finalGeneration = await getCombinedGenerationState(page, finalState);
     if (finalText && !finalGeneration.isGenerating) return finalText;
@@ -3541,7 +3671,7 @@ async function ask(page, message, args) {
   const watchBaseline = baselineState ? stateBaseline(baselineState) : null;
   const turnsBefore = await getConversationTurns(page);
   const baselineLastTurnId = turnsBefore.length ? turnsBefore[turnsBefore.length - 1].testid : '';
-  await sendMessage(page, message);
+  await sendMessage(page, message, baselineLastTurnId);
   await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout: 10000 }).catch(() => {});
   refreshSessionTranscript(page, args);
   await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
@@ -4036,9 +4166,9 @@ async function main() {
     return;
   }
 
-  const browser = await chromium.connectOverCDP(args.cdp);
+  const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
   try {
-    const page = await findTargetAppPage(browser);
+    const page = await findTargetAppPage(browser, args);
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
     if (passiveCurrentPageRead) {
       refreshSessionTranscript(page, args);

@@ -7,6 +7,7 @@ Terminal bridge for an already-open target app browser tab exposed through Chrom
 Copy `.env.example` into your shell or service environment and set:
 
 - `CHATBOT_CDP_URL`: Chromium DevTools endpoint. Defaults to `http://127.0.0.1:9222`.
+- `CHATBOT_CDP_CONNECT_TIMEOUT_MS`: Chromium DevTools attach timeout. Defaults to `60000`.
 - `CHATBOT_TRANSCRIPT_DIR`: private transcript output directory. Defaults to `outputs/`, which is gitignored.
 - `CHATBOT_PLAYWRIGHT_CORE_PATH`: optional absolute module path if `playwright-core` is installed outside this package.
 
@@ -26,6 +27,13 @@ On the RPC screen-97 test lane used during development, the browser CDP endpoint
 
 ```bash
 node CB.js --cdp http://127.0.0.1:9241 --status
+```
+
+Use `--new-tab` when a test prompt should run in a separate target app tab without
+taking over an already-running conversation:
+
+```bash
+node CB.js --cdp http://127.0.0.1:9241 --new-tab --new-conversation --message "hello"
 ```
 
 ## Commands
@@ -88,6 +96,11 @@ Send a prompt and stream the answer as target app produces it:
 ```bash
 node CB.js --message "Summarize this in three bullets"
 ```
+
+Before submitting, CB verifies that the composer draft contains the intended
+prompt text or a recognized long-form pasted-text attachment. After submitting,
+it waits for a matching user turn to appear after the baseline turn before it
+records the prompt as accepted or appends it to the transcript.
 
 Use `--no-stream` to wait silently and print the final answer only.
 Use `--state-jsonl` with a prompt to emit structured state events while still returning the answer.
