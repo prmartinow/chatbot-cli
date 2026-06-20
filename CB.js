@@ -8,7 +8,15 @@ const crypto = require('crypto');
 function loadPlaywright() {
   const override = process.env.CHATBOT_PLAYWRIGHT_CORE_PATH;
   if (override) return require(override);
-  return require('playwright-core');
+  const packageName = process.env.CHATBOT_PLAYWRIGHT_PACKAGE || 'rebrowser-playwright-core';
+  try {
+    return require(packageName);
+  } catch (error) {
+    if (packageName !== 'playwright-core') {
+      throw new Error(`Unable to load ${packageName}. Install it or set CHATBOT_PLAYWRIGHT_PACKAGE=playwright-core to use the unpatched driver. ${error.message || error}`);
+    }
+    throw error;
+  }
 }
 
 const { chromium } = loadPlaywright();

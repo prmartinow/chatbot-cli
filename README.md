@@ -2,14 +2,21 @@
 
 Terminal bridge for an already-open target app browser tab exposed through Chromium DevTools Protocol.
 
+CB uses Rebrowser's patched Playwright Core driver by default while still connecting
+to the already-open browser through CDP. Set `CHATBOT_PLAYWRIGHT_PACKAGE=playwright-core`
+to fall back to unpatched Playwright Core for compatibility checks.
+Rebrowser's patched Playwright packages can lag upstream Playwright releases, so
+driver upgrades should be validated with a live CDP status check.
+
 ## Configuration
 
 Copy `.env.example` into your shell or service environment and set:
 
 - `CHATBOT_CDP_URL`: Chromium DevTools endpoint. Defaults to `http://127.0.0.1:9222`.
 - `CHATBOT_CDP_CONNECT_TIMEOUT_MS`: Chromium DevTools attach timeout. Defaults to `60000`.
+- `CHATBOT_PLAYWRIGHT_PACKAGE`: automation driver package. Defaults to `rebrowser-playwright-core`.
 - `CHATBOT_TRANSCRIPT_DIR`: private transcript output directory. Defaults to `outputs/`, which is gitignored.
-- `CHATBOT_PLAYWRIGHT_CORE_PATH`: optional absolute module path if `playwright-core` is installed outside this package.
+- `CHATBOT_PLAYWRIGHT_CORE_PATH`: optional absolute module path override; wins over `CHATBOT_PLAYWRIGHT_PACKAGE`.
 
 Install dependencies:
 
