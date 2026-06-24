@@ -113,6 +113,10 @@ Options:
   --recover-queue
                   Sync the active conversation and reconcile queued/running job state.
   --queue-limit   With --run-queue, stop after this many jobs. Default: all.
+  --skip-failed   With --run-queue, auto-skip a blocking 'failed' job and continue
+                  to the next pending job, instead of stopping. The skip is
+                  journaled as 'job_skipped_auto'. Default: off (a failed job
+                  still blocks until manually reset).
   --conversation  Target session id or scheduled alias. Use "current" for the active tab.
   --new-conversation
                   Start a new target app conversation before the prompt.
@@ -171,6 +175,7 @@ function parseArgs(argv) {
     queueWatch: false,
     queueStatus: false,
     recoverQueue: false,
+    skipFailed: false,
     queueLimit: 0,
     conversation: '',
     newConversation: false,
@@ -217,6 +222,7 @@ function parseArgs(argv) {
     else if (arg === '--queue-watch') args.queueWatch = true;
     else if (arg === '--queue-status') args.queueStatus = true;
     else if (arg === '--recover-queue') args.recoverQueue = true;
+    else if (arg === '--skip-failed') args.skipFailed = true;
     else if (arg === '--queue-limit') args.queueLimit = Number(next());
     else if (arg === '--conversation') args.conversation = next();
     else if (arg === '--new-conversation') args.newConversation = true;
@@ -411,12 +417,28 @@ async function syncTranscriptFromPage(page, args, options = {}) {
       reason: 'active_generation',
     });
   }
-  const transcriptText = fs.readFileSync(args.transcript, 'utf8');
-  const entries = parseTranscriptEntries(transcriptText);
-  const startIndex = findTranscriptSyncStart(entries, turns);
+  let transcriptText = fs.readFileSync(args.transcript, 'utf8');
+  let entries = parseTranscriptEntries(transcriptText);
+  let startIndex = findTranscriptSyncStart(entries, turns);
 
   if (startIndex === -1) {
-    throw new Error(`Could not match existing transcript tail to live target app turns: ${args.transcript}`);
+    // A stale transcript tail (e.g. a leftover `new-chat.txt` from a prior clean
+    // test) makes the live-DOM sync unrecoverable. Rather than throw and take
+    // down the queue runner, quarantine the mismatched file and retry once
+    // against a fresh transcript. This mirrors the documented manual recovery.
+    const stale = args.transcript;
+    const quarantined = `${stale}.stale-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    try {
+      fs.renameSync(stale, quarantined);
+      info(`[sync] transcript tail did not match live turns; quarantined ${stale} -> ${quarantined}`);
+    } catch (renameError) {
+      info(`[sync] could not quarantine stale transcript ${stale}: ${renameError.message}`);
+    }
+    ensureTranscript(args.transcript);
+    transcriptText = fs.readFileSync(args.transcript, 'utf8');
+    entries = parseTranscriptEntries(transcriptText);
+    startIndex = findTranscriptSyncStart(entries, turns);
+    if (startIndex === -1) startIndex = 0; // fresh transcript: append all live turns
   }
 
   const appended = [];
@@ -3484,6 +3506,20 @@ async function runScheduledQueue(page, args) {
     const { job, blocked } = takeNextScheduledJob();
     if (!job) {
       if (blocked) {
+        if (args.skipFailed && blocked.job.status === 'failed') {
+          // A failed job should not pin the whole queue forever. When the
+          // operator opts in with --skip-failed, auto-skip the blocking failed
+          // job (journaled), then loop to the next pending job. The default
+          // remains that a failed job blocks until manually reset, so genuine
+          // failures are not silently dropped.
+          finishScheduledJob(blocked.job.id, {
+            status: 'skipped',
+            lastError: blocked.job.lastError || '',
+            result: { ...(blocked.job.result || {}), skippedAt: nowIso(), skippedReason: 'auto-skipped by --skip-failed (blocking failed job)' },
+          }, 'job_skipped_auto');
+          info(`[queue] #${blocked.job.seq} ${blocked.job.id}: auto-skipped (failed; --skip-failed)`);
+          continue;
+        }
         const message = `[queue] blocked at #${blocked.job.seq} ${blocked.job.id}: ${blocked.reason}`;
         if (!args.queueWatch) {
           console.error(message);

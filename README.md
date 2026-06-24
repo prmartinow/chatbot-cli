@@ -168,3 +168,59 @@ Run `node CB.js` and use:
 Multiline paste works directly at `CB>`. Long pasted text that target app converts into a composer attachment is surfaced through `/status`.
 
 Long Markdown prompts are matched back to target app turns with normalized text anchors, so code fences, inline backticks, ProseMirror spacing, and collapsed "show more" rendering do not block response capture.
+
+
+## Known recovery procedures
+
+Two queue-runner failure modes were observed and hardened in CB.js. The
+behaviors below are what the runner now does automatically; the manual steps
+are documented in case you ever need to inspect or undo state by hand.
+
+### 1. Stale transcript tail crashes the queue runner
+
+`--run-queue` reconciles the on-disk transcript against the live target app DOM
+before running jobs. If a transcript file (typically a leftover
+`outputs/new-chat.txt` from a prior clean test) has a tail that no longer
+matches the live page, sync used to throw and abort the whole runner before any
+job could run.
+
+**Now**: on a transcript-tail mismatch the runner renames the stale file aside
+(`outputs/new-chat.txt.stale-<ISO timestamp>`) and retries the sync against a
+fresh transcript, instead of throwing. The quarantine is logged.
+
+**Manual recovery** (if ever needed):
+```sh
+mv outputs/new-chat.txt outputs/new-chat.txt.stale-backup
+# the runner recreates outputs/new-chat.txt on next use
+```
+
+### 2. A blocking `failed` job pins the queue
+
+By design a job in `failed` status blocks later pending jobs until it is
+recovered, reset, or skipped (so genuine failures are not silently dropped).
+There was no CLI path to skip a blocking failed job, leaving manual edits to
+`outputs/scheduler/queue.json` as the only way out.
+
+**Now**: `--skip-failed` makes `--run-queue` auto-skip a blocking `failed` job,
+journal it as `job_skipped_auto`, and continue to the next pending job.
+
+```sh
+CB --run-queue --cdp http://127.0.0.1:9241 --skip-failed
+```
+
+The default remains that a failed job blocks until manually reset. To skip a
+failed job without running the queue, edit
+`outputs/scheduler/queue.json` directly:
+```sh
+python3 -c "
+import json, datetime
+p='outputs/scheduler/queue.json'
+d=json.load(open(p))
+for j in d['jobs']:
+    if j.get('status')=='failed':
+        j['status']='skipped'
+        j['updatedAt']=datetime.datetime.utcnow().isoformat(timespec='milliseconds')+'Z'
+json.dump(d, open(p,'w'), indent=2)
+print('skipped failed jobs')
+"
+```
