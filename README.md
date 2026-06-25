@@ -57,6 +57,8 @@ node CB.js --stop
 node CB.js --latest-assistant
 node CB.js --sync-transcript
 node CB.js --search "project name"
+node CB.js --search "project name" --search-scrolls 3
+node CB.js --search "project name" --search-all
 node CB.js --search "project name" --search-open 1
 node CB.js --dismiss-blocker
 ```
@@ -79,6 +81,12 @@ query, prints visible results, and closes the search dialog. Add
 `--search-open <index-or-title>` to open a result from that search by 1-based
 index or title/session text match. Search does not dismiss unrelated blocking
 modals; use `--dismiss-blocker` for that explicit action.
+
+Search is dynamic: CB waits while the history UI is still searching, distinguishes
+no-result state from results, and reports `phase`, `resultCount`, `complete`,
+`hasMore`, and `scrolls` in JSONL output. Use `--search-scrolls <n>` to scroll
+to the bottom repeatedly and load more results, or `--search-all` to keep
+scrolling until the loaded result list stops growing or the safety cap is hit.
 
 `--dismiss-blocker` attempts to dismiss one known safe blocking modal without
 sending a prompt or running another UI feature. It only uses safe close/Escape
@@ -177,6 +185,7 @@ Run `node CB.js` and use:
 - `/reasoning`: list visible reasoning controls.
 - `/model <text>` and `/reasoning <text>`: click matching UI options.
 - `/search <text>`: search target app conversations/history and print results.
+- `/search-all <text>`: search and scroll/load until the result list stops growing.
 - `/search-open <text>[ | index-or-title]`: search and open the first or matching result.
 - `/dismiss-blocker`: dismiss one known safe blocker without sending a prompt.
 - `/attach <path>`: queue a file for the next prompt.

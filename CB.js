@@ -37,6 +37,9 @@ const NO_RESPONSE_RELOAD_MS = 90000;
 const CONVERSATION_HYDRATION_TIMEOUT_MS = 15000;
 const COMPOSER_INSERT_TIMEOUT_MS = 10000;
 const PROMPT_ACCEPTED_TIMEOUT_MS = 30000;
+const SEARCH_READY_TIMEOUT_MS = 20000;
+const SEARCH_SCROLL_SETTLE_MS = 2500;
+const SEARCH_ALL_MAX_SCROLLS = 60;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
 const QUEUE_STATE_PATH = path.join(SCHEDULER_DIR, 'queue.json');
@@ -55,6 +58,7 @@ const COMMAND_PREFIXES = [
   '/model ',
   '/reasoning ',
   '/search ',
+  '/search-all ',
   '/search-open ',
   '/status ',
   '/stream ',
@@ -68,6 +72,7 @@ const COMMANDS = new Set([
   '/models',
   '/reasoning',
   '/search',
+  '/search-all',
   '/search-open',
   '/dismiss-blocker',
   '/artifacts',
@@ -182,6 +187,9 @@ Options:
   --alias         Alias to assign to a new or existing conversation in the scheduler index.
   --search        Search the target app conversation/history UI and print results.
   --search-open   With --search, open a result by 1-based index or text match.
+  --search-all    With --search, scroll/load until the result list stops growing.
+  --search-scrolls
+                  With --search, scroll to the end this many times to load more results.
   --dismiss-blocker
                   Dismiss one known safe blocker, then exit. Does not send a prompt.
   --models        Print visible model picker options and exit.
@@ -206,6 +214,8 @@ Interactive commands:
   /reasoning <text>
                   Select a reasoning option by visible label.
   /search <text>  Search target app conversations/history and print results.
+  /search-all <text>
+                  Search and repeatedly scroll until the result list stops growing.
   /search-open <text>[ | index-or-title]
                   Search and open the first or matching result.
   /dismiss-blocker
@@ -234,6 +244,9 @@ function parseArgs(argv) {
     deepStatus: false,
     searchQuery: '',
     searchOpen: '',
+    searchAll: false,
+    searchScrolls: 0,
+    searchScrollsExplicit: false,
     dismissBlocker: false,
     watchState: false,
     waitReady: false,
@@ -284,6 +297,11 @@ function parseArgs(argv) {
     else if (arg === '--deep-status' || arg === '--inspect-model-config') args.deepStatus = true;
     else if (arg === '--search') args.searchQuery = next();
     else if (arg === '--search-open') args.searchOpen = next();
+    else if (arg === '--search-all') args.searchAll = true;
+    else if (arg === '--search-scrolls') {
+      args.searchScrolls = Number(next());
+      args.searchScrollsExplicit = true;
+    }
     else if (arg === '--dismiss-blocker') args.dismissBlocker = true;
     else if (arg === '--watch-state') args.watchState = true;
     else if (arg === '--wait-ready') args.waitReady = true;
@@ -323,10 +341,16 @@ function parseArgs(argv) {
   if (!Number.isFinite(args.queueLimit) || args.queueLimit < 0) {
     throw new Error('--queue-limit must be zero or a positive number');
   }
+  if (!Number.isInteger(args.searchScrolls) || args.searchScrolls < 0) {
+    throw new Error('--search-scrolls must be zero or a positive integer');
+  }
   if (args.waitReady) args.watchState = true;
   if (args.queueWatch) args.runQueue = true;
   if (args.searchOpen && !args.searchQuery) {
     throw new Error('--search-open requires --search <query>');
+  }
+  if ((args.searchAll || args.searchScrollsExplicit) && !args.searchQuery) {
+    throw new Error('--search-all and --search-scrolls require --search <query>');
   }
 
   if (args.transcript) args.transcript = path.resolve(args.transcript);
@@ -352,6 +376,8 @@ function isPassiveCurrentPageRead(args) {
     && !args.models
     && !args.searchQuery
     && !args.searchOpen
+    && !args.searchAll
+    && !args.searchScrollsExplicit
     && !args.dismissBlocker
     && !args.stop
     && !args.downloadArtifacts
@@ -3034,56 +3060,172 @@ async function extractTargetSearchResults(page) {
       ].join(' '))) || null;
     const query = textOf(input);
 
-    const rawCandidates = [
-      ...dialog.querySelectorAll('ol > li'),
-      ...dialog.querySelectorAll('ul > li'),
-      ...dialog.querySelectorAll('[role="option"],[role="listitem"],[cmdk-item],a[href],button,[role="button"]'),
-    ].filter(isVisible);
+    const scrollable = [...dialog.querySelectorAll('*')]
+      .filter((el) => isVisible(el) && el.scrollHeight > el.clientHeight + 10)
+      .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0] || null;
+    document.querySelectorAll('[data-cb-search-scroll-container]').forEach((el) => {
+      el.removeAttribute('data-cb-search-scroll-container');
+    });
+    if (scrollable) scrollable.setAttribute('data-cb-search-scroll-container', 'true');
+
+    const resultMetaFromHref = (href) => {
+      try {
+        const url = new URL(href, location.href);
+        const parts = url.pathname.split('/').filter(Boolean);
+        if (parts[0] !== 'c' || !parts[1]) return null;
+        return {
+          url: url.toString(),
+          sessionId: parts[1],
+          messageId: url.searchParams.get('messageId') || '',
+          source: url.searchParams.get('src') || '',
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    const anchors = [...dialog.querySelectorAll('a[href]')]
+      .filter(isVisible)
+      .map((anchor) => ({ anchor, meta: resultMetaFromHref(anchor.href) }))
+      .filter((item) => item.meta);
     const seen = new Set();
     const results = [];
-    for (const candidate of rawCandidates) {
-      if (results.length >= 80) break;
-      const text = textOf(candidate);
-      const aria = candidate.getAttribute('aria-label') || '';
+    for (const { anchor, meta } of anchors) {
+      const text = textOf(anchor);
+      const aria = anchor.getAttribute('aria-label') || '';
       const joined = [text, aria].join(' ').trim();
       if (!joined || /^close$/i.test(joined) || /^no results$/i.test(joined)) continue;
-      if (candidate === input || candidate.contains(input)) continue;
-      const clickable = candidate.matches('a[href],button,[role="button"],[role="option"],[cmdk-item]')
-        ? candidate
-        : candidate.querySelector('a[href],button,[role="button"],[role="option"],[cmdk-item]') || candidate;
-      const href = clickable.href || candidate.querySelector('a[href]')?.href || '';
-      const key = [joined, href].join('::');
+      if (anchor === input || anchor.contains(input)) continue;
+      const key = [meta.sessionId, meta.messageId || meta.url].join('::');
       if (seen.has(key)) continue;
       seen.add(key);
       const index = results.length + 1;
-      clickable.setAttribute('data-cb-search-result-index', String(index));
+      anchor.setAttribute('data-cb-search-result-index', String(index));
       results.push({
         index,
         title: trimResultText(text || aria),
         aria: trimResultText(aria),
-        url: href,
-        sessionId: href ? ((href.match(/\/c\/([^/?#]+)/) || [])[1] || '') : '',
+        url: meta.url,
+        sessionId: meta.sessionId,
+        messageId: meta.messageId,
+        source: meta.source,
       });
     }
 
     const dialogText = textOf(dialog);
+    const loadingSignals = [
+      ...dialog.querySelectorAll('[role="status"],[role="progressbar"],[aria-busy="true"],svg.animate-spin,.animate-spin'),
+    ].filter(isVisible).map(textOf).filter(Boolean);
+    const loading = loadingSignals.length > 0
+      || (results.length === 0 && /\b(searching|loading|loading more|loading results)\b/i.test(dialogText));
+    const empty = results.length === 0 && /\bno results\b/i.test(dialogText);
+    const scroll = scrollable ? {
+      top: scrollable.scrollTop,
+      height: scrollable.clientHeight,
+      scrollHeight: scrollable.scrollHeight,
+      remaining: Math.max(0, scrollable.scrollHeight - scrollable.clientHeight - scrollable.scrollTop),
+    } : null;
+    const hasMore = Boolean(scroll && scroll.remaining > 8);
+    const phase = results.length ? 'ready' : (empty ? 'empty' : 'searching');
+    const complete = phase === 'ready' ? (!hasMore && !loading) : phase === 'empty';
     return {
       query,
-      empty: results.length === 0 && /\bno results\b/i.test(dialogText),
+      phase,
+      empty,
+      loading,
+      loadingSignals,
+      complete,
+      hasMore,
+      scroll,
       results,
     };
   });
 }
 
-async function waitForTargetSearchResults(page) {
-  const deadline = Date.now() + 8000;
-  let latest = { query: '', empty: false, results: [] };
+async function waitForTargetSearchResults(page, options = {}) {
+  const deadline = Date.now() + SEARCH_READY_TIMEOUT_MS;
+  let latest = { query: '', phase: 'searching', empty: false, loading: false, complete: false, hasMore: false, results: [] };
+  let lastSignature = '';
+  let stableSince = 0;
   while (Date.now() < deadline) {
     latest = await extractTargetSearchResults(page);
-    if (latest.results.length || latest.empty) return latest;
+    const signature = [latest.phase, latest.results.length, latest.empty, latest.loading, latest.scroll?.scrollHeight || 0].join(':');
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = Date.now();
+      if (typeof options.onState === 'function') options.onState(latest, { event: 'search_state' });
+    }
+    if (latest.results.length) {
+      if (Date.now() - stableSince >= 500) return latest;
+    } else if (latest.empty) {
+      if (Date.now() - stableSince >= 500) return latest;
+    }
     await page.waitForTimeout(250);
   }
+  latest.phase = latest.results.length ? 'ready' : 'timeout';
+  latest.timedOut = true;
   return latest;
+}
+
+async function scrollTargetSearchResults(page) {
+  return page.evaluate(() => {
+    const target = document.querySelector('[data-cb-search-scroll-container="true"]');
+    if (!target) return null;
+    const before = {
+      top: target.scrollTop,
+      height: target.clientHeight,
+      scrollHeight: target.scrollHeight,
+    };
+    target.scrollTop = target.scrollHeight;
+    return {
+      before,
+      after: {
+        top: target.scrollTop,
+        height: target.clientHeight,
+        scrollHeight: target.scrollHeight,
+      },
+    };
+  });
+}
+
+async function loadMoreTargetSearchResults(page, state, options = {}) {
+  const maxScrolls = Math.max(0, options.maxScrolls || 0);
+  let current = state;
+  let scrolls = 0;
+  let stagnantScrolls = 0;
+  while (scrolls < maxScrolls && current.results.length && current.hasMore) {
+    const beforeCount = current.results.length;
+    const beforeHeight = current.scroll?.scrollHeight || 0;
+    await scrollTargetSearchResults(page);
+    scrolls += 1;
+    if (typeof options.onState === 'function') {
+      options.onState({ ...current, scrolls, phase: 'scrolling' }, { event: 'search_scroll' });
+    }
+
+    const deadline = Date.now() + SEARCH_SCROLL_SETTLE_MS;
+    let latest = current;
+    while (Date.now() < deadline) {
+      latest = await extractTargetSearchResults(page);
+      const changed = latest.results.length > beforeCount || (latest.scroll?.scrollHeight || 0) > beforeHeight;
+      const stoppedAtEnd = !latest.loading && !latest.hasMore;
+      if (changed || stoppedAtEnd) break;
+      await page.waitForTimeout(250);
+    }
+    current = latest;
+    const afterCount = current.results.length;
+    const afterHeight = current.scroll?.scrollHeight || 0;
+    if (afterCount <= beforeCount && afterHeight <= beforeHeight) {
+      stagnantScrolls += 1;
+    } else {
+      stagnantScrolls = 0;
+    }
+    if (typeof options.onState === 'function') options.onState(current, { event: 'search_state', scrolls });
+    if (stagnantScrolls >= 2) break;
+  }
+  current.scrolls = scrolls;
+  current.complete = !current.hasMore || stagnantScrolls >= 2 || scrolls >= maxScrolls;
+  current.truncated = Boolean(current.hasMore && scrolls >= maxScrolls);
+  return current;
 }
 
 async function closeTargetSearch(page) {
@@ -3114,7 +3256,13 @@ async function searchTargetApp(page, query, options = {}) {
   if (!searchQuery) throw new Error('Search query is empty');
 
   await setTargetSearchQuery(page, searchQuery);
-  const state = await waitForTargetSearchResults(page);
+  let state = await waitForTargetSearchResults(page, options);
+  const maxScrolls = Number.isFinite(options.maxScrolls)
+    ? options.maxScrolls
+    : (options.loadAll ? SEARCH_ALL_MAX_SCROLLS : 0);
+  if (state.results.length && maxScrolls > 0) {
+    state = await loadMoreTargetSearchResults(page, state, { ...options, maxScrolls });
+  }
   let opened = null;
   if (options.open) {
     opened = chooseSearchResult(state.results, options.open);
@@ -3132,7 +3280,15 @@ async function searchTargetApp(page, query, options = {}) {
 
   return {
     query: searchQuery,
+    phase: state.phase,
     empty: Boolean(state.empty),
+    loading: Boolean(state.loading),
+    complete: Boolean(state.complete),
+    hasMore: Boolean(state.hasMore),
+    timedOut: Boolean(state.timedOut),
+    truncated: Boolean(state.truncated),
+    scrolls: state.scrolls || 0,
+    resultCount: state.results.length,
     results: state.results,
     opened,
     url: page.url(),
@@ -3151,20 +3307,60 @@ function printSearchResults(result, jsonl = false) {
   }
 
   console.log(`Search: ${result.query}`);
+  console.log(`State: ${result.phase || 'unknown'}; results=${result.resultCount || result.results.length}; complete=${result.complete ? 'yes' : 'no'}; scrolls=${result.scrolls || 0}${result.truncated ? '; truncated=yes' : ''}`);
   if (!result.results.length) {
-    console.log(result.empty ? 'No results.' : 'No visible results.');
+    if (result.empty) console.log('No results.');
+    else if (result.timedOut) console.log('Search timed out before results or no-result state appeared.');
+    else console.log('No visible results.');
     return;
   }
   for (const item of result.results) {
+    const displayTitle = item.title.length > 240 ? `${item.title.slice(0, 237)}...` : item.title;
     const suffix = [
       item.sessionId ? `session=${item.sessionId}` : '',
       item.url ? `url=${item.url}` : '',
     ].filter(Boolean).join(' ');
-    console.log(`#${item.index} ${item.title}${suffix ? ` (${suffix})` : ''}`);
+    console.log(`#${item.index} ${displayTitle}${suffix ? ` (${suffix})` : ''}`);
   }
   if (result.opened) {
     console.log(`Opened #${result.opened.index}: ${result.opened.title}`);
   }
+}
+
+function buildSearchStateEvent(state, extra = {}) {
+  return {
+    type: 'target_app_search_state',
+    at: nowIso(),
+    event: extra.event || 'search_state',
+    query: state.query || '',
+    phase: state.phase || 'unknown',
+    resultCount: state.results?.length || 0,
+    empty: Boolean(state.empty),
+    loading: Boolean(state.loading),
+    complete: Boolean(state.complete),
+    hasMore: Boolean(state.hasMore),
+    timedOut: Boolean(state.timedOut),
+    truncated: Boolean(state.truncated),
+    scrolls: extra.scrolls || state.scrolls || 0,
+    scroll: state.scroll || null,
+  };
+}
+
+function searchOptionsFromArgs(args) {
+  const maxScrolls = args.searchScrollsExplicit
+    ? args.searchScrolls
+    : (args.searchAll ? SEARCH_ALL_MAX_SCROLLS : 0);
+  const options = {
+    open: args.searchOpen,
+    loadAll: args.searchAll,
+    maxScrolls,
+  };
+  if (args.stateJsonl) {
+    options.onState = (state, extra = {}) => {
+      console.log(JSON.stringify(buildSearchStateEvent(state, extra)));
+    };
+  }
+  return options;
 }
 
 async function markModelSwitcher(page) {
@@ -4898,6 +5094,23 @@ async function interactive(page, args) {
       console.log('Usage: /search <query>');
       continue;
     }
+    if (input.type === 'command' && input.text.startsWith('/search-all ')) {
+      const query = input.text.slice('/search-all '.length).trim();
+      if (!query) {
+        console.log('Usage: /search-all <query>');
+        continue;
+      }
+      const result = await searchTargetApp(page, query, {
+        loadAll: true,
+        maxScrolls: SEARCH_ALL_MAX_SCROLLS,
+      });
+      printSearchResults(result);
+      continue;
+    }
+    if (input.type === 'command' && input.text === '/search-all') {
+      console.log('Usage: /search-all <query>');
+      continue;
+    }
     if (input.type === 'command' && input.text.startsWith('/search-open ')) {
       const raw = input.text.slice('/search-open '.length).trim();
       const [queryPart, openPart] = raw.split(/\s+\|\s+/, 2);
@@ -5130,7 +5343,7 @@ async function main() {
     }
 
     if (args.searchQuery) {
-      const result = await searchTargetApp(page, args.searchQuery, { open: args.searchOpen });
+      const result = await searchTargetApp(page, args.searchQuery, searchOptionsFromArgs(args));
       if (result.opened) {
         refreshSessionTranscript(page, args);
         await indexCurrentConversation(page, args, 'conversation_search_opened', {
