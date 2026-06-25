@@ -92,7 +92,7 @@ node CB.js --recover-queue --cdp http://127.0.0.1:9241
 node CB.js --queue-status
 ```
 
-`--run-queue` processes scheduled prompts in strict queue order. It only considers the first non-done job: `running`, `waiting`, `needs_recovery`, or `failed` jobs block later pending work until they are recovered, reset, or intentionally skipped. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. If target app is still generating when a timeout fires, the job is held as `waiting` and the runner stops instead of marking it failed and continuing. Pre-send UI blockers such as subscription modals or `modal-conversation-history-rate-limit` are held as `needs_recovery`; no prompt is considered submitted and the next queued job must not start. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
+`--run-queue` processes scheduled prompts in strict queue order. It only considers the first non-done job: `running`, `waiting`, `needs_recovery`, or `failed` jobs block later pending work until they are recovered, reset, or intentionally skipped. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. If target app is still generating when a timeout fires, the job is held as `waiting` and the runner stops instead of marking it failed and continuing. Pre-send UI blockers such as subscription modals or `modal-conversation-history-rate-limit` are held as `needs_recovery`; no prompt is considered submitted and the next queued job must not start. Known safe blockers such as `#modal-subscription-failure` and identified artifact/lightbox close overlays are auto-dismissed by clicking only visible Close controls and then rechecking the blocker state. Payment, upgrade, login, captcha, destructive, or unknown dialogs are not clicked. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
 
 `--recover-queue` never sends a new prompt. It syncs the active target app conversation, skips any in-flight assistant preface while the stop control is visible, updates matching rounds/jobs after the final answer is complete, audits already-done jobs for stale response counts, and reports the first queue blocker or next pending job. Use `--conversation <session-id-or-alias>` with `--recover-queue`, `--sync-transcript`, `--latest-assistant`, or `--status` to inspect or recover a specific existing conversation without sending a message. Scheduler completion is driven by target app state, not by a timer: queued jobs have no response timeout by default, and older jobs that only stored the default `180000` timeout do not inherit it. Use `--timeout <ms>` only as an explicit watchdog, or `--timeout 0` to force no timeout.
 
@@ -108,6 +108,10 @@ Before submitting, CB verifies that the composer draft contains the intended
 prompt text or a recognized long-form pasted-text attachment. After submitting,
 it waits for a matching user turn to appear after the baseline turn before it
 records the prompt as accepted or appends it to the transcript.
+Before typing or clicking send, CB also checks the center point of the composer
+and send button with `document.elementFromPoint()`. If a visible modal, dialog,
+or open overlay covers that point and cannot be safely dismissed, CB reports a
+UI blocker and does not insert or submit the prompt.
 
 Use `--no-stream` to wait silently and print the final answer only.
 Use `--state-jsonl` with a prompt to emit structured state events while still returning the answer.

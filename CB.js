@@ -66,6 +66,18 @@ const COMMANDS = new Set([
   '/download',
   '/stop',
 ]);
+const COMPOSER_SELECTORS = [
+  '#prompt-textarea',
+  '[data-testid="composer-input"]',
+  'textarea[placeholder]',
+  'div[contenteditable="true"]',
+];
+const SEND_BUTTON_SELECTORS = [
+  '#composer-submit-button',
+  '[data-testid="send-button"]',
+  'button[aria-label="Send prompt"]',
+  'button[aria-label="Send message"]',
+];
 const BLOCKING_MODAL_SELECTORS = [
   '#modal-conversation-history-rate-limit',
   '[data-testid="modal-conversation-history-rate-limit"]',
@@ -75,6 +87,17 @@ const BLOCKING_MODAL_SELECTORS = [
   '[data-testid^="modal-"][data-testid*="rate-limit"]',
   '[id^="modal-"][id*="subscription"]',
   '[data-testid^="modal-"][data-testid*="subscription"]',
+  '[id^="modal-"][id*="artifact"]',
+  '[data-testid^="modal-"][data-testid*="artifact"]',
+  '[id^="modal-"][id*="lightbox"]',
+  '[data-testid^="modal-"][data-testid*="lightbox"]',
+];
+const CLICK_INTERCEPTOR_SELECTORS = [
+  '[role="dialog"]',
+  '[aria-modal="true"]',
+  '[id^="modal-"]',
+  '[data-testid*="modal"]',
+  '[data-state="open"]',
 ];
 
 function usage() {
@@ -1138,14 +1161,7 @@ async function getAssistantTurns(page) {
 }
 
 async function findComposer(page) {
-  const selectors = [
-    '#prompt-textarea',
-    '[data-testid="composer-input"]',
-    'textarea[placeholder]',
-    'div[contenteditable="true"]',
-  ];
-
-  for (const selector of selectors) {
+  for (const selector of COMPOSER_SELECTORS) {
     const locator = page.locator(selector).last();
     try {
       await locator.waitFor({ state: 'visible', timeout: 3000 });
@@ -1157,14 +1173,9 @@ async function findComposer(page) {
 }
 
 async function getSendButtonState(page) {
-  return page.evaluate(() => {
+  return page.evaluate((sendButtonSelectors) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    const button = [...document.querySelectorAll([
-      '#composer-submit-button',
-      '[data-testid="send-button"]',
-      'button[aria-label="Send prompt"]',
-      'button[aria-label="Send message"]',
-    ].join(','))]
+    const button = [...document.querySelectorAll(sendButtonSelectors.join(','))]
       .find(isVisible);
 
     if (!button) return { exists: false, disabled: false, label: '' };
@@ -1178,7 +1189,7 @@ async function getSendButtonState(page) {
         button.innerText || '',
       ].join(' ').replace(/\s+/g, ' ').trim(),
     };
-  }).catch(() => ({ exists: false, disabled: false, label: '' }));
+  }, SEND_BUTTON_SELECTORS).catch(() => ({ exists: false, disabled: false, label: '' }));
 }
 
 async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
@@ -1190,7 +1201,7 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
     lastButton = await getSendButtonState(page);
     lastState = await getTargetAppState(page).catch(() => null);
     if (lastState?.blockingModal) {
-      throw new Error(blockingModalErrorMessage(lastState.blockingModal, 'while waiting for the send button'));
+      await ensureNoBlockingModal(page, 'while waiting for the send button');
     }
     if (!lastButton.exists || !lastButton.disabled) {
       return { button: lastButton, state: lastState };
@@ -1293,7 +1304,7 @@ async function waitForComposerInsertion(page, message, timeout = COMPOSER_INSERT
   let lastMatch = { ok: false, kind: '' };
 
   while (Date.now() - start < timeout) {
-    await assertNoBlockingModal(page, 'while verifying inserted prompt text');
+    await ensureNoBlockingModal(page, 'while verifying inserted prompt text');
     lastState = await getComposerDraftState(page);
     lastMatch = composerDraftMatchesMessage(lastState, message);
     if (lastMatch.ok) return { state: lastState, match: lastMatch };
@@ -1318,7 +1329,7 @@ async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout 
   let lastComposer = null;
 
   while (Date.now() - start < timeout) {
-    await assertNoBlockingModal(page, 'while verifying the prompt was accepted');
+    await ensureNoBlockingModal(page, 'while verifying the prompt was accepted');
     lastTurns = await getConversationTurns(page).catch(() => []);
     const userTurn = findUserTurnAfterBaseline(lastTurns, message, baselineLastTurnId);
     if (userTurn) return userTurn;
@@ -1332,10 +1343,10 @@ async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout 
 }
 
 async function sendMessage(page, message, baselineLastTurnId = '') {
-  await assertNoBlockingModal(page, 'before finding the composer');
+  await ensureNoBlockingModal(page, 'before finding the composer');
   const composer = await findComposer(page);
   try {
-    await assertNoBlockingModal(page, 'before focusing the composer');
+    await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before focusing the composer', { preferLast: true });
     await composer.click({ timeout: 10000 });
   } catch (error) {
     const modal = await getBlockingModal(page);
@@ -1348,14 +1359,15 @@ async function sendMessage(page, message, baselineLastTurnId = '') {
   const ready = await waitForSendReady(page);
 
   if (!ready.button.exists) {
+    await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before pressing Enter to submit', { preferLast: true });
     await page.keyboard.press('Enter');
     await page.waitForTimeout(700);
     return waitForPromptAccepted(page, message, baselineLastTurnId);
   }
 
   try {
-    await assertNoBlockingModal(page, 'before clicking the send button');
-    await page.locator('#composer-submit-button, [data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send message"]')
+    await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
+    await page.locator(SEND_BUTTON_SELECTORS.join(', '))
       .first()
       .click({ timeout: 5000 });
   } catch (error) {
@@ -1413,13 +1425,18 @@ function blockingModalKindFromMeta(meta) {
     meta?.id || '',
     meta?.testid || '',
     meta?.role || '',
+    meta?.aria || '',
+    meta?.title || '',
     meta?.text || '',
   ].join(' ');
   if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
     return 'conversation_history_rate_limit';
   }
-  if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+  if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
     return 'subscription_modal';
+  }
+  if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
+    return 'artifact_lightbox';
   }
   return 'blocking_modal';
 }
@@ -1439,17 +1456,26 @@ function blockingModalErrorMessage(modal, context = 'before sending') {
   return `target app UI blocker detected ${context}: ${summary}. No prompt was submitted; wait for the modal to clear, then recover or resume the queue.`;
 }
 
+function clickableBlockerErrorMessage(blocker, context) {
+  const modal = blocker?.modal || blocker;
+  const target = blocker?.target?.label ? `${blocker.target.label} ` : '';
+  return blockingModalErrorMessage(modal, `${context}; ${target}center is covered`);
+}
+
 async function getBlockingModal(page) {
   return page.evaluate((selectors) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
     const kindOf = (meta) => {
-      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.text || ''].join(' ');
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
       if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
         return 'conversation_history_rate_limit';
       }
-      if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+      if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
+      }
+      if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
+        return 'artifact_lightbox';
       }
       return 'blocking_modal';
     };
@@ -1463,6 +1489,8 @@ async function getBlockingModal(page) {
           testid: modal.getAttribute('data-testid') || candidate.getAttribute('data-testid') || '',
           role: modal.getAttribute('role') || '',
           ariaModal: modal.getAttribute('aria-modal') || '',
+          aria: modal.getAttribute('aria-label') || candidate.getAttribute('aria-label') || '',
+          title: modal.getAttribute('title') || candidate.getAttribute('title') || '',
           text: textOf(modal),
         };
         return { ...result, kind: kindOf(result) };
@@ -1473,10 +1501,225 @@ async function getBlockingModal(page) {
   }, BLOCKING_MODAL_SELECTORS).catch(() => null);
 }
 
+async function dismissBlockingModal(page) {
+  const candidate = await page.evaluate((selectors) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const kindOf = (meta) => {
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
+      if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
+        return 'conversation_history_rate_limit';
+      }
+      if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
+        return 'subscription_modal';
+      }
+      if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
+        return 'artifact_lightbox';
+      }
+      return 'blocking_modal';
+    };
+    const isSafe = (meta) => {
+      const joined = [meta.id || '', meta.testid || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
+      return /modal-subscription-failure/i.test(joined)
+        || /\b(artifact|lightbox|image preview|media preview)\b/i.test(joined);
+    };
+    const unsafeAction = (el) => /\b(update payment|upgrade|log in|login|sign in|captcha|delete|remove|confirm|continue|subscribe|buy|purchase|pay)\b/i.test([
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      textOf(el),
+    ].join(' '));
+    const metaOf = (modal, candidateEl) => {
+      const result = {
+        id: modal.id || candidateEl.id || '',
+        testid: modal.getAttribute('data-testid') || candidateEl.getAttribute('data-testid') || '',
+        role: modal.getAttribute('role') || '',
+        ariaModal: modal.getAttribute('aria-modal') || '',
+        aria: modal.getAttribute('aria-label') || candidateEl.getAttribute('aria-label') || '',
+        title: modal.getAttribute('title') || candidateEl.getAttribute('title') || '',
+        text: textOf(modal),
+      };
+      return { ...result, kind: kindOf(result) };
+    };
+
+    for (const selector of selectors) {
+      for (const candidateEl of document.querySelectorAll(selector)) {
+        const modal = candidateEl.closest('[role="dialog"],[aria-modal="true"],[id^="modal-"],[data-testid^="modal-"]') || candidateEl;
+        if (!isVisible(modal)) continue;
+        const modalMeta = metaOf(modal, candidateEl);
+        if (!isSafe(modalMeta)) return { found: true, safe: false, modal: modalMeta };
+
+        const controls = [
+          ...modal.querySelectorAll('button[aria-label="Close"], [role="button"][aria-label="Close"]'),
+          ...[...modal.querySelectorAll('button')].filter((button) => /^close$/i.test(textOf(button))),
+        ].filter((control, index, list) => list.indexOf(control) === index)
+          .filter(isVisible)
+          .filter((control) => !unsafeAction(control));
+        const marker = `cb-dismiss-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        if (controls[0]) {
+          controls[0].setAttribute('data-cb-dismiss-blocker', marker);
+          return {
+            found: true,
+            safe: true,
+            modal: modalMeta,
+            closeSelector: `[data-cb-dismiss-blocker="${marker}"]`,
+          };
+        }
+
+        return { found: true, safe: true, modal: modalMeta, closeSelector: '' };
+      }
+    }
+
+    return { found: false, safe: false, modal: null, closeSelector: '' };
+  }, BLOCKING_MODAL_SELECTORS).catch((error) => ({
+    found: false,
+    safe: false,
+    modal: null,
+    closeSelector: '',
+    error: error.message || String(error),
+  }));
+
+  if (!candidate?.found) return { dismissed: false, found: false, reason: candidate?.error || 'no blocker' };
+  if (!candidate.safe) return { dismissed: false, found: true, modal: candidate.modal, reason: 'not safe to dismiss automatically' };
+
+  let clicked = false;
+  if (candidate.closeSelector) {
+    clicked = await page.locator(candidate.closeSelector).click({ timeout: 5000 }).then(() => true).catch(() => false);
+    await page.waitForTimeout(300);
+  }
+
+  const beforeEscape = await getBlockingModal(page);
+  if (beforeEscape) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  const remaining = await getBlockingModal(page);
+  return {
+    dismissed: !remaining,
+    found: true,
+    safe: true,
+    clicked,
+    escaped: Boolean(beforeEscape),
+    modal: candidate.modal,
+    remaining,
+  };
+}
+
 async function assertNoBlockingModal(page, context) {
   const modal = await getBlockingModal(page);
   if (modal) throw new Error(blockingModalErrorMessage(modal, context));
   return null;
+}
+
+async function ensureNoBlockingModal(page, context) {
+  let modal = await getBlockingModal(page);
+  if (!modal) return null;
+
+  const dismiss = await dismissBlockingModal(page);
+  modal = await getBlockingModal(page);
+  if (!modal) return dismiss;
+  throw new Error(blockingModalErrorMessage(modal, context));
+}
+
+async function getCenterPointClickBlocker(page, selectors, label, options = {}) {
+  return page.evaluate(({ selectors: selectorList, interceptorSelectors, label: targetLabel, preferLast }) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const kindOf = (meta) => {
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
+      if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
+        return 'conversation_history_rate_limit';
+      }
+      if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
+        return 'subscription_modal';
+      }
+      if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
+        return 'artifact_lightbox';
+      }
+      return 'blocking_modal';
+    };
+    const metaOf = (el) => {
+      const result = {
+        id: el.id || '',
+        testid: el.getAttribute('data-testid') || '',
+        role: el.getAttribute('role') || '',
+        ariaModal: el.getAttribute('aria-modal') || '',
+        aria: el.getAttribute('aria-label') || '',
+        title: el.getAttribute('title') || '',
+        text: textOf(el),
+      };
+      return { ...result, kind: kindOf(result) };
+    };
+
+    const targets = selectorList.flatMap((selector) => [...document.querySelectorAll(selector)])
+      .filter((el, index, list) => list.indexOf(el) === index)
+      .filter(isVisible);
+    const target = preferLast ? targets[targets.length - 1] : targets[0];
+    if (!target) {
+      return {
+        blocked: false,
+        target: { label: targetLabel, exists: false },
+        top: null,
+        modal: null,
+      };
+    }
+
+    const rect = target.getBoundingClientRect();
+    const centerX = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const centerY = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const top = document.elementFromPoint(centerX, centerY);
+    const targetContainsTop = top && (target === top || target.contains(top));
+    if (targetContainsTop) {
+      return {
+        blocked: false,
+        target: { label: targetLabel, exists: true, centerX, centerY },
+        top: top ? metaOf(top) : null,
+        modal: null,
+      };
+    }
+
+    const blocker = top?.closest(interceptorSelectors.join(','));
+    if (blocker && isVisible(blocker) && !blocker.contains(target)) {
+      return {
+        blocked: true,
+        target: { label: targetLabel, exists: true, centerX, centerY },
+        top: top ? metaOf(top) : null,
+        modal: metaOf(blocker),
+      };
+    }
+
+    return {
+      blocked: false,
+      target: { label: targetLabel, exists: true, centerX, centerY },
+      top: top ? metaOf(top) : null,
+      modal: null,
+    };
+  }, {
+    selectors,
+    interceptorSelectors: CLICK_INTERCEPTOR_SELECTORS,
+    label,
+    preferLast: Boolean(options.preferLast),
+  }).catch((error) => ({
+    blocked: false,
+    target: { label, exists: false },
+    top: null,
+    modal: null,
+    error: error.message || String(error),
+  }));
+}
+
+async function ensureTargetClickable(page, selectors, label, context, options = {}) {
+  await ensureNoBlockingModal(page, context);
+  let blocker = await getCenterPointClickBlocker(page, selectors, label, options);
+  if (!blocker.blocked) return blocker;
+
+  const dismiss = await dismissBlockingModal(page);
+  if (dismiss.dismissed) {
+    blocker = await getCenterPointClickBlocker(page, selectors, label, options);
+    if (!blocker.blocked) return blocker;
+  }
+
+  throw new Error(clickableBlockerErrorMessage(blocker, context));
 }
 
 function stripLeadingProgressPrefix(text) {
@@ -1552,18 +1795,56 @@ async function getGenerationState(page) {
 }
 
 async function getTargetAppState(page) {
-  return page.evaluate((blockingModalSelectors) => {
+  return page.evaluate(({ blockingModalSelectors, composerSelectors, sendButtonSelectors, clickInterceptorSelectors }) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
     const blockingModalKindOf = (meta) => {
-      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.text || ''].join(' ');
+      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
       if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
         return 'conversation_history_rate_limit';
       }
-      if (/modal-subscription-failure|subscription|upgrade|plan limit/i.test(joined)) {
+      if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
       }
+      if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
+        return 'artifact_lightbox';
+      }
       return 'blocking_modal';
+    };
+    const metaOf = (el) => {
+      if (!el) return null;
+      const result = {
+        id: el.id || '',
+        testid: el.getAttribute('data-testid') || '',
+        role: el.getAttribute('role') || '',
+        ariaModal: el.getAttribute('aria-modal') || '',
+        aria: el.getAttribute('aria-label') || '',
+        title: el.getAttribute('title') || '',
+        text: textOf(el),
+      };
+      return { ...result, kind: blockingModalKindOf(result) };
+    };
+    const centerPointBlocker = (target, label) => {
+      if (!target || !isVisible(target)) {
+        return { blocked: false, target: { label, exists: false }, modal: null, top: null };
+      }
+      const rect = target.getBoundingClientRect();
+      const centerX = Math.max(0, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+      const centerY = Math.max(0, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+      const top = document.elementFromPoint(centerX, centerY);
+      if (top && (target === top || target.contains(top))) {
+        return { blocked: false, target: { label, exists: true, centerX, centerY }, modal: null, top: metaOf(top) };
+      }
+      const blocker = top?.closest(clickInterceptorSelectors.join(','));
+      if (blocker && isVisible(blocker) && !blocker.contains(target)) {
+        return {
+          blocked: true,
+          target: { label, exists: true, centerX, centerY },
+          modal: metaOf(blocker),
+          top: metaOf(top),
+        };
+      }
+      return { blocked: false, target: { label, exists: true, centerX, centerY }, modal: null, top: metaOf(top) };
     };
     const blockingModal = (() => {
       for (const selector of blockingModalSelectors) {
@@ -1575,6 +1856,8 @@ async function getTargetAppState(page) {
             testid: modal.getAttribute('data-testid') || candidate.getAttribute('data-testid') || '',
             role: modal.getAttribute('role') || '',
             ariaModal: modal.getAttribute('aria-modal') || '',
+            aria: modal.getAttribute('aria-label') || candidate.getAttribute('aria-label') || '',
+            title: modal.getAttribute('title') || candidate.getAttribute('title') || '',
             text: textOf(modal),
           };
           return { ...result, kind: blockingModalKindOf(result) };
@@ -1741,8 +2024,10 @@ async function getTargetAppState(page) {
       })).slice(0, 20)
       : [];
 
-    const composerCandidates = [...document.querySelectorAll('#prompt-textarea, [data-testid="composer-input"], textarea[placeholder], div[contenteditable="true"]')];
-    const composer = composerCandidates.find(isVisible) || composerCandidates[0] || null;
+    const composerCandidates = composerSelectors.flatMap((selector) => [...document.querySelectorAll(selector)])
+      .filter((el, index, list) => list.indexOf(el) === index);
+    const visibleComposers = composerCandidates.filter(isVisible);
+    const composer = visibleComposers[visibleComposers.length - 1] || composerCandidates[composerCandidates.length - 1] || null;
     const composerRoot = composer?.closest('form')
       || composer?.closest('[data-testid*="composer"]')
       || composer?.parentElement?.parentElement
@@ -1768,6 +2053,19 @@ async function getTargetAppState(page) {
         })
         .slice(0, 20)
       : [];
+    const sendButton = [...document.querySelectorAll(sendButtonSelectors.join(','))]
+      .find(isVisible) || null;
+    const sendButtonState = sendButton
+      ? {
+        exists: true,
+        disabled: Boolean(sendButton.disabled || sendButton.getAttribute('aria-disabled') === 'true'),
+        label: controlText(sendButton),
+      }
+      : { exists: false, disabled: false, label: '' };
+    const clickability = {
+      composer: centerPointBlocker(composer, 'composer'),
+      sendButton: centerPointBlocker(sendButton, 'send button'),
+    };
 
     const activityTexts = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *')]
       .filter(isVisible)
@@ -1803,6 +2101,8 @@ async function getTargetAppState(page) {
         attachments: composerAttachments,
         fileInputCount: document.querySelectorAll('input[type="file"]').length,
       },
+      sendButton: sendButtonState,
+      clickability,
       activityTexts,
       turnCount: turns.length,
       lastTurns: turns.slice(-6).map((turn) => ({
@@ -1824,7 +2124,12 @@ async function getTargetAppState(page) {
         codeBlocks,
       },
     };
-  }, BLOCKING_MODAL_SELECTORS);
+  }, {
+    blockingModalSelectors: BLOCKING_MODAL_SELECTORS,
+    composerSelectors: COMPOSER_SELECTORS,
+    sendButtonSelectors: SEND_BUTTON_SELECTORS,
+    clickInterceptorSelectors: CLICK_INTERCEPTOR_SELECTORS,
+  });
 }
 
 function compactModelConfig(config) {
@@ -1889,7 +2194,7 @@ function summarizeState(state, modelConfig = null) {
   }
   lines.push(`Generating: ${state.isGenerating ? 'yes' : 'no'}`);
   if (state.blockingModal) {
-    lines.push(`UI blocker: ${blockingModalSummary(state.blockingModal)}`);
+    lines.push(`Blocking modal: ${blockingModalSummary(state.blockingModal)}`);
   }
   if (state.generationControls.length) {
     lines.push(`Generation controls: ${state.generationControls.map((item) => item.text).join(' | ')}`);
@@ -1898,6 +2203,17 @@ function summarizeState(state, modelConfig = null) {
     lines.push(`Voice/dictation controls: recognized, not used (${state.voiceControls.map((item) => item.aria || item.title || item.text || item.testid).join(' | ')})`);
   }
   lines.push(`Composer: ${state.composer.visible ? 'visible' : 'not visible'}, ${state.composer.textChars} chars`);
+  if (state.clickability?.composer?.blocked) {
+    lines.push(`Composer click blocker: ${blockingModalSummary(state.clickability.composer.modal)}`);
+  }
+  if (state.sendButton?.exists) {
+    lines.push(`Send button: visible, ${state.sendButton.disabled ? 'disabled' : 'enabled'}${state.sendButton.label ? ` (${state.sendButton.label})` : ''}`);
+  } else {
+    lines.push('Send button: not visible');
+  }
+  if (state.clickability?.sendButton?.blocked) {
+    lines.push(`Send button click blocker: ${blockingModalSummary(state.clickability.sendButton.modal)}`);
+  }
   if (state.composer.textChars >= 10000) {
     lines.push(`Composer long text: yes (${state.composer.textChars} chars)`);
   }
@@ -1963,7 +2279,9 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
   const progressActivityWithoutAssistant = Boolean(!assistantAdvanced
     && latestTurn?.role !== 'assistant'
     && (state.activityTexts || []).some(isProgressOnlyText));
-  const blockedByModal = Boolean(state.blockingModal);
+  const blockedByModal = Boolean(state.blockingModal
+    || state.clickability?.composer?.blocked
+    || state.clickability?.sendButton?.blocked);
   const activeProgress = Boolean(state.isGenerating
     || state.generationControls?.length
     || progressOnlyAssistant
@@ -2015,6 +2333,31 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
       attachments: (state.composer?.attachments || []).map((item) => item.text || item.aria || item.testid).filter(Boolean),
       fileInputCount: state.composer?.fileInputCount || 0,
     },
+    sendButton: {
+      exists: Boolean(state.sendButton?.exists),
+      disabled: Boolean(state.sendButton?.disabled),
+      label: state.sendButton?.label || '',
+    },
+    clickability: {
+      composer: {
+        blocked: Boolean(state.clickability?.composer?.blocked),
+        blocker: state.clickability?.composer?.modal ? {
+          kind: state.clickability.composer.modal.kind || blockingModalKindFromMeta(state.clickability.composer.modal),
+          id: state.clickability.composer.modal.id || '',
+          testid: state.clickability.composer.modal.testid || '',
+          text: normalizeTurnText(state.clickability.composer.modal.text || '').slice(0, 500),
+        } : null,
+      },
+      sendButton: {
+        blocked: Boolean(state.clickability?.sendButton?.blocked),
+        blocker: state.clickability?.sendButton?.modal ? {
+          kind: state.clickability.sendButton.modal.kind || blockingModalKindFromMeta(state.clickability.sendButton.modal),
+          id: state.clickability.sendButton.modal.id || '',
+          testid: state.clickability.sendButton.modal.testid || '',
+          text: normalizeTurnText(state.clickability.sendButton.modal.text || '').slice(0, 500),
+        } : null,
+      },
+    },
     turns: {
       count: state.turnCount || 0,
       latest: compactTurn(latestTurn),
@@ -2049,6 +2392,19 @@ function stateEventKey(event) {
     event.blockingModal?.id || '',
     event.blockingModal?.testid || '',
     event.blockingModal?.text || '',
+    event.sendButton.exists ? 'send-exists' : 'send-missing',
+    event.sendButton.disabled ? 'send-disabled' : 'send-enabled',
+    event.sendButton.label || '',
+    event.clickability.composer.blocked ? 'composer-blocked' : '',
+    event.clickability.composer.blocker?.kind || '',
+    event.clickability.composer.blocker?.id || '',
+    event.clickability.composer.blocker?.testid || '',
+    event.clickability.composer.blocker?.text || '',
+    event.clickability.sendButton.blocked ? 'send-blocked' : '',
+    event.clickability.sendButton.blocker?.kind || '',
+    event.clickability.sendButton.blocker?.id || '',
+    event.clickability.sendButton.blocker?.testid || '',
+    event.clickability.sendButton.blocker?.text || '',
     event.generationControls.join('|'),
     event.activity.join('|'),
     event.artifacts.links,
@@ -2069,6 +2425,9 @@ function formatStateEvent(event) {
   if (event.modelSelection.mode) parts.push(`mode=${event.modelSelection.mode}`);
   if (event.modelSelection.effort) parts.push(`effort=${event.modelSelection.effort}`);
   if (event.blockingModal) parts.push(`blocker=${blockingModalSummary(event.blockingModal)}`);
+  if (event.clickability.composer.blocked) parts.push(`composer-blocker=${blockingModalSummary(event.clickability.composer.blocker)}`);
+  if (event.clickability.sendButton.blocked) parts.push(`send-blocker=${blockingModalSummary(event.clickability.sendButton.blocker)}`);
+  if (event.sendButton.exists) parts.push(`send=${event.sendButton.disabled ? 'disabled' : 'enabled'}`);
   if (event.generationControls.length) parts.push(`control=${event.generationControls.join(' | ')}`);
   if (event.activity.length) parts.push(`activity=${event.activity.join(' | ')}`);
   if (event.turns.latest) parts.push(`latest=${event.turns.latest.role || 'unknown'}:${event.turns.latest.chars}`);
