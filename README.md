@@ -89,7 +89,11 @@ no-result state from results, and reports `phase`, `resultCount`, `complete`,
 or `--search-all` to keep scrolling until the loaded result list stops growing
 or the safety cap is hit. Completion after scrolling requires repeated stable
 bottom checks, because the target app can load more rows after it first reaches
-the bottom. Search emits `search_opening` before interacting with the UI and
+the bottom. A bounded search should not end with both `hasMore:false` and
+`truncated:true`: once the UI reaches bottom, CB runs extra confirmation probes
+outside the load-scroll budget. If that bottom state cannot be confirmed after
+the safety probes, CB reports `bottomConfirmationTimedOut` instead of
+`truncated`. Search emits `search_opening` before interacting with the UI and
 does not pre-reconcile conversation transcripts before the search panel opens.
 
 `--dismiss-blocker` attempts to dismiss one known safe blocking modal without

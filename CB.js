@@ -41,6 +41,8 @@ const SEARCH_READY_TIMEOUT_MS = 20000;
 const SEARCH_OPEN_TIMEOUT_MS = 25000;
 const SEARCH_SCROLL_SETTLE_MS = 2500;
 const SEARCH_BOTTOM_STABLE_MS = 5000;
+const SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED = 2;
+const SEARCH_BOTTOM_CONFIRMATION_MAX_PROBES = 6;
 const SEARCH_ALL_MAX_SCROLLS = 60;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
@@ -3245,7 +3247,16 @@ async function loadMoreTargetSearchResults(page, state, options = {}) {
   let scrolls = 0;
   let stagnantScrolls = 0;
   let bottomConfirmations = 0;
-  while (scrolls < maxScrolls && current.results.length && (current.hasMore || bottomConfirmations < 2)) {
+  let bottomConfirmationProbes = 0;
+  while (current.results.length) {
+    const confirmingBottom = !current.hasMore && bottomConfirmations < SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED;
+    if (current.hasMore && scrolls >= maxScrolls) break;
+    if (!current.hasMore && !confirmingBottom) break;
+    if (confirmingBottom) {
+      if (bottomConfirmationProbes >= SEARCH_BOTTOM_CONFIRMATION_MAX_PROBES) break;
+      bottomConfirmationProbes += 1;
+    }
+
     const beforeCount = current.results.length;
     const beforeHeight = current.scroll?.scrollHeight || 0;
     const beforeTop = current.scroll?.top || 0;
@@ -3306,18 +3317,30 @@ async function loadMoreTargetSearchResults(page, state, options = {}) {
       bottomConfirmations += 1;
     } else {
       bottomConfirmations = 0;
+      bottomConfirmationProbes = 0;
     }
     current.bottomConfirmations = bottomConfirmations;
-    current.truncated = Boolean(scrolls >= maxScrolls && bottomConfirmations < 2);
-    current.complete = Boolean(!current.truncated && !current.hasMore && !current.loading && bottomConfirmations >= 2);
+    current.truncated = Boolean(current.hasMore && scrolls >= maxScrolls);
+    current.complete = Boolean(!current.truncated
+      && !current.hasMore
+      && !current.loading
+      && bottomConfirmations >= SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED);
     if (typeof options.onState === 'function') options.onState(current, { event: 'search_state', scrolls });
-    if (!current.hasMore && bottomConfirmations >= 2) break;
+    if (!current.hasMore && bottomConfirmations >= SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED) break;
     if (current.hasMore && stagnantScrolls >= 2) break;
   }
   current.scrolls = scrolls;
-  current.truncated = Boolean((scrolls >= maxScrolls && bottomConfirmations < 2)
-    || (current.hasMore && stagnantScrolls >= 2));
-  current.complete = Boolean(!current.truncated && !current.hasMore && !current.loading && bottomConfirmations >= 2);
+  current.truncated = Boolean(current.hasMore && (scrolls >= maxScrolls || stagnantScrolls >= 2));
+  current.bottomConfirmationTimedOut = Boolean(!current.truncated
+    && current.results.length
+    && !current.hasMore
+    && bottomConfirmations < SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED);
+  current.timedOut = Boolean(current.timedOut || current.bottomConfirmationTimedOut);
+  current.complete = Boolean(!current.truncated
+    && !current.timedOut
+    && !current.hasMore
+    && !current.loading
+    && bottomConfirmations >= SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED);
   current.bottomConfirmations = bottomConfirmations;
   return current;
 }
@@ -3396,6 +3419,7 @@ async function searchTargetApp(page, query, options = {}) {
     hasMore: Boolean(state.hasMore),
     timedOut: Boolean(state.timedOut),
     truncated: Boolean(state.truncated),
+    bottomConfirmationTimedOut: Boolean(state.bottomConfirmationTimedOut),
     scrolls: state.scrolls || 0,
     bottomConfirmations: state.bottomConfirmations || 0,
     resultCount: state.results.length,
@@ -3417,7 +3441,7 @@ function printSearchResults(result, jsonl = false) {
   }
 
   console.log(`Search: ${result.query}`);
-  console.log(`State: ${result.phase || 'unknown'}; results=${result.resultCount || result.results.length}; complete=${result.complete ? 'yes' : 'no'}; scrolls=${result.scrolls || 0}; bottom-confirmations=${result.bottomConfirmations || 0}${result.truncated ? '; truncated=yes' : ''}`);
+  console.log(`State: ${result.phase || 'unknown'}; results=${result.resultCount || result.results.length}; complete=${result.complete ? 'yes' : 'no'}; scrolls=${result.scrolls || 0}; bottom-confirmations=${result.bottomConfirmations || 0}${result.truncated ? '; truncated=yes' : ''}${result.bottomConfirmationTimedOut ? '; bottom-confirmation-timeout=yes' : ''}`);
   if (!result.results.length) {
     if (result.empty) console.log('No results.');
     else if (result.timedOut) console.log('Search timed out before results or no-result state appeared.');
@@ -3451,6 +3475,7 @@ function buildSearchStateEvent(state, extra = {}) {
     hasMore: Boolean(state.hasMore),
     timedOut: Boolean(state.timedOut),
     truncated: Boolean(state.truncated),
+    bottomConfirmationTimedOut: Boolean(state.bottomConfirmationTimedOut),
     scrolls: extra.scrolls || state.scrolls || 0,
     bottomConfirmations: state.bottomConfirmations || 0,
     scroll: state.scroll || null,
