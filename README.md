@@ -13,6 +13,7 @@ driver upgrades should be validated with a live CDP status check.
 Copy `.env.example` into your shell or service environment and set:
 
 - `CHATBOT_CDP_URL`: Chromium DevTools endpoint. Defaults to `http://127.0.0.1:9222`.
+- `CHATBOT_WEB_URL`: target web app URL. Defaults to the built-in target app URL; set this in services to avoid hard-coded hosts.
 - `CHATBOT_CDP_CONNECT_TIMEOUT_MS`: Chromium DevTools attach timeout. Defaults to `60000`.
 - `CHATBOT_PLAYWRIGHT_PACKAGE`: automation driver package. Defaults to `rebrowser-playwright-core`.
 - `CHATBOT_TRANSCRIPT_DIR`: private transcript output directory. Defaults to `outputs/`, which is gitignored.

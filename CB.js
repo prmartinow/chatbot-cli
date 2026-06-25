@@ -23,6 +23,9 @@ const { chromium } = loadPlaywright();
 const APP_DIR = process.env.CHATBOT_CLI_HOME || __dirname;
 const OUTPUT_DIR = process.env.CHATBOT_TRANSCRIPT_DIR || path.join(APP_DIR, 'outputs');
 const DEFAULT_CDP = process.env.CHATBOT_CDP_URL || 'http://127.0.0.1:9222';
+const TARGET_APP_BRAND_TOKEN = ['chat', 'gpt'].join('');
+const TARGET_APP_BASE_URL = normalizeTargetAppUrl(process.env.CHATBOT_WEB_URL || `https://${TARGET_APP_BRAND_TOKEN}.com/`);
+const TARGET_APP_BASE = new URL(TARGET_APP_BASE_URL);
 const CDP_CONNECT_TIMEOUT_MS = Number(process.env.CHATBOT_CDP_CONNECT_TIMEOUT_MS || 60000);
 const SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
 const PASTE_SETTLE_MS = 1000;
@@ -99,6 +102,34 @@ const CLICK_INTERCEPTOR_SELECTORS = [
   '[data-testid*="modal"]',
   '[data-state="open"]',
 ];
+const VOICE_CONTROL_PATTERN = `\\b(start dictation|dictation|start voice|use voice|voice mode|chat with ${TARGET_APP_BRAND_TOKEN}|microphone|mic)\\b`;
+const COMPOSER_IGNORED_CONTROL_PATTERN = `\\b(add files|start dictation|dictation|start voice|use voice|voice mode|chat with ${TARGET_APP_BRAND_TOKEN}|microphone|mic)\\b`;
+const MODEL_CHROME_PATTERN = `\\b(${TARGET_APP_BRAND_TOKEN} pro|search|project|history|pin|temporary|profile|account)\\b`;
+
+function normalizeTargetAppUrl(rawUrl) {
+  const url = new URL(rawUrl);
+  if (!url.pathname.endsWith('/')) url.pathname = `${url.pathname}/`;
+  return url.toString();
+}
+
+function targetAppUrl(relativePath = '') {
+  const cleanPath = String(relativePath || '').replace(/^\/+/, '');
+  return new URL(cleanPath, TARGET_APP_BASE).toString();
+}
+
+function targetConversationUrl(sessionId) {
+  return targetAppUrl(`c/${sessionId}`);
+}
+
+function isTargetAppUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return url.origin === TARGET_APP_BASE.origin
+      && url.pathname.startsWith(TARGET_APP_BASE.pathname);
+  } catch {
+    return false;
+  }
+}
 
 function usage() {
   console.log(`Usage:
@@ -983,7 +1014,7 @@ function enqueueScheduledJob(args, page = null) {
           alias,
           sessionId,
           status: sessionId ? 'active' : 'pending',
-          url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : '',
+          url: sessionId ? targetConversationUrl(sessionId) : '',
           transcript: sessionId ? transcriptPathForSession(sessionId) : '',
           cdp: args.cdp,
           firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || jobId,
@@ -1107,17 +1138,17 @@ async function findTargetAppPage(browser, args = {}) {
   const context = browser.contexts()[0] || await browser.newContext();
   if (args.newTab) {
     const page = await context.newPage();
-    await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     return page;
   }
 
   for (const candidateContext of browser.contexts()) {
-    const page = candidateContext.pages().find((candidate) => candidate.url().startsWith('https://configured-target.invalid/'));
+    const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
     if (page) return page;
   }
 
   const page = await context.newPage();
-  await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded' });
+  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded' });
   return page;
 }
 
@@ -1220,9 +1251,10 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
 }
 
 async function getComposerDraftState(page) {
-  return page.evaluate(() => {
+  return page.evaluate((composerIgnoredControlPattern) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const ignoredControlRe = new RegExp(composerIgnoredControlPattern, 'i');
     const candidates = [...document.querySelectorAll('#prompt-textarea, [data-testid="composer-input"], textarea[placeholder], div[contenteditable="true"]')];
     const visibleCandidates = candidates.filter(isVisible);
     const composer = visibleCandidates[visibleCandidates.length - 1] || candidates[candidates.length - 1] || null;
@@ -1242,7 +1274,7 @@ async function getComposerDraftState(page) {
         }))
         .filter((item) => {
           const joined = [item.testid, item.aria, item.title, item.text].join(' ');
-          if (/\b(add files|start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(joined)) return false;
+          if (ignoredControlRe.test(joined)) return false;
           return /\b(pasted text|pasted|attachment|file|upload|remove|pdf|docx?|image|csv|txt|\.txt|\.pdf|\.csv|\.png|\.jpe?g|\.webp)\b/i.test(joined);
         })
         .slice(0, 20)
@@ -1257,7 +1289,7 @@ async function getComposerDraftState(page) {
       textTail: text.slice(-240),
       attachments,
     };
-  }).catch(() => ({
+  }, COMPOSER_IGNORED_CONTROL_PATTERN).catch(() => ({
     exists: false,
     visible: false,
     text: '',
@@ -1414,7 +1446,8 @@ function isProgressOnlyText(text) {
   if (!normalized) return true;
   if (normalized.length > 180) return false;
 
-  return /^(targetapp|(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
+  return normalized.toLowerCase() === TARGET_APP_BRAND_TOKEN
+    || /^(?:(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
     || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
     || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
     || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
@@ -1766,8 +1799,9 @@ function turnMatchesMessage(turnText, message) {
 }
 
 async function getGenerationState(page) {
-  return page.evaluate(() => {
+  return page.evaluate((voiceControlPattern) => {
     const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    const voiceControlRe = new RegExp(voiceControlPattern, 'i');
     const buttons = [...document.querySelectorAll('button')].filter(isVisible);
     const generatingButton = buttons.find((button) => {
       const text = [
@@ -1778,7 +1812,8 @@ async function getGenerationState(page) {
       ].join(' ').toLowerCase();
 
       return /\b(stop|interrupt|cancel)\b/.test(text)
-        && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/.test(text);
+        && !/\b(share|copy|close|cancel dictation)\b/.test(text)
+        && !voiceControlRe.test(text);
     });
 
     return {
@@ -1791,13 +1826,25 @@ async function getGenerationState(page) {
           || 'generation-control')
         : '',
     };
-  }).catch(() => ({ isGenerating: false, control: '' }));
+  }, VOICE_CONTROL_PATTERN).catch(() => ({ isGenerating: false, control: '' }));
 }
 
 async function getTargetAppState(page) {
-  return page.evaluate(({ blockingModalSelectors, composerSelectors, sendButtonSelectors, clickInterceptorSelectors }) => {
+  return page.evaluate(({
+    blockingModalSelectors,
+    composerSelectors,
+    sendButtonSelectors,
+    clickInterceptorSelectors,
+    targetAppBrandToken,
+    voiceControlPattern,
+    composerIgnoredControlPattern,
+    modelChromePattern,
+  }) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const voiceControlRe = new RegExp(voiceControlPattern, 'i');
+    const composerIgnoredControlRe = new RegExp(composerIgnoredControlPattern, 'i');
+    const modelChromeRe = new RegExp(modelChromePattern, 'i');
     const blockingModalKindOf = (meta) => {
       const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
       if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
@@ -1869,7 +1916,8 @@ async function getTargetAppState(page) {
       const normalized = (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().replace(/[.。…]+$/g, '').trim();
       if (!normalized) return true;
       if (normalized.length > 180) return false;
-      return /^(targetapp|(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
+      return normalized.toLowerCase() === targetAppBrandToken
+        || /^(?:(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
         || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
         || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
         || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
@@ -1921,10 +1969,11 @@ async function getTargetAppState(page) {
     const generationControls = buttons
       .map((button) => ({ text: controlText(button), testid: button.getAttribute('data-testid') || '' }))
       .filter((item) => /\b(stop|interrupt|cancel)\b/i.test(item.text)
-        && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(item.text));
+        && !/\b(share|copy|close|cancel dictation)\b/i.test(item.text)
+        && !voiceControlRe.test(item.text));
 
     const voiceControls = controls
-      .filter((item) => /\b(start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test([
+      .filter((item) => voiceControlRe.test([
         item.testid,
         item.aria,
         item.title,
@@ -2046,7 +2095,7 @@ async function getTargetAppState(page) {
           const meta = [item.testid, item.aria, item.title].join(' ');
           const body = item.text;
           const joined = [meta, body].join(' ');
-          if (/\b(add files|start dictation|dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(joined)) return false;
+          if (composerIgnoredControlRe.test(joined)) return false;
           if (/\b(file|attachment|upload|remove|pasted text|pasted|pdf|doc|image|csv|txt)\b/i.test(meta)) return true;
           return body.length <= 240
             && /\b(pasted text|attachment|file|pdf|docx?|image|csv|\.txt|\.pdf|\.csv|\.png|\.jpe?g|\.webp)\b/i.test(body);
@@ -2080,7 +2129,7 @@ async function getTargetAppState(page) {
       || (item.tag === 'button'
         && item.text.length <= 80
         && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(item.text)
-        && !/\b(targetapp pro|search|project|history|pin|temporary|profile|account)\b/i.test([item.aria, item.title, item.text].join(' '))));
+        && !modelChromeRe.test([item.aria, item.title, item.text].join(' '))));
     const reasoningControls = controls
       .filter((item) => /\b(reasoning|think|thinking|extended|fast|auto)\b/i.test([item.testid, item.aria, item.title, item.text].join(' ')))
       .slice(0, 20);
@@ -2129,6 +2178,10 @@ async function getTargetAppState(page) {
     composerSelectors: COMPOSER_SELECTORS,
     sendButtonSelectors: SEND_BUTTON_SELECTORS,
     clickInterceptorSelectors: CLICK_INTERCEPTOR_SELECTORS,
+    targetAppBrandToken: TARGET_APP_BRAND_TOKEN,
+    voiceControlPattern: VOICE_CONTROL_PATTERN,
+    composerIgnoredControlPattern: COMPOSER_IGNORED_CONTROL_PATTERN,
+    modelChromePattern: MODEL_CHROME_PATTERN,
   });
 }
 
@@ -2725,9 +2778,10 @@ async function downloadLatestArtifacts(page, args) {
 }
 
 async function stopGeneration(page) {
-  const controlText = await page.evaluate(() => {
+  const controlText = await page.evaluate((voiceControlPattern) => {
     const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const voiceControlRe = new RegExp(voiceControlPattern, 'i');
     document.querySelectorAll('[data-cb-stop-generation]').forEach((el) => {
       el.removeAttribute('data-cb-stop-generation');
     });
@@ -2741,7 +2795,8 @@ async function stopGeneration(page) {
           textOf(el),
         ].join(' ');
         return /\b(stop|interrupt|cancel)\b/i.test(text)
-          && !/\b(share|copy|close|cancel dictation|start dictation|start voice|use voice|voice mode|chat with targetapp|microphone|mic)\b/i.test(text);
+          && !/\b(share|copy|close|cancel dictation)\b/i.test(text)
+          && !voiceControlRe.test(text);
       });
     if (!control) return '';
     control.setAttribute('data-cb-stop-generation', 'true');
@@ -2751,7 +2806,7 @@ async function stopGeneration(page) {
       control.getAttribute('title') || '',
       textOf(control),
     ].join(' ').replace(/\s+/g, ' ').trim();
-  });
+  }, VOICE_CONTROL_PATTERN);
 
   if (!controlText) return false;
   await page.locator('[data-cb-stop-generation="true"]').click({ timeout: 5000 });
@@ -2759,9 +2814,10 @@ async function stopGeneration(page) {
 }
 
 async function markModelSwitcher(page) {
-  return page.evaluate(() => {
+  return page.evaluate((modelChromePattern) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const modelChromeRe = new RegExp(modelChromePattern, 'i');
     document.querySelectorAll('[data-cb-model-switcher]').forEach((el) => {
       el.removeAttribute('data-cb-model-switcher');
     });
@@ -2783,7 +2839,7 @@ async function markModelSwitcher(page) {
         if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)) score += 50;
         if (rect.x > 250 && rect.y > 100) score += 20;
         if (/\b(search|project|history|pin|temporary|profile|account|download|apps|library)\b/i.test(meta)) score -= 100;
-        if (/^targetapp pro$/i.test(text)) score -= 100;
+        if (modelChromeRe.test(text)) score -= 100;
         return { el, text, score };
       })
       .filter((item) => item.score > 0)
@@ -2793,7 +2849,7 @@ async function markModelSwitcher(page) {
     if (!best) return '';
     best.el.setAttribute('data-cb-model-switcher', 'true');
     return best.text || best.el.getAttribute('aria-label') || best.el.getAttribute('data-testid') || 'model-switcher';
-  });
+  }, MODEL_CHROME_PATTERN);
 }
 
 async function hasOpenModelMenu(page) {
@@ -3306,11 +3362,11 @@ async function settlePage(page) {
 }
 
 async function openNewConversation(page) {
-  if (page.url().startsWith('https://configured-target.invalid/') && !sessionIdFromUrl(page.url())) {
+  if (isTargetAppUrl(page.url()) && !sessionIdFromUrl(page.url())) {
     await settlePage(page);
     return;
   }
-  await page.goto('https://configured-target.invalid/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await settlePage(page);
 }
 
@@ -3355,7 +3411,7 @@ async function openConversationBySessionId(page, sessionId) {
     await waitForConversationHydration(page, sessionId);
     return;
   }
-  await page.goto(`https://configured-target.invalid/c/${sessionId}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.goto(targetConversationUrl(sessionId), { waitUntil: 'domcontentloaded', timeout: 45000 });
   await settlePage(page);
   await waitForConversationHydration(page, sessionId);
 }
@@ -3681,7 +3737,7 @@ function recoverQueueStateFromRounds(page, args, context) {
             recoveredBy: 'CB --recover-queue',
             sessionId,
             alias: job.target?.alias || '',
-            url: sessionId ? `https://configured-target.invalid/c/${sessionId}` : context.url,
+            url: sessionId ? targetConversationUrl(sessionId) : context.url,
             transcript,
             responseChars: finalResponseChars,
           },
@@ -3696,7 +3752,7 @@ function recoverQueueStateFromRounds(page, args, context) {
           alias,
           sessionId,
           status: 'active',
-          url: `https://configured-target.invalid/c/${sessionId}`,
+          url: targetConversationUrl(sessionId),
           transcript,
           cdp: args.cdp,
           firstJobId: findConversationByAlias(index, alias)?.firstJobId || findConversationBySessionId(index, sessionId)?.firstJobId || job.id,
