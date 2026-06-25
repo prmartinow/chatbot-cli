@@ -2329,6 +2329,7 @@ function compactModelConfig(config) {
       label: row.label || '',
       mode: row.mode || '',
       effort: row.effort || '',
+      selectedEffort: row.selectedEffort || '',
       checked: row.checked || '',
       effortOptions: row.effortOptions || [],
     })),
@@ -2358,7 +2359,14 @@ function summarizeState(state, modelConfig = null) {
     const modeLabels = (config.modes || [])
       .map((row) => {
         if (!row.label) return '';
-        const suffix = row.effortOptions?.length ? ` (efforts: ${row.effortOptions.join(', ')})` : '';
+        const effortParts = [];
+        const displaySelectedEffort = row.selectedEffort
+          && (!row.effort || normalizeModelLabel(row.effort) === normalizeModelLabel(row.selectedEffort))
+          ? row.selectedEffort
+          : '';
+        if (displaySelectedEffort) effortParts.push(`selected effort: ${displaySelectedEffort}`);
+        if (row.effortOptions?.length) effortParts.push(`efforts: ${row.effortOptions.join(', ')}`);
+        const suffix = effortParts.length ? ` (${effortParts.join('; ')})` : '';
         return `${row.label}${suffix}`;
       })
       .filter(Boolean);
@@ -3733,7 +3741,7 @@ async function getModelMenuState(page) {
         const text = textOf(el);
         const parsed = parseRow(text);
         if (!parsed.mode) return null;
-        const effortButton = text === 'Pro Extended'
+        const effortButton = parsed.mode === 'Pro'
           ? intelligenceRoot.querySelector('[data-testid="composer-intelligence-pro-thinking-effort-trigger"]')
           : null;
         return {
@@ -3843,33 +3851,226 @@ async function readVisibleChoiceOptions(page) {
   });
 }
 
-async function readEffortOptionsForRow(page, row) {
-  if (!row?.testid || !row.effortTestid) return [];
+async function readVisibleEffortChoiceState(page, row) {
+  return page.evaluate((target) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const rectOf = (el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      };
+    };
+    const normalizeOption = (text) => {
+      let value = text.replace(/\s+/g, ' ').trim();
+      const mode = String(target.mode || '').trim();
+      if (mode) value = value.replace(new RegExp(`^${mode}\\s+`, 'i'), '').trim();
+      return value.replace(/\b\w/g, (s) => s.toUpperCase());
+    };
+    const isEffort = (text) => /^(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)$/i.test(text);
+    const checkedValue = (el) => [
+      el.getAttribute('aria-checked') || '',
+      el.getAttribute('data-state') || '',
+    ].join(' ');
+    const button = target.effortTestid ? document.querySelector(`[data-testid="${target.effortTestid}"]`) : null;
+    const buttonRect = button ? rectOf(button) : null;
+    const baseRoot = button?.closest('[role="menu"], [role="listbox"]') || null;
+    const roots = [...document.querySelectorAll('[role="menu"], [role="listbox"]')]
+      .filter(isVisible)
+      .map((el) => {
+        const rect = rectOf(el);
+        const items = [...el.querySelectorAll('[role="menuitemradio"], [role="option"]')]
+          .filter(isVisible)
+          .map((item) => ({
+            label: normalizeOption(textOf(item)),
+            checked: /true|checked|on/i.test(checkedValue(item)),
+          }))
+          .filter((item) => isEffort(item.label));
+        const separateFromBase = Boolean(baseRoot && el !== baseRoot && !el.contains(baseRoot) && !baseRoot.contains(el));
+        const distance = buttonRect
+          ? Math.abs(rect.x - buttonRect.x) + Math.abs(rect.y - buttonRect.y)
+          : 0;
+        return { items, separateFromBase, distance };
+      })
+      .filter((item) => item.items.length)
+      .sort((a, b) => {
+        if (a.separateFromBase !== b.separateFromBase) return a.separateFromBase ? -1 : 1;
+        return a.distance - b.distance;
+      });
+    const items = roots[0]?.items || [];
+    return {
+      options: [...new Set(items.map((item) => item.label))],
+      selected: items.find((item) => item.checked)?.label || '',
+    };
+  }, {
+    mode: row?.mode || '',
+    effortTestid: row?.effortTestid || '',
+  });
+}
+
+async function clickVisibleEffortChoice(page, row, effort) {
+  const marked = await page.evaluate((target) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const rectOf = (el) => {
+      const rect = el.getBoundingClientRect();
+      return {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+      };
+    };
+    const normalizeOption = (text) => {
+      let value = text.replace(/\s+/g, ' ').trim();
+      const mode = String(target.mode || '').trim();
+      if (mode) value = value.replace(new RegExp(`^${mode}\\s+`, 'i'), '').trim();
+      return value.replace(/\b\w/g, (s) => s.toUpperCase());
+    };
+    document.querySelectorAll('[data-cb-effort-choice-target]').forEach((el) => {
+      el.removeAttribute('data-cb-effort-choice-target');
+    });
+    const button = target.effortTestid ? document.querySelector(`[data-testid="${target.effortTestid}"]`) : null;
+    const buttonRect = button ? rectOf(button) : null;
+    const baseRoot = button?.closest('[role="menu"], [role="listbox"]') || null;
+    const roots = [...document.querySelectorAll('[role="menu"], [role="listbox"]')]
+      .filter(isVisible)
+      .map((el) => {
+        const rect = rectOf(el);
+        const items = [...el.querySelectorAll('[role="menuitemradio"], [role="option"]')]
+          .filter(isVisible)
+          .map((item) => ({
+            el: item,
+            label: normalizeOption(textOf(item)),
+          }))
+          .filter((item) => item.label);
+        const separateFromBase = Boolean(baseRoot && el !== baseRoot && !el.contains(baseRoot) && !baseRoot.contains(el));
+        const distance = buttonRect
+          ? Math.abs(rect.x - buttonRect.x) + Math.abs(rect.y - buttonRect.y)
+          : 0;
+        return { items, separateFromBase, distance };
+      })
+      .filter((item) => item.items.length)
+      .sort((a, b) => {
+        if (a.separateFromBase !== b.separateFromBase) return a.separateFromBase ? -1 : 1;
+        return a.distance - b.distance;
+      });
+    const normalizedEffort = normalizeOption(target.effort || '');
+    const item = roots[0]?.items.find((candidate) => candidate.label.toLowerCase() === normalizedEffort.toLowerCase())
+      || null;
+    if (!item) return false;
+    item.el.setAttribute('data-cb-effort-choice-target', 'true');
+    return true;
+  }, {
+    mode: row?.mode || '',
+    effortTestid: row?.effortTestid || '',
+    effort,
+  });
+  if (!marked) return false;
+  await page.locator('[data-cb-effort-choice-target="true"]').first().click({ timeout: 5000 });
+  await page.waitForTimeout(500);
+  return true;
+}
+
+async function markVisibleModelMenuRow(page, row) {
+  return page.evaluate((target) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const normalize = (text) => String(text || '')
+      .replace(/\u2022/g, ' ')
+      .replace(/[^a-zA-Z0-9.]+/g, ' ')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, ' ');
+    document.querySelectorAll('[data-cb-model-row-target]').forEach((el) => {
+      el.removeAttribute('data-cb-model-row-target');
+    });
+    if (target.testid) {
+      const byTestid = document.querySelector(`[data-testid="${target.testid}"]`);
+      if (isVisible(byTestid)) {
+        byTestid.setAttribute('data-cb-model-row-target', 'true');
+        return true;
+      }
+    }
+    const targetLabel = normalize(target.label);
+    const targetMode = normalize(target.mode);
+    const targetEffort = normalize(target.effort);
+    const candidates = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"]')]
+      .filter(isVisible)
+      .map((el) => {
+        const text = textOf(el);
+        const normalized = normalize(text);
+        let score = 0;
+        if (targetLabel && normalized === targetLabel) score += 100;
+        if (targetLabel && normalized.startsWith(`${targetLabel} `)) score += 60;
+        if (targetMode && normalized.includes(targetMode)) score += 30;
+        if (targetEffort && normalized.includes(targetEffort)) score += 30;
+        if (!targetLabel && !targetMode && !targetEffort) score = 0;
+        if (text.length > 120) score -= 50;
+        return { el, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    if (!best) return false;
+    best.el.setAttribute('data-cb-model-row-target', 'true');
+    return true;
+  }, {
+    label: row?.label || '',
+    mode: row?.mode || '',
+    effort: row?.effort || '',
+    testid: row?.testid || '',
+  });
+}
+
+async function hoverModelMenuRow(page, row) {
+  if (!await markVisibleModelMenuRow(page, row)) return false;
+  await page.locator('[data-cb-model-row-target="true"]').first().hover({ timeout: 5000 });
+  return true;
+}
+
+async function clickModelMenuRow(page, row) {
+  if (await markVisibleModelMenuRow(page, row)) {
+    await page.locator('[data-cb-model-row-target="true"]').first().click({ timeout: 5000 });
+    await page.waitForTimeout(500);
+    return true;
+  }
+  return clickMarkedVisibleOption(page, row?.label || '');
+}
+
+async function readEffortStateForRow(page, row) {
+  if (!row?.effortTestid) return { options: [], selected: '' };
   for (let attempt = 0; attempt < 2; attempt++) {
     await openModelSwitcher(page);
-    await page.locator(`[data-testid="${row.testid}"]`).hover({ timeout: 5000 }).catch(() => {});
+    await hoverModelMenuRow(page, row).catch(() => {});
     await page.waitForTimeout(150);
     const effortButton = page.locator(`[data-testid="${row.effortTestid}"]`).first();
-    if (!await effortButton.count().catch(() => 0)) return [];
+    if (!await effortButton.count().catch(() => 0)) return { options: [], selected: '' };
     await effortButton.click({ timeout: 5000, force: true });
     await page.waitForTimeout(300);
-    const options = (await readVisibleChoiceOptions(page))
-      .filter((option) => /^(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)$/i.test(option));
+    const state = await readVisibleEffortChoiceState(page, row);
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(200);
-    if (options.length) return options;
+    if (state.options.length) return state;
   }
-  return [];
+  return { options: [], selected: '' };
+}
+
+async function readEffortOptionsForRow(page, row) {
+  return (await readEffortStateForRow(page, row)).options;
 }
 
 async function setEffortForMenuRow(page, row, effort) {
-  if (!row?.testid || !row.effortTestid) throw new Error(`No effort control found for ${row?.label || 'model row'}`);
+  if (!row?.effortTestid) throw new Error(`No effort control found for ${row?.label || 'model row'}`);
   await openModelSwitcher(page);
-  await page.locator(`[data-testid="${row.testid}"]`).hover({ timeout: 5000 });
+  await hoverModelMenuRow(page, row).catch(() => {});
   await page.waitForTimeout(150);
   await page.locator(`[data-testid="${row.effortTestid}"]`).click({ timeout: 5000, force: true });
   await page.waitForTimeout(300);
-  if (!await clickMarkedVisibleOption(page, effort, { preferPopup: true })) {
+  if (!await clickVisibleEffortChoice(page, row, effort)) {
     throw new Error(`No visible effort option matching: ${effort}`);
   }
 }
@@ -3965,9 +4166,9 @@ async function getConfigureModalState(page, includeDropdowns = false) {
 }
 
 async function inspectModelConfigurator(page, options = {}) {
+  const buttonState = await getTargetAppState(page).catch(() => null);
   await openModelSwitcher(page);
   const menu = await getModelMenuState(page);
-  const buttonState = await getTargetAppState(page).catch(() => null);
   const result = {
     button: buttonState?.model || '',
     current: menu.current,
@@ -3976,8 +4177,19 @@ async function inspectModelConfigurator(page, options = {}) {
   };
 
   if (options.includeDetails) {
+    const buttonSelection = parseModeAndEffort(result.button || '');
     for (const row of result.modes) {
-      row.effortOptions = await readEffortOptionsForRow(page, row);
+      const effortState = await readEffortStateForRow(page, row);
+      row.effortOptions = effortState.options;
+      row.selectedEffort = row.checked === 'true'
+        && buttonSelection.effort
+        && normalizeModelLabel(row.mode) === normalizeModelLabel(buttonSelection.mode)
+        ? buttonSelection.effort
+        : effortState.selected;
+    }
+    const selectedEffortRow = result.modes.find((row) => row.checked === 'true' && row.selectedEffort);
+    if (selectedEffortRow && !buttonSelection.effort) {
+      result.button = `${selectedEffortRow.mode} ${selectedEffortRow.selectedEffort}`;
     }
     try {
       await openConfigureModalFromMenu(page);
@@ -4006,7 +4218,14 @@ async function listModelOptions(page) {
   if (config.current?.label) lines.push(`Current: ${config.current.label}`);
   if (config.button) lines.push(`Selected: ${config.button}`);
   for (const row of config.modes || []) {
-    const suffix = row.effortOptions?.length ? ` (efforts: ${row.effortOptions.join(', ')})` : '';
+    const effortParts = [];
+    const displaySelectedEffort = row.selectedEffort
+      && (!row.effort || normalizeModelLabel(row.effort) === normalizeModelLabel(row.selectedEffort))
+      ? row.selectedEffort
+      : '';
+    if (displaySelectedEffort) effortParts.push(`selected effort: ${displaySelectedEffort}`);
+    if (row.effortOptions?.length) effortParts.push(`efforts: ${row.effortOptions.join(', ')}`);
+    const suffix = effortParts.length ? ` (${effortParts.join('; ')})` : '';
     lines.push(`${row.label}${suffix}`);
   }
   if (config.configureAvailable) lines.push('Configure...');
@@ -4078,47 +4297,230 @@ async function selectInConfigureModal(page, selection) {
   await page.waitForTimeout(500);
 }
 
+function modelRowKey(row) {
+  return [
+    normalizeModelLabel(row?.label || ''),
+    normalizeModelLabel(row?.mode || ''),
+    normalizeModelLabel(row?.effort || ''),
+    row?.testid || '',
+    row?.effortTestid || '',
+  ].join('|');
+}
+
+async function hydrateModelRows(page, rows, currentSelection = null) {
+  const effortStateByKey = new Map();
+  for (const row of rows || []) {
+    const effortState = row.effortTestid ? await readEffortStateForRow(page, row) : { options: [], selected: '' };
+    if (effortState.options.length || effortState.selected) effortStateByKey.set(modelRowKey(row), effortState);
+  }
+  await openModelSwitcher(page).catch(() => {});
+  const state = await getModelMenuState(page);
+  return {
+    ...state,
+    rows: (state.rows || []).map((row) => {
+      const effortState = effortStateByKey.get(modelRowKey(row)) || { options: row.effortOptions || [], selected: '' };
+      const selectedEffort = row.checked === 'true'
+        && currentSelection?.effort
+        && normalizeModelLabel(row.mode) === normalizeModelLabel(currentSelection.mode)
+        ? currentSelection.effort
+        : effortState.selected;
+      return {
+        ...row,
+        selectedEffort: selectedEffort || '',
+        effortOptions: effortState.options || row.effortOptions || [],
+      };
+    }),
+  };
+}
+
+function effortRankForMode(mode, effort) {
+  const normalizedMode = normalizeModelLabel(mode);
+  const normalizedEffort = normalizeModelLabel(effort);
+  if (normalizedMode === 'instant') return 0;
+  if (normalizedMode === 'pro') {
+    if (/\b(extended|heavy|extra high)\b/.test(normalizedEffort)) return 6;
+    return 5;
+  }
+  if (normalizedMode === 'thinking') {
+    if (/\b(extra high|extended|heavy)\b/.test(normalizedEffort)) return 4;
+    if (/\bhigh\b/.test(normalizedEffort)) return 3;
+    if (/\b(medium|standard)\b/.test(normalizedEffort)) return 2;
+    if (/\b(light|low|fast|auto)\b/.test(normalizedEffort)) return 1;
+    return 3;
+  }
+  if (/\b(extra high|extended|heavy)\b/.test(normalizedEffort)) return 4;
+  if (/\bhigh\b/.test(normalizedEffort)) return 3;
+  if (/\b(medium|standard)\b/.test(normalizedEffort)) return 2;
+  if (/\b(light|low|fast|auto)\b/.test(normalizedEffort)) return 1;
+  return -1;
+}
+
+function modelChoiceLabel(choice) {
+  if (!choice) return '';
+  if (choice.mode === 'Instant') return 'Instant';
+  if (choice.mode && choice.effort) return `${choice.mode} ${choice.effort}`;
+  return choice.label || [choice.mode, choice.effort].filter(Boolean).join(' ') || '';
+}
+
+function modelChoicesFromRows(rows) {
+  const choices = [];
+  const seen = new Set();
+  const add = (choice) => {
+    const key = choice.effort
+      ? [normalizeModelLabel(choice.mode), normalizeModelLabel(choice.effort)].join('|')
+      : [normalizeModelLabel(choice.mode), normalizeModelLabel(choice.label)].join('|');
+    if (seen.has(key)) return;
+    seen.add(key);
+    choices.push({
+      ...choice,
+      rank: effortRankForMode(choice.mode, choice.effort),
+    });
+  };
+
+  for (const row of rows || []) {
+    if (!row.mode) continue;
+    const rowEffort = row.selectedEffort || row.effort || '';
+    add({
+      label: row.label,
+      mode: row.mode,
+      effort: rowEffort,
+      row,
+      requiresEffortSelection: false,
+    });
+    for (const effort of row.effortOptions || []) {
+      const normalizedEffort = effort.replace(/\b\w/g, (s) => s.toUpperCase());
+      add({
+        label: `${row.mode} ${normalizedEffort}`,
+        mode: row.mode,
+        effort: normalizedEffort,
+        row,
+        requiresEffortSelection: normalizeModelLabel(row.selectedEffort || row.effort || '') !== normalizeModelLabel(normalizedEffort),
+      });
+    }
+  }
+  return choices.filter((choice) => choice.rank >= 0);
+}
+
+function requestedModelRank(selection) {
+  const mode = selection.mode || (selection.effort ? 'Thinking' : '');
+  return effortRankForMode(mode, selection.effort);
+}
+
+function choiceMatchesSelection(choice, selection) {
+  if (!choice) return false;
+  if (selection.mode && normalizeModelLabel(choice.mode) !== normalizeModelLabel(selection.mode)) return false;
+  if (selection.effort && normalizeModelLabel(choice.effort) !== normalizeModelLabel(selection.effort)) return false;
+  if (!selection.mode && !selection.effort && selection.normalized) {
+    return normalizeModelLabel(choice.label).includes(selection.normalized)
+      || normalizeModelLabel(modelChoiceLabel(choice)).includes(selection.normalized);
+  }
+  return true;
+}
+
+function chooseFallbackModelChoice(choices, selection) {
+  const requestedRank = requestedModelRank(selection);
+  if (requestedRank < 0 || !choices.length) return null;
+  const byRank = choices.slice().sort((a, b) => b.rank - a.rank);
+  const notHigher = byRank.find((choice) => choice.rank <= requestedRank);
+  return notHigher || byRank[byRank.length - 1] || null;
+}
+
+function formatModelSelectionResult(result, kind = 'model') {
+  if (!result) return '';
+  if (result.fallback) {
+    const availableChoices = [...new Set(result.available || [])];
+    const available = availableChoices.length ? ` Available: ${availableChoices.join(', ')}.` : '';
+    return `Requested ${kind} "${result.requested}" is not available; selected "${result.selected}" instead.${available}`;
+  }
+  return `Selected ${kind}: ${result.selected || result.requested}`;
+}
+
+async function applyModelChoice(page, choice) {
+  if (!choice) throw new Error('No model choice selected');
+  const currentChoiceEffort = choice.row?.selectedEffort || choice.row?.effort || '';
+  if (choice.requiresEffortSelection || (choice.effort && normalizeModelLabel(currentChoiceEffort) !== normalizeModelLabel(choice.effort) && choice.row?.effortTestid)) {
+    await setEffortForMenuRow(page, choice.row, choice.effort);
+    await page.waitForTimeout(700);
+    const stateAfterEffort = await getTargetAppState(page).catch(() => null);
+    const selectionAfterEffort = parseModeAndEffort(stateAfterEffort?.model || '');
+    if (choice.mode && normalizeModelLabel(selectionAfterEffort.mode) === normalizeModelLabel(choice.mode)) {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(300);
+      return;
+    }
+    await openModelSwitcher(page);
+  }
+  let state = await getModelMenuState(page);
+  const freshRow = (state.rows || []).find((row) => choiceMatchesSelection({
+    label: row.label,
+    mode: row.mode,
+    effort: row.effort || '',
+  }, { mode: choice.mode, effort: choice.effort }))
+    || (choice.row?.testid ? (state.rows || []).find((row) => row.testid === choice.row.testid) : null)
+    || (state.rows || []).find((row) => normalizeModelLabel(row.label) === normalizeModelLabel(choice.row?.label || ''))
+    || choice.row;
+  if (!await clickModelMenuRow(page, freshRow)) {
+    throw new Error(`No visible model option matching: ${modelChoiceLabel(choice)}`);
+  }
+  await page.waitForTimeout(700);
+}
+
 async function selectModel(page, label) {
   const selection = parseModelSelection(label);
+  const currentButtonSelection = parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '');
   if (!await openModelSwitcher(page)) throw new Error('No visible model picker found');
-  let state = await getModelMenuState(page);
+  let state = await hydrateModelRows(page, (await getModelMenuState(page)).rows, currentButtonSelection);
   const currentModel = state.current?.model || '';
   const needsConfigure = Boolean(selection.model && (!currentModel || selection.model !== currentModel));
   if (needsConfigure) {
     await selectInConfigureModal(page, selection);
-    return;
+    return {
+      requested: label,
+      selected: label,
+      fallback: false,
+      available: modelChoicesFromRows(state.rows).map(modelChoiceLabel),
+    };
   }
 
   const targetMode = selection.mode
     || (selection.effort ? parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '').mode : '');
-  const row = targetMode
-    ? state.rows.find((item) => item.mode.toLowerCase() === targetMode.toLowerCase()
-      && (!selection.effort || item.effort.toLowerCase() === selection.effort.toLowerCase()
-        || normalizeModelLabel(item.label).includes(normalizeModelLabel(selection.effort))))
-    : state.rows.find((item) => normalizeModelLabel(item.label).includes(selection.normalized));
+  if (targetMode && !selection.mode) selection.mode = targetMode;
+  const choices = modelChoicesFromRows(state.rows);
+  let choice = choices.find((item) => choiceMatchesSelection(item, selection));
+  let fallback = false;
 
-  if (!row) {
+  if (!choice) {
     if (selection.model || selection.mode || selection.effort) {
-      await selectInConfigureModal(page, selection);
-      return;
+      choice = chooseFallbackModelChoice(choices, selection);
+      fallback = Boolean(choice);
+      if (!choice) {
+        await selectInConfigureModal(page, selection);
+        return {
+          requested: label,
+          selected: label,
+          fallback: false,
+          available: choices.map(modelChoiceLabel),
+        };
+      }
+    } else {
+      await clickOptionByText(page, label);
+      return {
+        requested: label,
+        selected: label,
+        fallback: false,
+        available: choices.map(modelChoiceLabel),
+      };
     }
-    await clickOptionByText(page, label);
-    return;
   }
 
-  if (selection.effort && row.effort.toLowerCase() !== selection.effort.toLowerCase()) {
-    await setEffortForMenuRow(page, row, selection.effort);
-    await openModelSwitcher(page);
-    state = await getModelMenuState(page);
-  }
-
-  const freshRow = (row.testid ? state.rows.find((item) => item.testid === row.testid) : null) || row;
-  if (freshRow.testid) {
-    await page.locator(`[data-testid="${freshRow.testid}"]`).first().click({ timeout: 5000 });
-  } else if (!await clickMarkedVisibleOption(page, freshRow.label)) {
-    throw new Error(`No visible model option matching: ${freshRow.label}`);
-  }
-  await page.waitForTimeout(700);
+  await applyModelChoice(page, choice);
+  return {
+    requested: label,
+    selected: modelChoiceLabel(choice),
+    fallback,
+    available: choices.map(modelChoiceLabel),
+  };
 }
 
 async function selectReasoning(page, label) {
@@ -4127,7 +4529,10 @@ async function selectReasoning(page, label) {
     const state = await getTargetAppState(page).catch(() => null);
     selection.mode = parseModeAndEffort(state?.model || '').mode;
   }
-  await selectModel(page, [selection.mode, selection.effort].filter(Boolean).join(' ') || label);
+  const requested = [selection.mode, selection.effort].filter(Boolean).join(' ') || label;
+  const result = await selectModel(page, requested);
+  if (result) result.requested = label;
+  return result;
 }
 
 async function attachFiles(page, filePaths) {
@@ -4926,11 +5331,13 @@ async function ask(page, message, args) {
   refreshSessionTranscript(page, args);
   if (args.model) {
     info(`[model] selecting ${args.model}`);
-    await selectModel(page, args.model);
+    const result = await selectModel(page, args.model);
+    if (result) info(`[model] ${formatModelSelectionResult(result)}`);
   }
   if (args.reasoning) {
     info(`[reasoning] selecting ${args.reasoning}`);
-    await selectReasoning(page, args.reasoning);
+    const result = await selectReasoning(page, args.reasoning);
+    if (result) info(`[reasoning] ${formatModelSelectionResult(result, 'reasoning')}`);
   }
   if (args.attachments && args.attachments.length) {
     info(`[attach] ${args.attachments.join(', ')}`);
@@ -5329,8 +5736,8 @@ async function interactive(page, args) {
         console.log('Usage: /model <visible label>');
         continue;
       }
-      await selectModel(page, label);
-      console.log(`Selected model matching: ${label}`);
+      const result = await selectModel(page, label);
+      console.log(formatModelSelectionResult(result));
       continue;
     }
     if (input.type === 'command' && input.text.startsWith('/reasoning ')) {
@@ -5339,8 +5746,8 @@ async function interactive(page, args) {
         console.log('Usage: /reasoning <visible label>');
         continue;
       }
-      await selectReasoning(page, label);
-      console.log(`Selected reasoning matching: ${label}`);
+      const result = await selectReasoning(page, label);
+      console.log(formatModelSelectionResult(result, 'reasoning'));
       continue;
     }
     if (input.type === 'command' && input.text.startsWith('/search ')) {

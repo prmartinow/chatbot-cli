@@ -112,6 +112,14 @@ Treat those labels as model-picker controls only when they are inside the
 composer control area. Do not use greeting/account-name buttons or sidebar
 profile controls as model-picker candidates.
 
+Model and reasoning availability is account/subscription-dependent. Some
+accounts expose only `Instant`; others expose Thinking tiers such as `Medium`,
+`High`, and `Extra High`; Pro-capable accounts can expose Pro tiers such as
+`Pro Standard` and `Pro Extended` through a row-specific effort flyout. CB reads
+the live picker before selecting. If the requested tier is absent, it selects
+the highest available tier that does not exceed the requested rank and reports
+the fallback instead of silently changing the model.
+
 Watch target app state for orchestration:
 
 ```bash
@@ -173,6 +181,11 @@ mode, and effort, for example `5.5 Pro Extended` or `5.5 Thinking Heavy`.
 `--status --state-jsonl` includes a lightweight `modelSelection` object from
 the visible composer button. Add `--deep-status` only when you need a compact
 `modelConfig` object with the live model list and effort options.
+If a requested effort is unavailable, selection reports the fallback, for
+example `5.5 Thinking Heavy` can select `Thinking Extra High` when Heavy is not
+present. Compact Pro rows can display only `Pro` in the composer while the
+checked flyout effort is `Standard`; `/models` and deep status open the picker
+to read that hidden checked effort.
 
 Attach files before sending:
 
