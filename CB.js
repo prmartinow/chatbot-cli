@@ -69,6 +69,7 @@ const COMMANDS = new Set([
   '/reasoning',
   '/search',
   '/search-open',
+  '/dismiss-blocker',
   '/artifacts',
   '/download',
   '/stop',
@@ -181,6 +182,8 @@ Options:
   --alias         Alias to assign to a new or existing conversation in the scheduler index.
   --search        Search the target app conversation/history UI and print results.
   --search-open   With --search, open a result by 1-based index or text match.
+  --dismiss-blocker
+                  Dismiss one known safe blocker, then exit. Does not send a prompt.
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
   --download-artifacts
@@ -205,6 +208,8 @@ Interactive commands:
   /search <text>  Search target app conversations/history and print results.
   /search-open <text>[ | index-or-title]
                   Search and open the first or matching result.
+  /dismiss-blocker
+                  Dismiss one known safe blocker. Does not send a prompt.
   /attach <path>  Attach a file to the next message.
   /artifacts      Print links/images/download controls from the latest assistant turn.
   /download       Download visible artifacts from the latest assistant turn.
@@ -229,6 +234,7 @@ function parseArgs(argv) {
     deepStatus: false,
     searchQuery: '',
     searchOpen: '',
+    dismissBlocker: false,
     watchState: false,
     waitReady: false,
     stateJsonl: false,
@@ -278,6 +284,7 @@ function parseArgs(argv) {
     else if (arg === '--deep-status' || arg === '--inspect-model-config') args.deepStatus = true;
     else if (arg === '--search') args.searchQuery = next();
     else if (arg === '--search-open') args.searchOpen = next();
+    else if (arg === '--dismiss-blocker') args.dismissBlocker = true;
     else if (arg === '--watch-state') args.watchState = true;
     else if (arg === '--wait-ready') args.waitReady = true;
     else if (arg === '--state-jsonl') args.stateJsonl = true;
@@ -345,6 +352,7 @@ function isPassiveCurrentPageRead(args) {
     && !args.models
     && !args.searchQuery
     && !args.searchOpen
+    && !args.dismissBlocker
     && !args.stop
     && !args.downloadArtifacts
     && typeof args.message !== 'string'
@@ -1656,6 +1664,42 @@ async function dismissBlockingModal(page) {
   };
 }
 
+function printBlockingDismissal(result, jsonl = false) {
+  const payload = {
+    type: 'target_app_blocker_dismissal',
+    at: nowIso(),
+    dismissed: Boolean(result.dismissed),
+    found: Boolean(result.found),
+    safe: Boolean(result.safe),
+    clicked: Boolean(result.clicked),
+    escaped: Boolean(result.escaped),
+    reason: result.reason || '',
+    modal: result.modal || null,
+    remaining: result.remaining || null,
+  };
+  if (jsonl) {
+    console.log(JSON.stringify(payload));
+    return;
+  }
+
+  if (!payload.found) {
+    console.log('No blocking modal found.');
+  } else if (!payload.safe) {
+    console.log(`Blocking modal is not safe to dismiss automatically: ${blockingModalSummary(payload.modal)}`);
+    if (payload.reason) console.log(`Reason: ${payload.reason}`);
+  } else if (payload.dismissed) {
+    const actions = [
+      payload.clicked ? 'clicked close control' : '',
+      payload.escaped ? 'pressed Escape' : '',
+    ].filter(Boolean).join(', ') || 'dismissed';
+    console.log(`Dismissed blocking modal: ${blockingModalSummary(payload.modal)}`);
+    console.log(`Action: ${actions}`);
+  } else {
+    console.log(`Blocking modal remains: ${blockingModalSummary(payload.remaining || payload.modal)}`);
+    if (payload.reason) console.log(`Reason: ${payload.reason}`);
+  }
+}
+
 async function assertNoBlockingModal(page, context) {
   const modal = await getBlockingModal(page);
   if (modal) throw new Error(blockingModalErrorMessage(modal, context));
@@ -1760,9 +1804,17 @@ async function getCenterPointClickBlocker(page, selectors, label, options = {}) 
 }
 
 async function ensureTargetClickable(page, selectors, label, context, options = {}) {
-  await ensureNoBlockingModal(page, context);
+  if (options.dismissBlockers === false) {
+    await assertNoBlockingModal(page, context);
+  } else {
+    await ensureNoBlockingModal(page, context);
+  }
   let blocker = await getCenterPointClickBlocker(page, selectors, label, options);
   if (!blocker.blocked) return blocker;
+
+  if (options.dismissBlockers === false) {
+    throw new Error(clickableBlockerErrorMessage(blocker, context));
+  }
 
   const dismiss = await dismissBlockingModal(page);
   if (dismiss.dismissed) {
@@ -2906,10 +2958,10 @@ async function openTargetSearch(page) {
   const existing = await markSearchInput(page).catch(() => null);
   if (existing) return existing;
 
-  await ensureNoBlockingModal(page, 'before opening target app search');
+  await assertNoBlockingModal(page, 'before opening target app search');
   const control = await markNavigationSearchControl(page);
   if (!control) throw new Error('No visible target app search control found');
-  await ensureTargetClickable(page, ['[data-cb-nav-search-control="true"]'], 'search control', 'before opening target app search');
+  await ensureTargetClickable(page, ['[data-cb-nav-search-control="true"]'], 'search control', 'before opening target app search', { dismissBlockers: false });
   await clickMarkedSearchElement(page, '[data-cb-nav-search-control="true"]', 'search control');
 
   const deadline = Date.now() + 10000;
@@ -3070,7 +3122,7 @@ async function searchTargetApp(page, query, options = {}) {
       await closeTargetSearch(page);
       throw new Error(`No target app search result matched: ${options.open}`);
     }
-    await ensureTargetClickable(page, [`[data-cb-search-result-index="${opened.index}"]`], `search result ${opened.index}`, 'before opening target app search result');
+    await ensureTargetClickable(page, [`[data-cb-search-result-index="${opened.index}"]`], `search result ${opened.index}`, 'before opening target app search result', { dismissBlockers: false });
     await clickMarkedSearchElement(page, `[data-cb-search-result-index="${opened.index}"]`, `search result ${opened.index}`);
     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
     await settlePage(page);
@@ -4870,6 +4922,11 @@ async function interactive(page, args) {
       console.log('Usage: /search-open <query>[ | index-or-title]');
       continue;
     }
+    if (input.type === 'command' && input.text === '/dismiss-blocker') {
+      const result = await dismissBlockingModal(page);
+      printBlockingDismissal(result);
+      continue;
+    }
     if (input.type === 'command' && input.text.startsWith('/attach ')) {
       const filePath = input.text.slice('/attach '.length).trim();
       if (!filePath) {
@@ -5063,6 +5120,12 @@ async function main() {
 
     if (args.watchState) {
       await watchTargetAppState(page, args);
+      return;
+    }
+
+    if (args.dismissBlocker) {
+      const result = await dismissBlockingModal(page);
+      printBlockingDismissal(result, args.stateJsonl);
       return;
     }
 

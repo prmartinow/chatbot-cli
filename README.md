@@ -58,6 +58,7 @@ node CB.js --latest-assistant
 node CB.js --sync-transcript
 node CB.js --search "project name"
 node CB.js --search "project name" --search-open 1
+node CB.js --dismiss-blocker
 ```
 
 `--status` is a passive current-page DOM read for composer, generation, turn,
@@ -76,7 +77,13 @@ including headers such as `Latest` or `Legacy`.
 `--search <query>` opens the target app's left-navigation search UI, enters the
 query, prints visible results, and closes the search dialog. Add
 `--search-open <index-or-title>` to open a result from that search by 1-based
-index or title/session text match.
+index or title/session text match. Search does not dismiss unrelated blocking
+modals; use `--dismiss-blocker` for that explicit action.
+
+`--dismiss-blocker` attempts to dismiss one known safe blocking modal without
+sending a prompt or running another UI feature. It only uses safe close/Escape
+behavior and reports if the blocker remains or is not safe to dismiss
+automatically.
 
 Watch target app state for orchestration:
 
@@ -171,6 +178,7 @@ Run `node CB.js` and use:
 - `/model <text>` and `/reasoning <text>`: click matching UI options.
 - `/search <text>`: search target app conversations/history and print results.
 - `/search-open <text>[ | index-or-title]`: search and open the first or matching result.
+- `/dismiss-blocker`: dismiss one known safe blocker without sending a prompt.
 - `/attach <path>`: queue a file for the next prompt.
 - `/artifacts`: save artifact metadata from the latest assistant turn.
 - `/download`: save latest-turn artifacts to disk.
