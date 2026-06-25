@@ -56,6 +56,8 @@ node CB.js --models
 node CB.js --stop
 node CB.js --latest-assistant
 node CB.js --sync-transcript
+node CB.js --search "project name"
+node CB.js --search "project name" --search-open 1
 ```
 
 `--status` is a passive current-page DOM read for composer, generation, turn,
@@ -70,6 +72,11 @@ current header, selected composer button, visible mode rows, reasoning-effort
 flyout options, and the Configure dialog's model list. These labels are scraped
 from the current UI because model names and picker layout change over time,
 including headers such as `Latest` or `Legacy`.
+
+`--search <query>` opens the target app's left-navigation search UI, enters the
+query, prints visible results, and closes the search dialog. Add
+`--search-open <index-or-title>` to open a result from that search by 1-based
+index or title/session text match.
 
 Watch target app state for orchestration:
 
@@ -162,6 +169,8 @@ Run `node CB.js` and use:
 - `/models`: list visible model picker options.
 - `/reasoning`: list visible reasoning controls.
 - `/model <text>` and `/reasoning <text>`: click matching UI options.
+- `/search <text>`: search target app conversations/history and print results.
+- `/search-open <text>[ | index-or-title]`: search and open the first or matching result.
 - `/attach <path>`: queue a file for the next prompt.
 - `/artifacts`: save artifact metadata from the latest assistant turn.
 - `/download`: save latest-turn artifacts to disk.

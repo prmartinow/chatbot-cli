@@ -54,6 +54,8 @@ const COMMAND_PREFIXES = [
   '/attach ',
   '/model ',
   '/reasoning ',
+  '/search ',
+  '/search-open ',
   '/status ',
   '/stream ',
 ];
@@ -65,6 +67,8 @@ const COMMANDS = new Set([
   '/status',
   '/models',
   '/reasoning',
+  '/search',
+  '/search-open',
   '/artifacts',
   '/download',
   '/stop',
@@ -175,6 +179,8 @@ Options:
   --new-conversation
                   Start a new target app conversation before the prompt.
   --alias         Alias to assign to a new or existing conversation in the scheduler index.
+  --search        Search the target app conversation/history UI and print results.
+  --search-open   With --search, open a result by 1-based index or text match.
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
   --download-artifacts
@@ -196,6 +202,9 @@ Interactive commands:
   /model <text>   Select a model by visible label.
   /reasoning <text>
                   Select a reasoning option by visible label.
+  /search <text>  Search target app conversations/history and print results.
+  /search-open <text>[ | index-or-title]
+                  Search and open the first or matching result.
   /attach <path>  Attach a file to the next message.
   /artifacts      Print links/images/download controls from the latest assistant turn.
   /download       Download visible artifacts from the latest assistant turn.
@@ -218,6 +227,8 @@ function parseArgs(argv) {
     reasoning: '',
     status: false,
     deepStatus: false,
+    searchQuery: '',
+    searchOpen: '',
     watchState: false,
     waitReady: false,
     stateJsonl: false,
@@ -265,6 +276,8 @@ function parseArgs(argv) {
     else if (arg === '--reasoning') args.reasoning = next();
     else if (arg === '--status') args.status = true;
     else if (arg === '--deep-status' || arg === '--inspect-model-config') args.deepStatus = true;
+    else if (arg === '--search') args.searchQuery = next();
+    else if (arg === '--search-open') args.searchOpen = next();
     else if (arg === '--watch-state') args.watchState = true;
     else if (arg === '--wait-ready') args.waitReady = true;
     else if (arg === '--state-jsonl') args.stateJsonl = true;
@@ -305,6 +318,9 @@ function parseArgs(argv) {
   }
   if (args.waitReady) args.watchState = true;
   if (args.queueWatch) args.runQueue = true;
+  if (args.searchOpen && !args.searchQuery) {
+    throw new Error('--search-open requires --search <query>');
+  }
 
   if (args.transcript) args.transcript = path.resolve(args.transcript);
   args.attachments = args.attachments.map((filePath) => path.resolve(filePath));
@@ -327,6 +343,8 @@ function isPassiveCurrentPageRead(args) {
     && !args.recoverQueue
     && !args.runQueue
     && !args.models
+    && !args.searchQuery
+    && !args.searchOpen
     && !args.stop
     && !args.downloadArtifacts
     && typeof args.message !== 'string'
@@ -2813,6 +2831,290 @@ async function stopGeneration(page) {
   return controlText;
 }
 
+async function markNavigationSearchControl(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    document.querySelectorAll('[data-cb-nav-search-control]').forEach((el) => {
+      el.removeAttribute('data-cb-nav-search-control');
+    });
+
+    const candidates = [...document.querySelectorAll('button,[role="button"],a')]
+      .filter(isVisible)
+      .map((el) => {
+        const rect = el.getBoundingClientRect();
+        const label = [
+          el.getAttribute('data-testid') || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          textOf(el),
+        ].join(' ').replace(/\s+/g, ' ').trim();
+        let score = 0;
+        if (/\bsearch chats?\b/i.test(label)) score += 120;
+        else if (/\bsearch\b/i.test(label)) score += 40;
+        if (el.closest('nav,[aria-label*="Sidebar" i],[aria-label*="history" i]')) score += 40;
+        if (rect.x <= 320 && rect.y <= 180) score += 30;
+        if (/\b(close|share|download|options|profile|apps|model|reasoning)\b/i.test(label)) score -= 100;
+        return { el, label, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const best = candidates[0];
+    if (!best) return null;
+    best.el.setAttribute('data-cb-nav-search-control', 'true');
+    return { label: best.label };
+  });
+}
+
+async function markSearchInput(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    document.querySelectorAll('[data-cb-search-input]').forEach((el) => {
+      el.removeAttribute('data-cb-search-input');
+    });
+
+    const visibleDialogs = [...document.querySelectorAll('[role="dialog"],[data-radix-dialog-content]')]
+      .filter(isVisible);
+    const inputs = [...document.querySelectorAll('input:not([type="file"]),textarea,[contenteditable="true"],[role="searchbox"]')]
+      .filter(isVisible)
+      .map((el) => {
+        const label = [
+          el.getAttribute('placeholder') || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('role') || '',
+          textOf(el),
+        ].join(' ').replace(/\s+/g, ' ').trim();
+        let score = 0;
+        if (/\bsearch chats?\b/i.test(label)) score += 120;
+        else if (/\bsearch\b/i.test(label)) score += 80;
+        if (visibleDialogs.some((dialog) => dialog.contains(el))) score += 30;
+        return { el, label, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const best = inputs[0];
+    if (!best) return null;
+    best.el.setAttribute('data-cb-search-input', 'true');
+    return { label: best.label, value: textOf(best.el) };
+  });
+}
+
+async function openTargetSearch(page) {
+  const existing = await markSearchInput(page).catch(() => null);
+  if (existing) return existing;
+
+  await ensureNoBlockingModal(page, 'before opening target app search');
+  const control = await markNavigationSearchControl(page);
+  if (!control) throw new Error('No visible target app search control found');
+  await ensureTargetClickable(page, ['[data-cb-nav-search-control="true"]'], 'search control', 'before opening target app search');
+  await clickMarkedSearchElement(page, '[data-cb-nav-search-control="true"]', 'search control');
+
+  const deadline = Date.now() + 10000;
+  let input = null;
+  while (Date.now() < deadline) {
+    input = await markSearchInput(page).catch(() => null);
+    if (input) return input;
+    await page.waitForTimeout(250);
+  }
+  throw new Error('Target app search opened, but no visible search input appeared');
+}
+
+async function clickMarkedSearchElement(page, selector, label) {
+  const locator = page.locator(selector).first();
+  try {
+    await locator.click({ timeout: 5000 });
+    return;
+  } catch (error) {
+    const clicked = await page.evaluate((targetSelector) => {
+      const target = document.querySelector(targetSelector);
+      if (!target) return false;
+      target.click();
+      return true;
+    }, selector).catch(() => false);
+    if (!clicked) {
+      throw new Error(`Unable to click ${label}: ${error.message || String(error)}`);
+    }
+  }
+}
+
+async function setTargetSearchQuery(page, query) {
+  await openTargetSearch(page);
+  const locator = page.locator('[data-cb-search-input="true"]').first();
+  await locator.fill(query).catch(async () => {
+    await locator.click({ timeout: 5000 });
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => {});
+    await page.keyboard.insertText(query);
+  });
+  await page.waitForTimeout(400);
+}
+
+async function extractTargetSearchResults(page) {
+  return page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const textOf = (el) => (el?.innerText || el?.textContent || el?.value || '').replace(/\s+/g, ' ').trim();
+    const trimResultText = (text) => (text.length > 800 ? `${text.slice(0, 797)}...` : text);
+    document.querySelectorAll('[data-cb-search-result-index]').forEach((el) => {
+      el.removeAttribute('data-cb-search-result-index');
+    });
+
+    const dialogs = [...document.querySelectorAll('[role="dialog"],[data-radix-dialog-content]')].filter(isVisible);
+    const markedInput = document.querySelector('[data-cb-search-input="true"]');
+    const markedDialog = markedInput?.closest('[role="dialog"],[data-radix-dialog-content]') || null;
+    const dialog = (markedDialog && isVisible(markedDialog) ? markedDialog : null)
+      || dialogs.find((candidate) => markedInput && candidate.contains(markedInput))
+      || dialogs.find((candidate) => [...candidate.querySelectorAll('input:not([type="file"]),textarea,[contenteditable="true"],[role="searchbox"]')]
+      .some((input) => isVisible(input) && /\bsearch\b/i.test([
+        input.getAttribute('placeholder') || '',
+        input.getAttribute('aria-label') || '',
+        input.getAttribute('role') || '',
+      ].join(' ')))) || null;
+    if (!dialog) return { query: '', empty: false, results: [] };
+
+    const input = (markedInput && dialog.contains(markedInput) ? markedInput : null)
+      || [...dialog.querySelectorAll('input:not([type="file"]),textarea,[contenteditable="true"],[role="searchbox"]')]
+      .find((candidate) => isVisible(candidate) && /\bsearch\b/i.test([
+        candidate.getAttribute('placeholder') || '',
+        candidate.getAttribute('aria-label') || '',
+        candidate.getAttribute('role') || '',
+      ].join(' '))) || null;
+    const query = textOf(input);
+
+    const rawCandidates = [
+      ...dialog.querySelectorAll('ol > li'),
+      ...dialog.querySelectorAll('ul > li'),
+      ...dialog.querySelectorAll('[role="option"],[role="listitem"],[cmdk-item],a[href],button,[role="button"]'),
+    ].filter(isVisible);
+    const seen = new Set();
+    const results = [];
+    for (const candidate of rawCandidates) {
+      if (results.length >= 80) break;
+      const text = textOf(candidate);
+      const aria = candidate.getAttribute('aria-label') || '';
+      const joined = [text, aria].join(' ').trim();
+      if (!joined || /^close$/i.test(joined) || /^no results$/i.test(joined)) continue;
+      if (candidate === input || candidate.contains(input)) continue;
+      const clickable = candidate.matches('a[href],button,[role="button"],[role="option"],[cmdk-item]')
+        ? candidate
+        : candidate.querySelector('a[href],button,[role="button"],[role="option"],[cmdk-item]') || candidate;
+      const href = clickable.href || candidate.querySelector('a[href]')?.href || '';
+      const key = [joined, href].join('::');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const index = results.length + 1;
+      clickable.setAttribute('data-cb-search-result-index', String(index));
+      results.push({
+        index,
+        title: trimResultText(text || aria),
+        aria: trimResultText(aria),
+        url: href,
+        sessionId: href ? ((href.match(/\/c\/([^/?#]+)/) || [])[1] || '') : '',
+      });
+    }
+
+    const dialogText = textOf(dialog);
+    return {
+      query,
+      empty: results.length === 0 && /\bno results\b/i.test(dialogText),
+      results,
+    };
+  });
+}
+
+async function waitForTargetSearchResults(page) {
+  const deadline = Date.now() + 8000;
+  let latest = { query: '', empty: false, results: [] };
+  while (Date.now() < deadline) {
+    latest = await extractTargetSearchResults(page);
+    if (latest.results.length || latest.empty) return latest;
+    await page.waitForTimeout(250);
+  }
+  return latest;
+}
+
+async function closeTargetSearch(page) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(250);
+    const stillOpen = await markSearchInput(page).catch(() => null);
+    if (!stillOpen) return;
+  }
+}
+
+function chooseSearchResult(results, selector) {
+  if (!selector) return null;
+  const normalized = String(selector).trim();
+  if (!normalized) return null;
+  if (/^\d+$/.test(normalized)) {
+    const index = Number(normalized);
+    return results.find((item) => item.index === index) || null;
+  }
+  const lower = normalized.toLowerCase();
+  return results.find((item) => [item.title, item.aria, item.sessionId, item.url]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(lower))) || null;
+}
+
+async function searchTargetApp(page, query, options = {}) {
+  const searchQuery = String(query || '').trim();
+  if (!searchQuery) throw new Error('Search query is empty');
+
+  await setTargetSearchQuery(page, searchQuery);
+  const state = await waitForTargetSearchResults(page);
+  let opened = null;
+  if (options.open) {
+    opened = chooseSearchResult(state.results, options.open);
+    if (!opened) {
+      await closeTargetSearch(page);
+      throw new Error(`No target app search result matched: ${options.open}`);
+    }
+    await ensureTargetClickable(page, [`[data-cb-search-result-index="${opened.index}"]`], `search result ${opened.index}`, 'before opening target app search result');
+    await clickMarkedSearchElement(page, `[data-cb-search-result-index="${opened.index}"]`, `search result ${opened.index}`);
+    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    await settlePage(page);
+  } else if (!options.keepOpen) {
+    await closeTargetSearch(page);
+  }
+
+  return {
+    query: searchQuery,
+    empty: Boolean(state.empty),
+    results: state.results,
+    opened,
+    url: page.url(),
+    sessionId: sessionIdFromUrl(page.url()),
+  };
+}
+
+function printSearchResults(result, jsonl = false) {
+  if (jsonl) {
+    console.log(JSON.stringify({
+      type: 'target_app_search',
+      at: nowIso(),
+      ...result,
+    }));
+    return;
+  }
+
+  console.log(`Search: ${result.query}`);
+  if (!result.results.length) {
+    console.log(result.empty ? 'No results.' : 'No visible results.');
+    return;
+  }
+  for (const item of result.results) {
+    const suffix = [
+      item.sessionId ? `session=${item.sessionId}` : '',
+      item.url ? `url=${item.url}` : '',
+    ].filter(Boolean).join(' ');
+    console.log(`#${item.index} ${item.title}${suffix ? ` (${suffix})` : ''}`);
+  }
+  if (result.opened) {
+    console.log(`Opened #${result.opened.index}: ${result.opened.title}`);
+  }
+}
+
 async function markModelSwitcher(page) {
   return page.evaluate((modelChromePattern) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
@@ -4478,7 +4780,7 @@ async function interactive(page, args) {
   console.log(`Connected to target app: ${page.url()}`);
   refreshSessionTranscript(page, args);
   console.log(`Transcript: ${args.transcript}`);
-  console.log('Type /exit to quit. Use /status, /models, /attach <path>, /artifacts, or /stream off. Multiline paste works at CB>.');
+  console.log('Type /exit to quit. Use /status, /models, /search <query>, /attach <path>, /artifacts, or /stream off. Multiline paste works at CB>.');
   let pendingAttachments = [];
   const scriptedInputs = args.scriptedInput === null ? null : parseScriptedInputs(args.scriptedInput);
 
@@ -4528,6 +4830,44 @@ async function interactive(page, args) {
       }
       await selectReasoning(page, label);
       console.log(`Selected reasoning matching: ${label}`);
+      continue;
+    }
+    if (input.type === 'command' && input.text.startsWith('/search ')) {
+      const query = input.text.slice('/search '.length).trim();
+      if (!query) {
+        console.log('Usage: /search <query>');
+        continue;
+      }
+      const result = await searchTargetApp(page, query);
+      printSearchResults(result);
+      continue;
+    }
+    if (input.type === 'command' && input.text === '/search') {
+      console.log('Usage: /search <query>');
+      continue;
+    }
+    if (input.type === 'command' && input.text.startsWith('/search-open ')) {
+      const raw = input.text.slice('/search-open '.length).trim();
+      const [queryPart, openPart] = raw.split(/\s+\|\s+/, 2);
+      const query = (queryPart || '').trim();
+      const open = (openPart || '1').trim();
+      if (!query) {
+        console.log('Usage: /search-open <query>[ | index-or-title]');
+        continue;
+      }
+      const result = await searchTargetApp(page, query, { open });
+      if (result.opened) {
+        refreshSessionTranscript(page, args);
+        await indexCurrentConversation(page, args, 'conversation_search_opened', {
+          searchQuery: query,
+          openedTitle: result.opened.title || '',
+        }).catch(() => {});
+      }
+      printSearchResults(result);
+      continue;
+    }
+    if (input.type === 'command' && input.text === '/search-open') {
+      console.log('Usage: /search-open <query>[ | index-or-title]');
       continue;
     }
     if (input.type === 'command' && input.text.startsWith('/attach ')) {
@@ -4723,6 +5063,19 @@ async function main() {
 
     if (args.watchState) {
       await watchTargetAppState(page, args);
+      return;
+    }
+
+    if (args.searchQuery) {
+      const result = await searchTargetApp(page, args.searchQuery, { open: args.searchOpen });
+      if (result.opened) {
+        refreshSessionTranscript(page, args);
+        await indexCurrentConversation(page, args, 'conversation_search_opened', {
+          searchQuery: args.searchQuery,
+          openedTitle: result.opened.title || '',
+        }).catch(() => {});
+      }
+      printSearchResults(result, args.stateJsonl);
       return;
     }
 
