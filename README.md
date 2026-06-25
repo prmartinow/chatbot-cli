@@ -84,9 +84,13 @@ modals; use `--dismiss-blocker` for that explicit action.
 
 Search is dynamic: CB waits while the history UI is still searching, distinguishes
 no-result state from results, and reports `phase`, `resultCount`, `complete`,
-`hasMore`, and `scrolls` in JSONL output. Use `--search-scrolls <n>` to scroll
-to the bottom repeatedly and load more results, or `--search-all` to keep
-scrolling until the loaded result list stops growing or the safety cap is hit.
+`hasMore`, `scrolls`, and `bottomConfirmations` in JSONL output. Use
+`--search-scrolls <n>` to scroll to the bottom repeatedly and load more results,
+or `--search-all` to keep scrolling until the loaded result list stops growing
+or the safety cap is hit. Completion after scrolling requires repeated stable
+bottom checks, because the target app can load more rows after it first reaches
+the bottom. Search emits `search_opening` before interacting with the UI and
+does not pre-reconcile conversation transcripts before the search panel opens.
 
 `--dismiss-blocker` attempts to dismiss one known safe blocking modal without
 sending a prompt or running another UI feature. It only uses safe close/Escape

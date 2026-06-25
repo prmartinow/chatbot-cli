@@ -38,7 +38,9 @@ const CONVERSATION_HYDRATION_TIMEOUT_MS = 15000;
 const COMPOSER_INSERT_TIMEOUT_MS = 10000;
 const PROMPT_ACCEPTED_TIMEOUT_MS = 30000;
 const SEARCH_READY_TIMEOUT_MS = 20000;
+const SEARCH_OPEN_TIMEOUT_MS = 25000;
 const SEARCH_SCROLL_SETTLE_MS = 2500;
+const SEARCH_BOTTOM_STABLE_MS = 5000;
 const SEARCH_ALL_MAX_SCROLLS = 60;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
 const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
@@ -3168,23 +3170,72 @@ async function waitForTargetSearchResults(page, options = {}) {
 }
 
 async function scrollTargetSearchResults(page) {
-  return page.evaluate(() => {
+  const target = await page.evaluate(() => {
     const target = document.querySelector('[data-cb-search-scroll-container="true"]');
     if (!target) return null;
+    const rect = target.getBoundingClientRect();
     const before = {
       top: target.scrollTop,
       height: target.clientHeight,
       scrollHeight: target.scrollHeight,
-    };
-    target.scrollTop = target.scrollHeight;
-    return {
-      before,
-      after: {
-        top: target.scrollTop,
-        height: target.clientHeight,
-        scrollHeight: target.scrollHeight,
+      rect: {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        heightPx: rect.height,
       },
     };
+    return { before };
+  });
+  if (!target) return null;
+
+  const rect = target.before.rect;
+  if (rect && rect.width > 0 && rect.heightPx > 0) {
+    await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.heightPx / 2).catch(() => {});
+    const delta = Math.max(600, Math.floor(rect.heightPx * 0.9));
+    for (let i = 0; i < 12; i += 1) {
+      await page.mouse.wheel(0, delta).catch(() => {});
+      await page.waitForTimeout(50);
+    }
+  }
+
+  const after = await page.evaluate(() => {
+    const target = document.querySelector('[data-cb-search-scroll-container="true"]');
+    if (!target) return null;
+    if (target.scrollTop <= 0) target.scrollTop = target.scrollHeight;
+    return {
+      top: target.scrollTop,
+      height: target.clientHeight,
+      scrollHeight: target.scrollHeight,
+    };
+  });
+
+  return { before: target.before, after };
+}
+
+function mergeSearchStates(previous, next) {
+  if (!previous?.results?.length) return next;
+  const seen = new Set();
+  const results = [];
+  for (const item of [...previous.results, ...(next.results || [])]) {
+    const key = [item.sessionId || '', item.messageId || item.url || item.title || ''].join('::');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push({ ...item, index: results.length + 1 });
+  }
+  return {
+    ...next,
+    results,
+  };
+}
+
+function withSearchStepTimeout(promise, timeoutMs, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
   });
 }
 
@@ -3193,38 +3244,81 @@ async function loadMoreTargetSearchResults(page, state, options = {}) {
   let current = state;
   let scrolls = 0;
   let stagnantScrolls = 0;
-  while (scrolls < maxScrolls && current.results.length && current.hasMore) {
+  let bottomConfirmations = 0;
+  while (scrolls < maxScrolls && current.results.length && (current.hasMore || bottomConfirmations < 2)) {
     const beforeCount = current.results.length;
     const beforeHeight = current.scroll?.scrollHeight || 0;
+    const beforeTop = current.scroll?.top || 0;
+    const beforeRemaining = current.scroll?.remaining ?? Number.POSITIVE_INFINITY;
+    const beforeLast = current.results[current.results.length - 1] || {};
     await scrollTargetSearchResults(page);
     scrolls += 1;
     if (typeof options.onState === 'function') {
       options.onState({ ...current, scrolls, phase: 'scrolling' }, { event: 'search_scroll' });
     }
 
-    const deadline = Date.now() + SEARCH_SCROLL_SETTLE_MS;
+    const deadline = Date.now() + Math.max(SEARCH_SCROLL_SETTLE_MS, SEARCH_BOTTOM_STABLE_MS);
     let latest = current;
+    let lastSignature = '';
+    let stableSince = 0;
     while (Date.now() < deadline) {
-      latest = await extractTargetSearchResults(page);
-      const changed = latest.results.length > beforeCount || (latest.scroll?.scrollHeight || 0) > beforeHeight;
-      const stoppedAtEnd = !latest.loading && !latest.hasMore;
-      if (changed || stoppedAtEnd) break;
+      latest = mergeSearchStates(current, await extractTargetSearchResults(page));
+      const last = latest.results[latest.results.length - 1] || {};
+      const signature = [
+        latest.results.length,
+        latest.scroll?.scrollHeight || 0,
+        Math.round(latest.scroll?.remaining || 0),
+        last.sessionId || '',
+        last.messageId || last.url || '',
+        latest.loading ? 'loading' : 'idle',
+      ].join(':');
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        stableSince = Date.now();
+      }
+      const changed = latest.results.length > beforeCount
+        || (latest.scroll?.scrollHeight || 0) > beforeHeight
+        || (last.sessionId && last.sessionId !== (current.results[current.results.length - 1] || {}).sessionId);
+      const stableAtBottom = !latest.loading
+        && !latest.hasMore
+        && stableSince
+        && Date.now() - stableSince >= SEARCH_BOTTOM_STABLE_MS;
+      if (changed && Date.now() - stableSince >= 750) break;
+      if (stableAtBottom) break;
       await page.waitForTimeout(250);
     }
     current = latest;
     const afterCount = current.results.length;
     const afterHeight = current.scroll?.scrollHeight || 0;
-    if (afterCount <= beforeCount && afterHeight <= beforeHeight) {
+    const afterTop = current.scroll?.top || 0;
+    const afterRemaining = current.scroll?.remaining ?? Number.POSITIVE_INFINITY;
+    const afterLast = current.results[current.results.length - 1] || {};
+    const grew = afterCount > beforeCount
+      || afterHeight > beforeHeight
+      || (afterLast.sessionId && (afterLast.sessionId !== beforeLast.sessionId || afterLast.messageId !== beforeLast.messageId));
+    const movedTowardBottom = afterTop > beforeTop + 8 || afterRemaining < beforeRemaining - 8;
+    if (!grew && !movedTowardBottom) {
       stagnantScrolls += 1;
     } else {
       stagnantScrolls = 0;
     }
+    if (!current.hasMore && !current.loading && !grew) {
+      bottomConfirmations += 1;
+    } else {
+      bottomConfirmations = 0;
+    }
+    current.bottomConfirmations = bottomConfirmations;
+    current.truncated = Boolean(scrolls >= maxScrolls && bottomConfirmations < 2);
+    current.complete = Boolean(!current.truncated && !current.hasMore && !current.loading && bottomConfirmations >= 2);
     if (typeof options.onState === 'function') options.onState(current, { event: 'search_state', scrolls });
-    if (stagnantScrolls >= 2) break;
+    if (!current.hasMore && bottomConfirmations >= 2) break;
+    if (current.hasMore && stagnantScrolls >= 2) break;
   }
   current.scrolls = scrolls;
-  current.complete = !current.hasMore || stagnantScrolls >= 2 || scrolls >= maxScrolls;
-  current.truncated = Boolean(current.hasMore && scrolls >= maxScrolls);
+  current.truncated = Boolean((scrolls >= maxScrolls && bottomConfirmations < 2)
+    || (current.hasMore && stagnantScrolls >= 2));
+  current.complete = Boolean(!current.truncated && !current.hasMore && !current.loading && bottomConfirmations >= 2);
+  current.bottomConfirmations = bottomConfirmations;
   return current;
 }
 
@@ -3255,7 +3349,22 @@ async function searchTargetApp(page, query, options = {}) {
   const searchQuery = String(query || '').trim();
   if (!searchQuery) throw new Error('Search query is empty');
 
-  await setTargetSearchQuery(page, searchQuery);
+  if (typeof options.onState === 'function') {
+    options.onState({
+      query: searchQuery,
+      phase: 'opening',
+      empty: false,
+      loading: false,
+      complete: false,
+      hasMore: false,
+      results: [],
+    }, { event: 'search_opening' });
+  }
+  await withSearchStepTimeout(
+    setTargetSearchQuery(page, searchQuery),
+    SEARCH_OPEN_TIMEOUT_MS,
+    `Timed out after ${SEARCH_OPEN_TIMEOUT_MS}ms while opening or filling target app search`,
+  );
   let state = await waitForTargetSearchResults(page, options);
   const maxScrolls = Number.isFinite(options.maxScrolls)
     ? options.maxScrolls
@@ -3288,6 +3397,7 @@ async function searchTargetApp(page, query, options = {}) {
     timedOut: Boolean(state.timedOut),
     truncated: Boolean(state.truncated),
     scrolls: state.scrolls || 0,
+    bottomConfirmations: state.bottomConfirmations || 0,
     resultCount: state.results.length,
     results: state.results,
     opened,
@@ -3307,7 +3417,7 @@ function printSearchResults(result, jsonl = false) {
   }
 
   console.log(`Search: ${result.query}`);
-  console.log(`State: ${result.phase || 'unknown'}; results=${result.resultCount || result.results.length}; complete=${result.complete ? 'yes' : 'no'}; scrolls=${result.scrolls || 0}${result.truncated ? '; truncated=yes' : ''}`);
+  console.log(`State: ${result.phase || 'unknown'}; results=${result.resultCount || result.results.length}; complete=${result.complete ? 'yes' : 'no'}; scrolls=${result.scrolls || 0}; bottom-confirmations=${result.bottomConfirmations || 0}${result.truncated ? '; truncated=yes' : ''}`);
   if (!result.results.length) {
     if (result.empty) console.log('No results.');
     else if (result.timedOut) console.log('Search timed out before results or no-result state appeared.');
@@ -3342,6 +3452,7 @@ function buildSearchStateEvent(state, extra = {}) {
     timedOut: Boolean(state.timedOut),
     truncated: Boolean(state.truncated),
     scrolls: extra.scrolls || state.scrolls || 0,
+    bottomConfirmations: state.bottomConfirmations || 0,
     scroll: state.scroll || null,
   };
 }
@@ -5240,6 +5351,9 @@ async function main() {
     const page = await findTargetAppPage(browser, args);
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
     if (passiveCurrentPageRead) {
+      refreshSessionTranscript(page, args);
+    } else if (args.searchQuery) {
+      await settlePage(page);
       refreshSessionTranscript(page, args);
     } else {
       await settlePage(page);
