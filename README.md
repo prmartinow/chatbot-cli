@@ -101,6 +101,17 @@ sending a prompt or running another UI feature. It only uses safe close/Escape
 behavior and reports if the blocker remains or is not safe to dismiss
 automatically.
 
+Settings and personalization dialogs are treated as blocking UI, not as safe
+auto-dismiss targets. Model-picker commands must not use account/profile or
+settings controls as model switchers; if a settings dialog is open, close it
+explicitly before inspecting or selecting models.
+
+The current compact Intelligence picker can expose effort-only composer labels
+such as `Medium`, `High`, and `Extra High` instead of older model/mode labels.
+Treat those labels as model-picker controls only when they are inside the
+composer control area. Do not use greeting/account-name buttons or sidebar
+profile controls as model-picker candidates.
+
 Watch target app state for orchestration:
 
 ```bash

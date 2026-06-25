@@ -96,6 +96,8 @@ const SEND_BUTTON_SELECTORS = [
   'button[aria-label="Send message"]',
 ];
 const BLOCKING_MODAL_SELECTORS = [
+  '#modal-settings',
+  '[data-testid="modal-settings"]',
   '#modal-conversation-history-rate-limit',
   '[data-testid="modal-conversation-history-rate-limit"]',
   '#modal-subscription-failure',
@@ -1524,6 +1526,9 @@ function blockingModalKindFromMeta(meta) {
   if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
     return 'subscription_modal';
   }
+  if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
+    return 'settings_modal';
+  }
   if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
     return 'artifact_lightbox';
   }
@@ -1563,6 +1568,9 @@ async function getBlockingModal(page) {
       if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
       }
+      if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
+        return 'settings_modal';
+      }
       if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
         return 'artifact_lightbox';
       }
@@ -1601,6 +1609,9 @@ async function dismissBlockingModal(page) {
       }
       if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
+      }
+      if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
+        return 'settings_modal';
       }
       if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
         return 'artifact_lightbox';
@@ -1757,6 +1768,9 @@ async function getCenterPointClickBlocker(page, selectors, label, options = {}) 
       }
       if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
+      }
+      if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
+        return 'settings_modal';
       }
       if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
         return 'artifact_lightbox';
@@ -1952,6 +1966,9 @@ async function getTargetAppState(page) {
       }
       if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
         return 'subscription_modal';
+      }
+      if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
+        return 'settings_modal';
       }
       if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
         return 'artifact_lightbox';
@@ -2224,12 +2241,26 @@ async function getTargetAppState(page) {
       .filter((text, index, arr) => arr.indexOf(text) === index)
       .slice(-20);
 
-    const modelButton = controls.find((item) => item.testid === 'model-switcher-dropdown-button'
-      || /model selector/i.test(item.aria)
-      || (item.tag === 'button'
-        && item.text.length <= 80
-        && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(item.text)
-        && !modelChromeRe.test([item.aria, item.title, item.text].join(' '))));
+    const modelButtonEl = buttons.find((button) => {
+      const text = textOf(button);
+      const meta = controlText(button);
+      const insideComposer = Boolean(composerRoot && composerRoot.contains(button));
+      if (button.getAttribute('data-testid') === 'model-switcher-dropdown-button') return true;
+      if (/model selector/i.test(button.getAttribute('aria-label') || '')) return true;
+      if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)
+        && !modelChromeRe.test(meta)) return true;
+      return insideComposer
+        && text.length <= 80
+        && /\b(extra high|high|medium|low|auto|fast)\b/i.test(text)
+        && !modelChromeRe.test(meta);
+    });
+    const modelButton = modelButtonEl
+      ? {
+        text: textOf(modelButtonEl),
+        aria: modelButtonEl.getAttribute('aria-label') || '',
+        testid: modelButtonEl.getAttribute('data-testid') || '',
+      }
+      : null;
     const reasoningControls = controls
       .filter((item) => /\b(reasoning|think|thinking|extended|fast|auto)\b/i.test([item.testid, item.aria, item.title, item.text].join(' ')))
       .slice(0, 20);
@@ -3511,6 +3542,20 @@ async function markModelSwitcher(page) {
     const candidates = [...document.querySelectorAll('button,[role="button"]')]
       .filter(isVisible)
       .map((el) => {
+        const containingDialog = el.closest('[role="dialog"],[aria-modal="true"],[id^="modal-"],[data-testid^="modal-"]');
+        if (containingDialog && /modal-settings|settings|personalization|custom instructions|base style and tone/i.test([
+          containingDialog.id || '',
+          containingDialog.getAttribute('data-testid') || '',
+          textOf(containingDialog),
+        ].join(' '))) {
+          return null;
+        }
+        const containingForm = el.closest('form');
+        const insideComposer = Boolean(containingForm && /composer|ask anything/i.test([
+          containingForm.getAttribute('data-testid') || '',
+          containingForm.className || '',
+          textOf(containingForm),
+        ].join(' ')));
         const rect = el.getBoundingClientRect();
         const text = textOf(el);
         const meta = [
@@ -3520,14 +3565,28 @@ async function markModelSwitcher(page) {
           text,
         ].join(' ');
         let score = 0;
+        let modelSignal = false;
         if (el.getAttribute('data-testid') === 'model-switcher-dropdown-button') score += 100;
-        if (/model selector/i.test(el.getAttribute('aria-label') || '')) score += 100;
-        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)) score += 50;
-        if (rect.x > 250 && rect.y > 100) score += 20;
-        if (/\b(search|project|history|pin|temporary|profile|account|download|apps|library)\b/i.test(meta)) score -= 100;
+        if (el.getAttribute('data-testid') === 'model-switcher-dropdown-button') modelSignal = true;
+        if (/model selector/i.test(el.getAttribute('aria-label') || '')) {
+          score += 100;
+          modelSignal = true;
+        }
+        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)) {
+          score += 50;
+          modelSignal = true;
+        }
+        if (insideComposer && text.length <= 80 && /\b(extra high|high|medium|low|auto|fast)\b/i.test(text)) {
+          score += 60;
+          modelSignal = true;
+        }
+        if (modelSignal && rect.x > 250 && rect.y > 100) score += 20;
+        if (/\b(search|project|history|pin|temporary|profile|account|settings|personalization|custom instructions|download|apps|library)\b/i.test(meta)) score -= 100;
         if (modelChromeRe.test(text)) score -= 100;
+        if (!modelSignal) score = 0;
         return { el, text, score };
       })
+      .filter(Boolean)
       .filter((item) => item.score > 0)
       .sort((a, b) => b.score - a.score);
 
@@ -3564,6 +3623,7 @@ async function waitForModelMenu(page, timeout = 5000) {
 }
 
 async function openModelSwitcher(page) {
+  await ensureNoBlockingModal(page, 'before opening target app model picker');
   if (await hasOpenModelMenu(page)) return 'open';
   const label = await markModelSwitcher(page);
   if (!label) return '';
@@ -3575,7 +3635,7 @@ async function openModelSwitcher(page) {
 function parseModelSelection(text) {
   const normalized = normalizeModelLabel(text);
   const modelMatch = normalized.match(/\b(?:gpt\s*)?((?:[45](?:\.\d+)?)|o\d+)\b/);
-  const effortMatch = normalized.match(/\b(light|standard|extended|heavy)\b/);
+  const effortMatch = normalized.match(/\b(extra high|light|standard|extended|heavy|medium|high|low|auto|fast)\b/);
   let mode = '';
   if (/\binstant\b/.test(normalized)) mode = 'Instant';
   else if (/\bthinking\b/.test(normalized)) mode = 'Thinking';
@@ -3586,7 +3646,7 @@ function parseModelSelection(text) {
     normalized,
     model: modelMatch ? modelMatch[1] : '',
     mode,
-    effort: effortMatch ? effortMatch[1][0].toUpperCase() + effortMatch[1].slice(1) : '',
+    effort: effortMatch ? effortMatch[1].replace(/\b\w/g, (s) => s.toUpperCase()) : '',
   };
 }
 
@@ -3605,6 +3665,27 @@ async function getModelMenuState(page) {
   return page.evaluate(() => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const effortPattern = '(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)';
+    const parseRow = (text) => {
+      const normalized = text.replace(/\s+/g, ' ').trim();
+      let mode = '';
+      let effort = '';
+      if (/^Instant\b/i.test(normalized)) {
+        mode = 'Instant';
+      } else if (/^Pro\b/i.test(normalized)) {
+        mode = 'Pro';
+        effort = (normalized.match(new RegExp(`^Pro\\s+${effortPattern}\\b`, 'i'))?.[1] || '')
+          .replace(/\b\w/g, (s) => s.toUpperCase());
+      } else if (new RegExp(`^${effortPattern}$`, 'i').test(normalized)) {
+        mode = 'Thinking';
+        effort = normalized.replace(/\b\w/g, (s) => s.toUpperCase());
+      } else if (/^Thinking\b/i.test(normalized)) {
+        mode = 'Thinking';
+        effort = (normalized.match(new RegExp(`\\b${effortPattern}\\b`, 'i'))?.[1] || '')
+          .replace(/\b\w/g, (s) => s.toUpperCase());
+      }
+      return { mode, effort };
+    };
     const rectOf = (el) => {
       const rect = el.getBoundingClientRect();
       return {
@@ -3614,7 +3695,7 @@ async function getModelMenuState(page) {
         height: Math.round(rect.height),
       };
     };
-    const modelRows = [...document.querySelectorAll('[data-testid^="model-switcher-"]')]
+    let modelRows = [...document.querySelectorAll('[data-testid^="model-switcher-"]')]
       .filter(isVisible)
       .filter((el) => {
         const testid = el.getAttribute('data-testid') || '';
@@ -3624,16 +3705,15 @@ async function getModelMenuState(page) {
       })
       .map((el) => {
         const text = textOf(el);
-        const mode = (text.match(/\b(Instant|Thinking|Pro)\b/i)?.[1] || '').replace(/^./, (s) => s.toUpperCase());
-        const effort = (text.match(/•\s*(Light|Standard|Extended|Heavy)\b/i)?.[1] || '').replace(/^./, (s) => s.toUpperCase());
+        const parsed = parseRow(text);
         const testid = el.getAttribute('data-testid') || '';
         const effortButton = [...document.querySelectorAll('[data-testid]')]
           .find((button) => (button.getAttribute('data-testid') || '') === `${testid}-thinking-effort`)
           || el.querySelector('[data-model-picker-thinking-effort-action="true"], button[aria-label="Effort"]');
         return {
           label: text,
-          mode,
-          effort,
+          mode: parsed.mode,
+          effort: parsed.effort,
           testid,
           role: el.getAttribute('role') || '',
           checked: el.getAttribute('aria-checked') || el.getAttribute('data-state') || '',
@@ -3642,10 +3722,41 @@ async function getModelMenuState(page) {
         };
       });
 
+    const intelligenceRoot = [...document.querySelectorAll('[data-testid="composer-intelligence-picker-content"], [role="menu"]')]
+      .filter(isVisible)
+      .find((el) => /\b(Intelligence|Instant|Extra High|GPT-[45](?:\.\d+)?)\b/i.test(textOf(el)));
+    const intelligenceItems = intelligenceRoot
+      ? [...intelligenceRoot.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')].filter(isVisible)
+      : [];
+    const intelligenceRows = intelligenceItems
+      .map((el) => {
+        const text = textOf(el);
+        const parsed = parseRow(text);
+        if (!parsed.mode) return null;
+        const effortButton = text === 'Pro Extended'
+          ? intelligenceRoot.querySelector('[data-testid="composer-intelligence-pro-thinking-effort-trigger"]')
+          : null;
+        return {
+          label: text,
+          mode: parsed.mode,
+          effort: parsed.effort,
+          testid: el.getAttribute('data-testid') || '',
+          role: el.getAttribute('role') || '',
+          checked: el.getAttribute('aria-checked') || el.getAttribute('data-state') || '',
+          effortTestid: effortButton?.getAttribute('data-testid') || '',
+          rect: rectOf(el),
+        };
+      })
+      .filter(Boolean);
+    if (intelligenceRows.length) modelRows = intelligenceRows;
+
     const menuRoots = [...document.querySelectorAll('[role="menu"]')]
       .filter(isVisible)
-      .filter((el) => modelRows.some((row) => el.contains(document.querySelector(`[data-testid="${row.testid}"]`))));
-    const menuRoot = menuRoots[0] || null;
+      .filter((el) => {
+        if (intelligenceRoot && el.contains(intelligenceRoot)) return true;
+        return modelRows.some((row) => row.testid && el.contains(document.querySelector(`[data-testid="${row.testid}"]`)));
+      });
+    const menuRoot = menuRoots[0] || (intelligenceRoot?.closest('[role="menu"]') || null);
     const header = menuRoot
       ? [...menuRoot.querySelectorAll('div,span')]
         .filter(isVisible)
@@ -3653,7 +3764,12 @@ async function getModelMenuState(page) {
         .find((text) => /^(Latest|Legacy)\s*•\s*/i.test(text) || /^(Latest|Legacy)\b/i.test(text))
         || ''
       : '';
-    const currentModel = header.match(/\b((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1] || '';
+    const modelOption = intelligenceItems
+      .map(textOf)
+      .find((text) => /\b(?:gpt[-\s]*)?(?:[45](?:\.\d+)?|o\d+)\b/i.test(text)) || '';
+    const currentModel = header.match(/\b((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1]
+      || modelOption.match(/\b(?:gpt[-\s]*)?((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1]
+      || '';
     const configure = [...document.querySelectorAll('[data-testid="model-configure-modal"], [role="menuitem"]')]
       .filter(isVisible)
       .map((el) => ({
@@ -3665,7 +3781,7 @@ async function getModelMenuState(page) {
 
     return {
       current: {
-        label: header,
+        label: header || modelOption,
         model: currentModel,
       },
       rows: modelRows,
@@ -3738,7 +3854,7 @@ async function readEffortOptionsForRow(page, row) {
     await effortButton.click({ timeout: 5000, force: true });
     await page.waitForTimeout(300);
     const options = (await readVisibleChoiceOptions(page))
-      .filter((option) => /^(Light|Standard|Extended|Heavy)$/i.test(option));
+      .filter((option) => /^(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)$/i.test(option));
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(200);
     if (options.length) return options;
@@ -3832,11 +3948,11 @@ async function getConfigureModalState(page, includeDropdowns = false) {
     await page.waitForTimeout(200);
   }
   const effortCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
-    .filter({ hasText: /\b(Light|Standard|Extended|Heavy)\b/ }).last();
+    .filter({ hasText: /\b(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)\b/ }).last();
   if (await effortCombo.count().catch(() => 0)) {
     await effortCombo.click({ timeout: 5000 });
     await page.waitForTimeout(300);
-    effortOptions.push(...(await readVisibleChoiceOptions(page)).filter((option) => /^(Light|Standard|Extended|Heavy)$/i.test(option)));
+    effortOptions.push(...(await readVisibleChoiceOptions(page)).filter((option) => /^(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)$/i.test(option)));
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(200);
   }
@@ -3863,8 +3979,12 @@ async function inspectModelConfigurator(page, options = {}) {
     for (const row of result.modes) {
       row.effortOptions = await readEffortOptionsForRow(page, row);
     }
-    await openConfigureModalFromMenu(page);
-    result.configure = await getConfigureModalState(page, true);
+    try {
+      await openConfigureModalFromMenu(page);
+      result.configure = await getConfigureModalState(page, true);
+    } catch (error) {
+      result.configureError = error.message || String(error);
+    }
     if (result.configure?.effortOptions?.length) {
       const selectedMode = normalizeModelLabel(result.configure.selectedMode);
       const selectedRow = result.modes.find((row) => row.checked === 'true'
@@ -3890,6 +4010,7 @@ async function listModelOptions(page) {
     lines.push(`${row.label}${suffix}`);
   }
   if (config.configureAvailable) lines.push('Configure...');
+  if (config.configureError) lines.push(`Configure unavailable: ${config.configureError}`);
   if (config.configure?.modelOptions?.length) {
     lines.push(`Configure models: ${config.configure.modelOptions.join(', ')}`);
   }
@@ -3944,7 +4065,7 @@ async function selectInConfigureModal(page, selection) {
 
   if (selection.effort) {
     const effortCombo = page.locator('[role="dialog"] [role="combobox"], [role="dialog"] button')
-      .filter({ hasText: /\b(Light|Standard|Extended|Heavy)\b/ }).last();
+      .filter({ hasText: /\b(Extra High|Light|Standard|Extended|Heavy|Medium|High|Low|Auto|Fast)\b/ }).last();
     if (!await effortCombo.count().catch(() => 0)) throw new Error('No effort dropdown found in Configure modal');
     await effortCombo.click({ timeout: 5000 });
     await page.waitForTimeout(300);
@@ -3971,7 +4092,9 @@ async function selectModel(page, label) {
   const targetMode = selection.mode
     || (selection.effort ? parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '').mode : '');
   const row = targetMode
-    ? state.rows.find((item) => item.mode.toLowerCase() === targetMode.toLowerCase())
+    ? state.rows.find((item) => item.mode.toLowerCase() === targetMode.toLowerCase()
+      && (!selection.effort || item.effort.toLowerCase() === selection.effort.toLowerCase()
+        || normalizeModelLabel(item.label).includes(normalizeModelLabel(selection.effort))))
     : state.rows.find((item) => normalizeModelLabel(item.label).includes(selection.normalized));
 
   if (!row) {
@@ -3989,8 +4112,12 @@ async function selectModel(page, label) {
     state = await getModelMenuState(page);
   }
 
-  const freshRow = state.rows.find((item) => item.testid === row.testid) || row;
-  await page.locator(`[data-testid="${freshRow.testid}"]`).first().click({ timeout: 5000 });
+  const freshRow = (row.testid ? state.rows.find((item) => item.testid === row.testid) : null) || row;
+  if (freshRow.testid) {
+    await page.locator(`[data-testid="${freshRow.testid}"]`).first().click({ timeout: 5000 });
+  } else if (!await clickMarkedVisibleOption(page, freshRow.label)) {
+    throw new Error(`No visible model option matching: ${freshRow.label}`);
+  }
   await page.waitForTimeout(700);
 }
 
