@@ -761,6 +761,31 @@ function sessionIdFromTranscriptPath(transcriptPath) {
   return SESSION_ID_RE.test(id) ? id : '';
 }
 
+function sessionIdFromSchedulerRecord(record) {
+  if (!record) return '';
+  return record.sessionId
+    || sessionIdFromUrl(record.url || '')
+    || sessionIdFromTranscriptPath(record.transcript || '')
+    || '';
+}
+
+function normalizeSchedulerSessionRecord(record) {
+  if (!record) return record;
+  const sessionId = sessionIdFromSchedulerRecord(record);
+  if (!sessionId) return { ...record };
+  const normalized = {
+    ...record,
+    sessionId,
+  };
+  if (!sessionIdFromUrl(normalized.url || '')) {
+    normalized.url = targetConversationUrl(sessionId);
+  }
+  if (!normalized.transcript) {
+    normalized.transcript = transcriptPathForSession(sessionId);
+  }
+  return normalized;
+}
+
 function upsertConversation(index, patch) {
   const now = nowIso();
   const alias = patch.alias || '';
@@ -926,7 +951,7 @@ function responseAfterRound(entries, round) {
 
 function reconcilePendingRoundsFromTranscript(args, options = {}) {
   if (!args.transcript || !fs.existsSync(args.transcript)) return [];
-  const sessionId = path.basename(args.transcript, path.extname(args.transcript));
+  const sessionId = sessionIdFromTranscriptPath(args.transcript);
   const skipSessionIds = new Set(options.skipSessionIds || []);
   const entries = parseTranscriptEntries(fs.readFileSync(args.transcript, 'utf8'));
   if (!entries.length) return [];
@@ -934,15 +959,32 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
   return withSchedulerLock(() => {
     const state = loadRoundState();
     const completed = [];
+    let changed = false;
     for (const round of state.rounds) {
       if (round.status !== 'pending') continue;
-      const roundSessionId = round.sessionId || sessionId;
+      const roundSessionId = sessionIdFromSchedulerRecord(round) || sessionId;
       if (skipSessionIds.has(roundSessionId)) continue;
-      if (round.sessionId && round.sessionId !== sessionId) continue;
+      if (roundSessionId && sessionId && roundSessionId !== sessionId) continue;
+      const normalizedRound = normalizeSchedulerSessionRecord({ ...round, sessionId: roundSessionId || round.sessionId });
+      if (normalizedRound.sessionId && (
+        round.sessionId !== normalizedRound.sessionId
+        || round.url !== normalizedRound.url
+        || round.transcript !== normalizedRound.transcript
+      )) {
+        Object.assign(round, normalizedRound, { updatedAt: nowIso() });
+        changed = true;
+        appendJsonl(ROUND_EVENTS_PATH, {
+          type: 'round_session_backfilled',
+          at: round.updatedAt,
+          round,
+        });
+      }
       const finalResponse = responseAfterRound(entries, round);
       if (!finalResponse) continue;
       Object.assign(round, {
         status: 'done',
+        sessionId: roundSessionId || round.sessionId || '',
+        url: sessionIdFromUrl(round.url || '') ? round.url : (roundSessionId ? targetConversationUrl(roundSessionId) : round.url || ''),
         responseChars: finalResponse.length,
         transcript: args.transcript,
         completedAt: nowIso(),
@@ -956,7 +998,7 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
         round,
       });
     }
-    if (completed.length) saveRoundState(state);
+    if (completed.length || changed) saveRoundState(state);
     return completed;
   });
 }
@@ -1138,10 +1180,14 @@ function printScheduledJob(job, jsonl = false) {
 }
 
 function queueSnapshot() {
+  const rounds = loadRoundState();
+  rounds.rounds = rounds.rounds.map(normalizeSchedulerSessionRecord);
+  const conversations = loadConversationIndex();
+  conversations.conversations = conversations.conversations.map(normalizeSchedulerSessionRecord);
   return {
     queue: loadQueueState(),
-    conversations: loadConversationIndex(),
-    rounds: loadRoundState(),
+    conversations,
+    rounds,
   };
 }
 
@@ -4850,10 +4896,9 @@ function expectedSessionIdForJob(job, index) {
   if (!job) return '';
   const alias = job.target?.alias || job.result?.alias || '';
   const record = alias && index ? findConversationByAlias(index, alias) : null;
-  return record?.sessionId
+  return sessionIdFromSchedulerRecord(record)
     || job.target?.sessionId
-    || job.result?.sessionId
-    || sessionIdFromTranscriptPath(job.result?.transcript)
+    || sessionIdFromSchedulerRecord(job.result)
     || '';
 }
 
@@ -4863,14 +4908,14 @@ function findRoundForJob(rounds, job, index = null) {
 
   const expectedSessionId = expectedSessionIdForJob(job, index);
   if (expectedSessionId) {
-    return candidates.find((round) => round.sessionId === expectedSessionId) || null;
+    return candidates.find((round) => sessionIdFromSchedulerRecord(round) === expectedSessionId) || null;
   }
 
   const jobHash = messageHash(job.message || '');
   const exactHashMatches = candidates.filter((round) => round.messageHash && round.messageHash === jobHash);
   if (exactHashMatches.length === 1) return exactHashMatches[0];
 
-  const sessionMatches = candidates.filter((round) => round.sessionId);
+  const sessionMatches = candidates.filter((round) => sessionIdFromSchedulerRecord(round));
   return sessionMatches.length === 1 ? sessionMatches[0] : null;
 }
 
@@ -4900,7 +4945,8 @@ function recoverQueueStateFromRounds(page, args, context) {
     const indexBefore = JSON.stringify(index.conversations);
     const transcriptEntries = new Map();
     const finalResponseForRound = (round) => {
-      const transcript = round.sessionId === context.activeSessionId
+      const roundSessionId = sessionIdFromSchedulerRecord(round);
+      const transcript = roundSessionId === context.activeSessionId
         ? args.transcript
         : (round.transcript || '');
       if (!transcript || !fs.existsSync(transcript)) return '';
@@ -4910,13 +4956,25 @@ function recoverQueueStateFromRounds(page, args, context) {
       return responseAfterRound(transcriptEntries.get(transcript), round);
     };
 
+    for (const round of roundState.rounds) {
+      const normalized = normalizeSchedulerSessionRecord(round);
+      if (normalized.sessionId && (
+        round.sessionId !== normalized.sessionId
+        || round.url !== normalized.url
+        || round.transcript !== normalized.transcript
+      )) {
+        Object.assign(round, normalized, { updatedAt: now });
+        changedRounds.push({ type: 'round_session_backfilled', round });
+      }
+    }
+
     for (const job of queue.jobs) {
       if (!scheduledJobNeedsReconciliation(job.status)) continue;
       const round = findRoundForJob(roundState.rounds, job, index);
-      const sessionId = round?.sessionId || job.result?.sessionId || '';
+      const sessionId = sessionIdFromSchedulerRecord(round) || sessionIdFromSchedulerRecord(job.result) || '';
       if (!round && !sessionId) continue;
 
-      const activeRound = context.activeSessionId && round?.sessionId === context.activeSessionId;
+      const activeRound = context.activeSessionId && sessionIdFromSchedulerRecord(round) === context.activeSessionId;
       if (activeRound && context.isGenerating) {
         const message = `target app is still generating for session ${context.activeSessionId}; run CB --recover-queue after it finishes.`;
         if (job.status !== 'waiting' || job.lastError !== message) {
@@ -4937,6 +4995,7 @@ function recoverQueueStateFromRounds(page, args, context) {
         if (round.status !== 'pending' || round.lastError !== message) {
           Object.assign(round, {
             status: 'pending',
+            sessionId,
             responseChars: 0,
             completedAt: '',
             lastError: message,
@@ -4951,6 +5010,7 @@ function recoverQueueStateFromRounds(page, args, context) {
       if (round && finalResponse && finalResponse.length > (round.responseChars || 0)) {
         Object.assign(round, {
           status: 'done',
+          sessionId,
           responseChars: finalResponse.length,
           completedAt: round.completedAt || now,
           lastError: '',
@@ -5400,19 +5460,23 @@ async function ask(page, message, args) {
       streamer ? (event) => streamer.update(event) : null,
     );
   } catch (error) {
+    const sessionId = sessionIdFromUrl(page.url());
     updateRound(round.id, {
       status: 'pending',
+      sessionId,
       lastError: error.message || String(error),
       url: page.url(),
-      transcript: args.transcript,
+      transcript: args.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
     }, 'round_waiting_for_recovery');
     throw error;
   }
   if (streamer) streamer.finish();
   refreshSessionTranscript(page, args);
   appendTranscript(args.transcript, 'assistant', response);
+  const sessionId = sessionIdFromUrl(page.url());
   updateRound(round.id, {
     status: 'done',
+    sessionId,
     responseChars: response.length,
     completedAt: nowIso(),
     url: page.url(),
