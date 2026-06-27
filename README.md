@@ -144,6 +144,11 @@ node CB.js --queue-status
 
 `--run-queue` processes scheduled prompts in strict queue order. It only considers the first non-done job: `running`, `waiting`, `needs_recovery`, or `failed` jobs block later pending work until they are recovered, reset, or intentionally skipped. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. If target app is still generating when a timeout fires, the job is held as `waiting` and the runner stops instead of marking it failed and continuing. Pre-send UI blockers such as subscription modals or `modal-conversation-history-rate-limit` are held as `needs_recovery`; no prompt is considered submitted and the next queued job must not start. Known safe blockers such as `#modal-subscription-failure` and identified artifact/lightbox close overlays are auto-dismissed by clicking only visible Close controls and then rechecking the blocker state. Payment, upgrade, login, captcha, destructive, or unknown dialogs are not clicked. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
 
+If a new-conversation job displays the submitted user turn but the backend never
+assigns a `/c/<session-id>` URL, CB reloads once after the acceptance window. If
+the session id still does not appear, the job is held as `needs_recovery` and
+the queue stops instead of waiting forever or advancing to the next prompt.
+
 `--recover-queue` never sends a new prompt. It syncs the active target app conversation, skips any in-flight assistant preface while the stop control is visible, updates matching rounds/jobs after the final answer is complete, audits already-done jobs for stale response counts, and reports the first queue blocker or next pending job. Use `--conversation <session-id-or-alias>` with `--recover-queue`, `--sync-transcript`, `--latest-assistant`, or `--status` to inspect or recover a specific existing conversation without sending a message. Scheduler completion is driven by target app state, not by a timer: queued jobs have no response timeout by default, and older jobs that only stored the default `180000` timeout do not inherit it. Use `--timeout <ms>` only as an explicit watchdog, or `--timeout 0` to force no timeout.
 
 Scheduler and conversation state is private output data under `outputs/scheduler/`: `queue.json`, `conversation-index.json`, and `rounds.json` are the readable current state, while their `.jsonl` companions are append-only event journals.
@@ -158,6 +163,11 @@ Before submitting, CB verifies that the composer draft contains the intended
 prompt text or a recognized long-form pasted-text attachment. After submitting,
 it waits for a matching user turn to appear after the baseline turn before it
 records the prompt as accepted or appends it to the transcript.
+For brand-new conversations, the matching user turn is not enough: CB also
+requires the URL to move to `/c/<session-id>`. If no session id appears within
+30 seconds, CB reloads once and rechecks. If the session id still does not
+appear, CB treats the send as recoverable and does not append transcript or
+index state for that prompt.
 Before typing or clicking send, CB also checks the center point of the composer
 and send button with `document.elementFromPoint()`. If a visible modal, dialog,
 or open overlay covers that point and cannot be safely dismissed, CB reports a

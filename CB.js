@@ -37,6 +37,8 @@ const NO_RESPONSE_RELOAD_MS = 90000;
 const CONVERSATION_HYDRATION_TIMEOUT_MS = 15000;
 const COMPOSER_INSERT_TIMEOUT_MS = 10000;
 const PROMPT_ACCEPTED_TIMEOUT_MS = 30000;
+const NEW_SESSION_ACCEPTANCE_TIMEOUT_MS = 30000;
+const NEW_SESSION_ACCEPTANCE_RELOAD_TIMEOUT_MS = 15000;
 const SEARCH_READY_TIMEOUT_MS = 20000;
 const SEARCH_OPEN_TIMEOUT_MS = 25000;
 const SEARCH_SCROLL_SETTLE_MS = 2500;
@@ -1430,6 +1432,37 @@ async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout 
   const latest = lastTurns.length ? lastTurns[lastTurns.length - 1] : null;
   const latestSummary = latest ? `${latest.role || 'unknown'}:${latest.testid || latest.index}:${(latest.text || '').slice(0, 240)}` : 'none';
   throw new Error(`Prompt was not accepted by target app after ${timeout}ms: no matching user turn appeared after the baseline. Composer: ${composerDraftSummary(lastComposer)}. Latest turn: ${latestSummary}.`);
+}
+
+async function waitForSessionIdInUrl(page, timeout) {
+  if (sessionIdFromUrl(page.url())) return sessionIdFromUrl(page.url());
+  await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout }).catch(() => {});
+  return sessionIdFromUrl(page.url());
+}
+
+async function confirmNewConversationAccepted(page, message, baselineLastTurnId) {
+  const existingSessionId = sessionIdFromUrl(page.url());
+  if (existingSessionId) {
+    return { sessionId: existingSessionId, reloaded: false };
+  }
+
+  const sessionId = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_TIMEOUT_MS);
+  if (sessionId) return { sessionId, reloaded: false };
+
+  info(`[state] no session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms; reloading target app once to verify prompt acceptance`);
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await settlePage(page);
+
+  const sessionIdAfterReload = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_RELOAD_TIMEOUT_MS);
+  if (sessionIdAfterReload) return { sessionId: sessionIdAfterReload, reloaded: true };
+
+  const turns = await getConversationTurns(page).catch(() => []);
+  const userTurn = findUserTurnAfterBaseline(turns, message, baselineLastTurnId);
+  const state = await getTargetAppState(page).catch(() => null);
+  const generation = await getCombinedGenerationState(page, state).catch(() => ({ isGenerating: false }));
+  const latest = turns.length ? turns[turns.length - 1] : null;
+  const latestSummary = latest ? `${latest.role || 'unknown'}:${latest.testid || latest.index}:${(latest.text || '').slice(0, 240)}` : 'none';
+  throw new Error(`Prompt was submitted but target app did not assign a session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms; reloaded once and still no session id. User turn after reload: ${userTurn ? 'yes' : 'no'}. Generating: ${generation.isGenerating ? 'yes' : 'no'}. Latest turn: ${latestSummary}. No transcript entry was recorded; retry or recover manually.`);
 }
 
 async function sendMessage(page, message, baselineLastTurnId = '') {
@@ -4851,7 +4884,7 @@ function scheduledJobNeedsReconciliation(status) {
 
 function queueHoldStatusForError(message) {
   if (/Timed out after \d+ms while target app was still generating/i.test(message)) return 'waiting';
-  if (/target app UI blocker|modal-conversation-history-rate-limit|conversation_history_rate_limit|modal-subscription-failure|subscription_modal|intercepts pointer events|Prompt was not submitted|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
+  if (/target app UI blocker|modal-conversation-history-rate-limit|conversation_history_rate_limit|modal-subscription-failure|subscription_modal|intercepts pointer events|Prompt was not submitted|Prompt was submitted but target app did not assign a session id|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
   return 'failed';
 }
 
@@ -5351,7 +5384,7 @@ async function ask(page, message, args) {
   const turnsBefore = await getConversationTurns(page);
   const baselineLastTurnId = turnsBefore.length ? turnsBefore[turnsBefore.length - 1].testid : '';
   await sendMessage(page, message, baselineLastTurnId);
-  await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout: 10000 }).catch(() => {});
+  await confirmNewConversationAccepted(page, message, baselineLastTurnId);
   refreshSessionTranscript(page, args);
   await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
   const round = registerPendingRound(args, page, message, baselineLastTurnId);
