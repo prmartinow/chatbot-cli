@@ -61,6 +61,9 @@ node CB.js --search "project name" --search-scrolls 3
 node CB.js --search "project name" --search-all
 node CB.js --search "project name" --search-open 1
 node CB.js --dismiss-blocker
+node CB.js --compact-conversation
+node CB.js --compact-handoff
+node CB.js --recover-interrupted
 ```
 
 `--status` is a passive current-page DOM read for composer, generation, turn,
@@ -101,6 +104,26 @@ does not pre-reconcile conversation transcripts before the search panel opens.
 sending a prompt or running another UI feature. It only uses safe close/Escape
 behavior and reports if the blocker remains or is not safe to dismiss
 automatically.
+
+`--recover-interrupted` recovers from mid-generation connection drops or stream
+stalls ("Connection interrupted. Waiting for the complete answer"). It clicks
+the active stop control, reloads the exact same conversation URL, and verifies
+the composer is editable, keeping conversational cache intact without branching
+into a new conversation.
+
+`--compact-conversation` parses the active or specified conversation transcript,
+extracts high-signal architecture details (overarching mission, verified code
+references, commit SHAs, empirical findings, standing recommendations, and
+external GitHub/web URLs), and writes compaction JSON and Markdown artifacts
+under `outputs/compactions/`.
+
+`--compact-handoff` executes the full 3-step thread compaction handoff when a
+conversation hits ChatGPT's maximum length limit:
+1. Compacts the active conversation history into structured architectural context.
+2. Starts a fresh continuation session on ChatGPT.
+3. Submits Turn 1 containing the compaction brief along with strict instructions
+   directing the research agent to review external references/repos and ask
+   clarifying questions back to the local model/user before proposing code.
 
 Settings and personalization dialogs are treated as blocking UI, not as safe
 auto-dismiss targets. Model-picker commands must not use account/profile or

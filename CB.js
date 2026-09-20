@@ -202,6 +202,12 @@ Options:
                   Dismiss one known safe blocker, then exit. Does not send a prompt.
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
+  --compact-conversation
+                  Export structured compaction summary for current/specified session.
+  --compact-handoff
+                  Compact active session and start Turn 1 in a new continuation session.
+  --recover-interrupted
+                  Stop stalled generation and reload conversation URL for connection errors.
   --download-artifacts
                   Save artifacts from the latest assistant turn, or after the reply.
   --show-artifacts
@@ -232,6 +238,10 @@ Interactive commands:
   /artifacts      Print links/images/download controls from the latest assistant turn.
   /download       Download visible artifacts from the latest assistant turn.
   /stop           Stop the current generation if a stop/interrupt control is visible.
+  /compact        Export compaction summary for the active thread.
+  /handoff        Compact active thread and seed Turn 1 in a new continuation thread.
+  /recover-interrupted
+                  Stop stalled answer and reload conversation URL to restore composer.
   /stream on|off  Toggle live response streaming.
 `);
 }
@@ -274,6 +284,9 @@ function parseArgs(argv) {
     alias: '',
     models: false,
     stop: false,
+    compactConversation: false,
+    handoffNewSession: false,
+    recoverInterrupted: false,
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
@@ -329,6 +342,9 @@ function parseArgs(argv) {
     else if (arg === '--alias') args.alias = next();
     else if (arg === '--models') args.models = true;
     else if (arg === '--stop') args.stop = true;
+    else if (arg === '--compact-conversation' || arg === '--compact') args.compactConversation = true;
+    else if (arg === '--handoff-new-session' || arg === '--compact-handoff' || arg === '--handoff') args.handoffNewSession = true;
+    else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
     else if (arg === '--show-artifacts') args.showArtifacts = true;
     else if (arg === '--no-stream') args.stream = false;
@@ -1587,7 +1603,8 @@ function isProgressOnlyText(text) {
     || /^(?:(?:pro\s+)?thinking|finalizing answer|looking for available tools|called tool)$/i.test(normalized)
     || /^thought for (?:a couple of seconds|\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes))(?:\s*[›>])?(?:\s+edit)?$/i.test(normalized)
     || /^(searching|searched|reading|analyzing|working|creating|generating|running|uploading|processing|finalizing)(?:\s+(?:answer|response|file|image|results?|the web|online|tool|tools?))?$/i.test(normalized)
-    || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized);
+    || /^using (?:a |the )?.{1,80}\btool$/i.test(normalized)
+    || /connection interrupted.*waiting for the complete answer|waiting for the complete answer/i.test(normalized);
 }
 
 function blockingModalKindFromMeta(meta) {
@@ -2349,9 +2366,22 @@ async function getTargetAppState(page) {
       .filter((item) => /\b(reasoning|think|thinking|extended|fast|auto)\b/i.test([item.testid, item.aria, item.title, item.text].join(' ')))
       .slice(0, 20);
 
+    const maxLengthBanner = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *, .text-token-text-error, div, p')]
+      .find((el) => isVisible(el) && textOf(el).length < 300 && /maximum length for this conversation/i.test(textOf(el)));
+
+    const connectionInterruptedBanner = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *, .text-token-text-error, div, p')]
+      .find((el) => isVisible(el) && textOf(el).length < 300 && /connection interrupted.*waiting for the complete answer|waiting for the complete answer/i.test(textOf(el)));
+
+    const maxLengthReached = Boolean(maxLengthBanner);
+    const connectionInterrupted = Boolean(connectionInterruptedBanner);
+
     return {
       url: location.href,
       title: document.title,
+      maxLengthReached,
+      maxLengthBanner: maxLengthBanner ? textOf(maxLengthBanner) : '',
+      connectionInterrupted,
+      connectionInterruptedBanner: connectionInterruptedBanner ? textOf(connectionInterruptedBanner) : '',
       model: modelButton ? (modelButton.text || modelButton.aria || modelButton.testid) : '',
       blockingModal,
       reasoningControls,
@@ -2439,6 +2469,12 @@ function summarizeState(state, modelConfig = null) {
   const config = compactModelConfig(modelConfig);
   lines.push(`URL: ${state.url}`);
   lines.push(`Model: ${state.model || 'unknown'}`);
+  if (state.maxLengthReached) {
+    lines.push(`Thread limit: Maximum conversation length reached. Run 'CB --compact-handoff' to seed continuation thread.`);
+  }
+  if (state.connectionInterrupted) {
+    lines.push(`Connection status: Interrupted / waiting for answer. Run 'CB --recover-interrupted' to reload.`);
+  }
   if (config?.error) {
     lines.push(`Model config: unavailable (${config.error})`);
   } else if (config) {
@@ -2593,8 +2629,11 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
   return {
     type: 'target_app_state',
     at: new Date().toISOString(),
-    phase,
+    phase: state.maxLengthReached ? 'max_length_reached' : phase,
     ready,
+    maxLengthReached: Boolean(state.maxLengthReached),
+    connectionInterrupted: Boolean(state.connectionInterrupted),
+    edgeState: state.maxLengthReached ? 'max_conversation_length' : (state.connectionInterrupted ? 'connection_interrupted' : null),
     sessionId: sessionIdFromUrl(state.url),
     url: state.url,
     title: state.title,
@@ -4993,6 +5032,10 @@ async function prepareConversationForPrompt(page, args) {
     return;
   }
   if (!args.conversation || isCurrentConversationRef(args.conversation)) {
+    const state = await getTargetAppState(page).catch(() => null);
+    if (state?.maxLengthReached && !args.handoffNewSession) {
+      throw new Error('Maximum conversation length reached for this thread. Run "CB --compact-handoff" to compact context and seed Turn 1 in a new continuation thread.');
+    }
     return;
   }
 
@@ -5611,6 +5654,17 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     const placeholder = !text || isProgressOnlyText(text);
     const pageState = await getTargetAppState(page).catch(() => null);
 
+    if (pageState?.connectionInterrupted) {
+      info('[recovery] Connection interrupted / stalled generation detected; stopping generation and reloading session URL...');
+      await stopGeneration(page);
+      await page.waitForTimeout(1000);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await settlePage(page);
+      info('[recovery] Reload complete. Resending prompt in the same conversation thread...');
+      await sendMessage(page, message, baselineLastTurnId);
+      continue;
+    }
+
     if (!placeholder) {
       sawResponse = true;
       if (text !== lastText) {
@@ -6065,6 +6119,233 @@ function readMultilineInput() {
   });
 }
 
+
+function extractThreadCompaction(transcriptText, sessionId, title = '') {
+  const entries = parseTranscriptEntries(transcriptText);
+  if (!entries.length) {
+    throw new Error(`No transcript entries found for session ${sessionId}`);
+  }
+
+  const userEntries = entries.filter((e) => e.role === 'user');
+  const assistantEntries = entries.filter((e) => e.role === 'assistant');
+
+  // Extract GitHub URLs
+  const rawUrls = [...new Set([...transcriptText.matchAll(/https?:\/\/[^\s\)\"',]+/g)].map((m) => m[0]))];
+  const githubUrls = [...new Set(rawUrls.filter((u) => u.includes('github.com')).map((u) => u.replace(/[\.,:;]+$/, '')))];
+
+  // Extract key source files referenced (.ts, .tsx, .py, .sh, .yaml, .json, .md)
+  const fileMatches = [...new Set([...transcriptText.matchAll(/\b(?:[\w\-]+\/)*[\w\-]+\.(?:tsx?|jsx?|py|sh|yaml|json|md)\b/g)].map((m) => m[0]))]
+    .filter((f) => !f.startsWith('http') && (f.includes('/') || f.endsWith('.tsx') || f.endsWith('.ts') || f.endsWith('.py') || f.endsWith('.sh')));
+
+  // Extract git SHAs
+  const shaMatches = [...new Set([...transcriptText.matchAll(/\b([0-9a-f]{7,40})\b/gi)].map((m) => m[1]))]
+    .filter((s) => !/^\d+$/.test(s) && (s.length === 40 || s.length === 10 || s.length === 7));
+
+  // Initial headline and mission statement from earliest substantive user turn
+  const initialTurn = userEntries.find((e) => e.text.length > 200) || userEntries[0];
+  const initialText = initialTurn ? initialTurn.text : '';
+  const initialLines = initialText.split('\n').map((l) => l.trim()).filter(Boolean);
+  const headline = initialLines.find((l) => l.startsWith('#')) || title || 'Architecture & Research Review';
+  const missionParagraphs = initialText.split('\n\n').map((p) => p.trim()).filter(Boolean);
+  const overarchingMission = missionParagraphs.slice(0, 3).join('\n\n') || initialText.slice(0, 800);
+
+  // Latest findings & standing recommendations (last 1-2 assistant turns)
+  const latestAssistant = assistantEntries[assistantEntries.length - 1]?.text || '';
+  const priorAssistant = assistantEntries.length > 1 ? assistantEntries[assistantEntries.length - 2]?.text : '';
+
+  // Clean trailing banner text if captured
+  const cleanLatestAssistant = latestAssistant
+    .replace(/You've reached the maximum length for this conversation.*$/is, '')
+    .trim();
+
+  return {
+    sessionId,
+    title: title || headline.replace(/^#+\s*/, ''),
+    turnCount: entries.length,
+    userTurnCount: userEntries.length,
+    assistantTurnCount: assistantEntries.length,
+    totalChars: transcriptText.length,
+    compactedAt: new Date().toISOString(),
+    overarchingMission,
+    githubRepositories: githubUrls,
+    keyFiles: fileMatches.slice(0, 30),
+    verifiedCommits: shaMatches.slice(-15),
+    latestRecommendations: cleanLatestAssistant.slice(0, 5000),
+    priorSummary: priorAssistant ? priorAssistant.slice(0, 1500) : '',
+  };
+}
+
+function buildTurn1HandoffPrompt(compaction) {
+  const repoList = compaction.githubRepositories.length
+    ? compaction.githubRepositories.map((u) => `- ${u}`).join('\n')
+    : '- (None recorded; see referenced local paths)';
+
+  const fileList = compaction.keyFiles.length
+    ? compaction.keyFiles.join(', ')
+    : 'N/A';
+
+  const shaList = compaction.verifiedCommits.length
+    ? compaction.verifiedCommits.join(', ')
+    : 'N/A';
+
+  return `[CONTEXT CONTINUATION & THREAD COMPACTION HANDOFF]
+The previous conversation thread (ID: ${compaction.sessionId}, Title: "${compaction.title}") reached ChatGPT's maximum length limit (${compaction.turnCount} turns, ~${Math.round(compaction.totalChars / 1024)} KB).
+This new session is the direct, seamless continuation of our research and architecture review.
+
+### 1. Overarching Mission & Directives
+${compaction.overarchingMission}
+
+### 2. Relevant Repositories & External Resources
+${repoList}
+
+### 3. Key Code References & Working State
+- **Key Source Files**: ${fileList}
+- **Verified Git Commits**: ${shaList}
+
+### 4. Standing Architectural Findings & Immediate Focus
+${compaction.latestRecommendations}
+
+---
+### MANDATORY PROTOCOL FOR RESEARCH AGENT (TURN 1):
+You are acting as our research and architecture advisor in this new continuation thread. Because you run in cloud isolation without direct terminal access to our local host:
+1. Thoroughly review all the architectural context, verified findings, and standing recommendations detailed above.
+2. Access and inspect all referenced external repositories and documentation links (especially ${compaction.githubRepositories[0] || 'the relevant GitHub repositories'}) to build complete situational awareness.
+3. DO NOT generate speculative code or begin unguided implementation yet.
+4. Formulate and ask targeted, probing clarifying questions regarding the local environment, current codebase state, and the immediate focus of this session.
+5. Conclude your Turn 1 response with these questions. The local model/user will inspect the environment and provide concrete answers in Turn 2 before we proceed.`;
+}
+
+async function compactActiveConversation(page, args = {}) {
+  await settlePage(page);
+  const currentUrl = page.url();
+  const sessionId = sessionIdFromUrl(currentUrl) || args.conversation;
+  if (!sessionId) {
+    throw new Error('Cannot compact conversation: no session ID found in active URL or --conversation');
+  }
+
+  refreshSessionTranscript(page, args);
+  await syncTranscriptFromPage(page, args).catch(() => {});
+
+  const transcriptPath = args.transcript || transcriptPathForSession(sessionId);
+  if (!fs.existsSync(transcriptPath)) {
+    throw new Error(`Transcript file not found: ${transcriptPath}`);
+  }
+
+  const transcriptText = fs.readFileSync(transcriptPath, 'utf8');
+  const title = await page.title().catch(() => '') || 'Conversation Compaction';
+  const compaction = extractThreadCompaction(transcriptText, sessionId, title);
+  const turn1Prompt = buildTurn1HandoffPrompt(compaction);
+
+  const compactionDir = path.join(OUTPUT_DIR, 'compactions');
+  if (!fs.existsSync(compactionDir)) {
+    fs.mkdirSync(compactionDir, { recursive: true });
+  }
+
+  const jsonPath = path.join(compactionDir, `${sessionId}-compaction.json`);
+  const mdPath = path.join(compactionDir, `${sessionId}-compaction.md`);
+  const promptPath = path.join(compactionDir, `${sessionId}-turn1-prompt.txt`);
+
+  fs.writeFileSync(jsonPath, JSON.stringify(compaction, null, 2), 'utf8');
+  fs.writeFileSync(promptPath, turn1Prompt, 'utf8');
+
+  const mdContent = `# Thread Compaction: ${compaction.title}
+Session ID: ${compaction.sessionId}
+Turns: ${compaction.turnCount}
+Compacted At: ${compaction.compactedAt}
+
+## Mission & Overarching Directives
+${compaction.overarchingMission}
+
+## External Repositories & URLs
+${compaction.githubRepositories.map((u) => `- <${u}>`).join('\n') || '- None'}
+
+## Key Source Files
+${compaction.keyFiles.map((f) => `- \`${f}\``).join('\n') || '- None'}
+
+## Verified Commits
+${compaction.verifiedCommits.map((c) => `- \`${c}\``).join('\n') || '- None'}
+
+## Standing Recommendations & Focus
+${compaction.latestRecommendations}
+`;
+  fs.writeFileSync(mdPath, mdContent, 'utf8');
+
+  return {
+    compaction,
+    jsonPath,
+    mdPath,
+    promptPath,
+    turn1Prompt,
+  };
+}
+
+async function executeCompactionHandoff(page, args) {
+  info('[handoff] Extracting and compacting context from current thread...');
+  const result = await compactActiveConversation(page, args);
+  info(`[handoff] Compaction artifacts saved to:
+  - JSON: ${result.jsonPath}
+  - Markdown: ${result.mdPath}
+  - Turn 1 Prompt: ${result.promptPath}`);
+
+  info('[handoff] Navigating to fresh conversation on ChatGPT...');
+  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await settlePage(page);
+
+  args.newConversation = true;
+  args.conversation = '';
+  args.handoffNewSession = true;
+  refreshSessionTranscript(page, args);
+
+  info('[handoff] Submitting Turn 1 compaction seed prompt...');
+  const response = await ask(page, result.turn1Prompt, args);
+
+  console.log('\n================================================================================');
+  console.log('[HANDOFF COMPLETE] Context successfully seeded into new thread:');
+  console.log(`URL: ${page.url()}`);
+  console.log('--------------------------------------------------------------------------------');
+  console.log('RESEARCH AGENT RESPONSE & CLARIFYING QUESTIONS (Turn 1):');
+  console.log('--------------------------------------------------------------------------------');
+  console.log(response);
+  console.log('================================================================================');
+  console.log('[NEXT STEP]: Inspect the above questions and answer them in Turn 2 using:');
+  console.log('  CB --message "<your answers>"\n');
+
+  return {
+    oldSessionId: result.compaction.sessionId,
+    newSessionId: sessionIdFromUrl(page.url()),
+    newUrl: page.url(),
+    response,
+  };
+}
+
+async function recoverInterruptedConnection(page, args = {}) {
+  const currentUrl = page.url();
+  const sessionId = sessionIdFromUrl(currentUrl);
+  if (!sessionId) {
+    info('[recovery] No active conversation session id in URL; cannot reload specific conversation');
+    return { recovered: false, error: 'No active conversation URL' };
+  }
+
+  info(`[recovery] Stopping stalled generation on ${sessionId}...`);
+  await stopGeneration(page);
+  await page.waitForTimeout(1000);
+
+  info(`[recovery] Reloading exact conversation ${currentUrl}...`);
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await settlePage(page);
+
+  const state = await getTargetAppState(page);
+  const composerReady = Boolean(state.composer?.visible && !state.isGenerating);
+  info(`[recovery] Reload complete. Composer ready: ${composerReady}`);
+
+  return {
+    recovered: composerReady,
+    sessionId,
+    url: currentUrl,
+    composerReady,
+  };
+}
+
 async function interactive(page, args) {
   console.log(`Connected to target app: ${page.url()}`);
   refreshSessionTranscript(page, args);
@@ -6211,6 +6492,22 @@ async function interactive(page, args) {
     if (input.type === 'command' && input.text === '/stop') {
       const stopped = await stopGeneration(page);
       console.log(stopped ? `Clicked generation control: ${stopped}` : 'No visible generation control found.');
+      continue;
+    }
+    if (input.type === 'command' && input.text === '/compact') {
+      const result = await compactActiveConversation(page, args);
+      console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
+      console.log(`Markdown: ${result.mdPath}`);
+      console.log(`Prompt: ${result.promptPath}`);
+      continue;
+    }
+    if (input.type === 'command' && (input.text === '/handoff' || input.text === '/compact-handoff')) {
+      await executeCompactionHandoff(page, args);
+      continue;
+    }
+    if (input.type === 'command' && input.text === '/recover-interrupted') {
+      const recovery = await recoverInterruptedConnection(page, args);
+      console.log(recovery.recovered ? `Recovery successful on ${recovery.url}. Composer is ready.` : `Recovery failed.`);
       continue;
     }
     if (input.type === 'command' && input.text.startsWith('/stream ')) {
@@ -6396,6 +6693,26 @@ async function main() {
         }).catch(() => {});
       }
       printSearchResults(result, args.stateJsonl);
+      return;
+    }
+
+    if (args.compactConversation) {
+      const result = await compactActiveConversation(page, args);
+      console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
+      console.log(`JSON: ${result.jsonPath}`);
+      console.log(`Markdown: ${result.mdPath}`);
+      console.log(`Turn 1 Prompt: ${result.promptPath}`);
+      return;
+    }
+
+    if (args.handoffNewSession) {
+      await executeCompactionHandoff(page, args);
+      return;
+    }
+
+    if (args.recoverInterrupted) {
+      const recovery = await recoverInterruptedConnection(page, args);
+      console.log(recovery.recovered ? `Recovery successful on ${recovery.url}. Composer is ready.` : `Recovery failed: ${recovery.error || 'Composer not ready'}`);
       return;
     }
 
