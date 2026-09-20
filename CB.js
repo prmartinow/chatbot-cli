@@ -2629,7 +2629,7 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
   return {
     type: 'target_app_state',
     at: new Date().toISOString(),
-    phase: state.maxLengthReached ? 'max_length_reached' : phase,
+    phase,
     ready,
     maxLengthReached: Boolean(state.maxLengthReached),
     connectionInterrupted: Boolean(state.connectionInterrupted),
@@ -5033,8 +5033,8 @@ async function prepareConversationForPrompt(page, args) {
   }
   if (!args.conversation || isCurrentConversationRef(args.conversation)) {
     const state = await getTargetAppState(page).catch(() => null);
-    if (state?.maxLengthReached && !args.handoffNewSession) {
-      throw new Error('Maximum conversation length reached for this thread. Run "CB --compact-handoff" to compact context and seed Turn 1 in a new continuation thread.');
+    if (state?.maxLengthReached) {
+      info('[state] Note: Maximum conversation length advisory banner visible on thread. If prompt is rejected, consider branching the last prompt or running CB --compact-handoff.');
     }
     return;
   }
