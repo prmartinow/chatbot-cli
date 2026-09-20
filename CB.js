@@ -2313,9 +2313,10 @@ async function getTargetAppState(page) {
     };
 
     const activityTexts = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *')]
-      .filter(isVisible)
+      .filter((el) => isVisible(el) && (!composerRoot || !composerRoot.contains(el)))
       .map(textOf)
       .filter((text) => text && text.length <= 180)
+      .filter((text) => !/thinking effort/i.test(text))
       .filter((text) => /\b(thinking|thought|reasoning|searching|searched|browsing|reading|analyzing|working|creating|generating|running|tool|uploading|processing|finalizing|attached)\b/i.test(text))
       .filter((text, index, arr) => arr.indexOf(text) === index)
       .slice(-20);
@@ -2324,18 +2325,22 @@ async function getTargetAppState(page) {
       const text = textOf(button);
       const meta = controlText(button);
       const insideComposer = Boolean(composerRoot && composerRoot.contains(button));
+      if (insideComposer && button.matches('button.__composer-pill, button[class*="__composer-pill"]')) return true;
+      if (insideComposer && button.getAttribute('aria-haspopup') === 'menu' && button.id !== 'composer-plus-btn') return true;
       if (button.getAttribute('data-testid') === 'model-switcher-dropdown-button') return true;
       if (/model selector/i.test(button.getAttribute('aria-label') || '')) return true;
-      if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)
+      if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra)\b/i.test(text)
         && !modelChromeRe.test(meta)) return true;
       return insideComposer
         && text.length <= 80
-        && /\b(extra high|high|medium|low|auto|fast)\b/i.test(text)
+        && /\b(extra high|high|medium|low|auto|fast|thinking effort)\b/i.test(text)
         && !modelChromeRe.test(meta);
     });
+    const rawModelButtonText = modelButtonEl ? textOf(modelButtonEl) : '';
+    const normalizedModelButtonText = /^thinking effort$/i.test(rawModelButtonText) ? '' : rawModelButtonText;
     const modelButton = modelButtonEl
       ? {
-        text: textOf(modelButtonEl),
+        text: normalizedModelButtonText || modelButtonEl.getAttribute('aria-label') || '',
         aria: modelButtonEl.getAttribute('aria-label') || '',
         testid: modelButtonEl.getAttribute('data-testid') || '',
       }
@@ -2403,7 +2408,11 @@ function compactModelConfig(config) {
     current: {
       label: config.current?.label || '',
       model: config.current?.model || '',
+      effort: config.current?.effort || '',
     },
+    models: config.models || [],
+    efforts: config.efforts || [],
+    hasSlider: Boolean(config.hasSlider),
     modes: (config.modes || []).map((row) => ({
       label: row.label || '',
       mode: row.mode || '',
@@ -2435,6 +2444,16 @@ function summarizeState(state, modelConfig = null) {
   } else if (config) {
     const current = config.current?.label || config.current?.model || '';
     const selected = config.button || state.model || '';
+    if (config.models?.length) {
+      lines.push(`Models: ${config.models.map((m) => {
+        const isLatest = /^latest/i.test(m.name || m.label);
+        const suffix = isLatest ? ' (GPT-6 / Astra)' : '';
+        return `${m.label}${suffix}${m.checked ? ' [selected]' : ''}`;
+      }).join(', ')}`);
+    }
+    if (config.efforts?.length) {
+      lines.push(`Effort levels: ${config.efforts.map((e) => `${e.label}${e.selected ? ' [selected]' : ''}`).join(', ')}`);
+    }
     const modeLabels = (config.modes || [])
       .map((row) => {
         if (!row.label) return '';
@@ -2583,8 +2602,8 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     model: state.model || '',
     modelSelection: {
       button: state.model || '',
-      model: modelSelection.model || modelConfig?.current?.model || modelConfig?.configure?.model || '',
-      mode: modelSelection.mode || '',
+      model: modelSelection.model || modelConfig?.current?.model || modelConfig?.configure?.model || (modelSelection.effort || modelSelection.mode ? 'Latest' : ''),
+      mode: modelSelection.mode || (modelSelection.effort ? 'Thinking' : ''),
       effort: modelSelection.effort || '',
     },
     modelConfig,
@@ -3659,11 +3678,19 @@ async function markModelSwitcher(page) {
           score += 100;
           modelSignal = true;
         }
-        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro)\b/i.test(text)) {
+        if (el.matches('button.__composer-pill, button[class*="__composer-pill"]') || el.querySelector('.uFxlGa_TriggerWrapper, [data-model-reasoning-effort-slider]')) {
+          score += 150;
+          modelSignal = true;
+        }
+        if (insideComposer && el.getAttribute('aria-haspopup') === 'menu' && el.id !== 'composer-plus-btn') {
+          score += 120;
+          modelSignal = true;
+        }
+        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra)\b/i.test(text)) {
           score += 50;
           modelSignal = true;
         }
-        if (insideComposer && text.length <= 80 && /\b(extra high|high|medium|low|auto|fast)\b/i.test(text)) {
+        if (insideComposer && text.length <= 80 && /\b(extra high|high|medium|low|auto|fast|thinking effort)\b/i.test(text)) {
           score += 60;
           modelSignal = true;
         }
@@ -3688,8 +3715,8 @@ async function hasOpenModelMenu(page) {
   return page.evaluate(() => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
-    return [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"], [data-testid^="model-switcher-"], [data-testid="model-configure-modal"]')]
-      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure|intelligence|model)\b/i.test([
+    return [...document.querySelectorAll('[role="menu"], [role="listbox"], [role="dialog"], [data-testid^="model-switcher-"], [data-testid="composer-intelligence-picker-content"], [data-testid="model-configure-modal"]')]
+      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure|intelligence|model|extra high|high|medium)\b/i.test([
         el.getAttribute('data-testid') || '',
         el.getAttribute('aria-label') || '',
         textOf(el),
@@ -3701,8 +3728,8 @@ async function waitForModelMenu(page, timeout = 5000) {
   await page.waitForFunction(() => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
-    return [...document.querySelectorAll('[role="menu"], [data-testid^="model-switcher-"], [data-testid="model-configure-modal"]')]
-      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure)\b/i.test([
+    return [...document.querySelectorAll('[role="menu"], [data-testid^="model-switcher-"], [data-testid="composer-intelligence-picker-content"], [data-testid="model-configure-modal"]')]
+      .some((el) => isVisible(el) && /\b(latest|instant|thinking|pro|configure|intelligence|model|extra high|high|medium)\b/i.test([
         el.getAttribute('data-testid') || '',
         textOf(el),
       ].join(' ')));
@@ -3721,19 +3748,43 @@ async function openModelSwitcher(page) {
 
 function parseModelSelection(text) {
   const normalized = normalizeModelLabel(text);
-  const modelMatch = normalized.match(/\b(?:gpt\s*)?((?:[45](?:\.\d+)?)|o\d+)\b/);
-  const effortMatch = normalized.match(/\b(extra high|light|standard|extended|heavy|medium|high|low|auto|fast)\b/);
+  let model = '';
+  if (/\b(5\.6|sol)\b/i.test(normalized)) {
+    model = '5.6';
+  } else if (/\b(5\.5)\b/i.test(normalized)) {
+    model = '5.5';
+  } else if (/\b(latest|gpt\s*6|astra|(?<!\.)\b6\b(?!\.))/i.test(normalized)) {
+    model = 'Latest';
+  } else {
+    const modelMatch = normalized.match(/\b(?:gpt\s*)?((?:[456](?:\.\d+)?)|o\d+)\b/i);
+    if (modelMatch) model = modelMatch[1];
+  }
+
+  let effort = '';
+  if (/\b(extra high|extended)\b/i.test(normalized)) {
+    effort = 'Extra High';
+  } else if (/\b(medium|light|low)\b/i.test(normalized)) {
+    effort = 'Medium';
+  } else if (/\b(high|standard)\b/i.test(normalized)) {
+    effort = 'High';
+  } else if (/\b(instant|fast|auto)\b/i.test(normalized)) {
+    effort = 'Instant';
+  } else if (/\b(pro|heavy)\b/i.test(normalized)) {
+    effort = 'Pro';
+  }
+
   let mode = '';
-  if (/\binstant\b/.test(normalized)) mode = 'Instant';
-  else if (/\bthinking\b/.test(normalized)) mode = 'Thinking';
-  else if (/\bpro\b/.test(normalized)) mode = 'Pro';
+  if (effort === 'Instant') mode = 'Instant';
+  else if (effort === 'Pro') mode = 'Pro';
+  else if (effort) mode = 'Thinking';
+  else if (/\bthinking\b/i.test(normalized)) mode = 'Thinking';
 
   return {
     raw: text,
     normalized,
-    model: modelMatch ? modelMatch[1] : '',
+    model,
     mode,
-    effort: effortMatch ? effortMatch[1].replace(/\b\w/g, (s) => s.toUpperCase()) : '',
+    effort,
   };
 }
 
@@ -3853,10 +3904,90 @@ async function getModelMenuState(page) {
       : '';
     const modelOption = intelligenceItems
       .map(textOf)
-      .find((text) => /\b(?:gpt[-\s]*)?(?:[45](?:\.\d+)?|o\d+)\b/i.test(text)) || '';
-    const currentModel = header.match(/\b((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1]
-      || modelOption.match(/\b(?:gpt[-\s]*)?((?:[45](?:\.\d+)?)|o\d+)\b/i)?.[1]
+      .find((text) => /\b(?:gpt[-\s]*)?(?:[456](?:\.\d+)?|o\d+)\b/i.test(text)) || '';
+
+    const slider = document.querySelector('[role="slider"]')
+      || document.querySelector('[aria-valuenow]')
+      || document.querySelector('[data-model-reasoning-effort-slider-thumb]');
+    const announcementText = textOf(document.querySelector('.d1BZWq_KeyboardAnnouncement') || document.querySelector('.d1BZWq_ViewToggle'));
+    const hasSlider = Boolean(slider);
+    let sliderVal = slider && slider.hasAttribute('aria-valuenow')
+      ? parseInt(slider.getAttribute('aria-valuenow'), 10)
+      : null;
+    if (sliderVal === null && announcementText) {
+      if (/\binstant\b/i.test(announcementText)) sliderVal = 0;
+      else if (/\bmedium\b/i.test(announcementText)) sliderVal = 1;
+      else if (/\bhigh\b/i.test(announcementText) && !/extra\s*high/i.test(announcementText)) sliderVal = 2;
+      else if (/\bextra\s*high\b/i.test(announcementText)) sliderVal = 3;
+      else if (/\bpro\b/i.test(announcementText)) sliderVal = 4;
+    }
+    const effortLevels = ['Instant', 'Medium', 'High', 'Extra High', 'Pro'];
+    const selectedEffort = sliderVal !== null && effortLevels[sliderVal] ? effortLevels[sliderVal] : '';
+
+    const modelRadios = [...document.querySelectorAll('[role="menuitemradio"]')]
+      .filter(isVisible)
+      .map((el) => {
+        const text = textOf(el);
+        const checked = el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-state') === 'checked';
+        let cleanName = text;
+        if (/^Latest\b/i.test(text)) cleanName = 'Latest';
+        else if (/^GPT-5\.6\b/i.test(text)) cleanName = 'GPT-5.6 Sol';
+        else if (/^GPT-5\.5\b/i.test(text)) cleanName = 'GPT-5.5';
+        return {
+          label: text,
+          name: cleanName,
+          checked,
+          testid: el.getAttribute('data-testid') || '',
+          rect: rectOf(el),
+        };
+      });
+
+    const checkedModelItem = modelRadios.find((r) => r.checked);
+    const checkedModel = checkedModelItem ? checkedModelItem.name : (header ? (header.match(/\b((?:[456](?:\.\d+)?)|o\d+|latest)\b/i)?.[1] || '') : 'Latest');
+    const currentModel = checkedModel
+      || header.match(/\b((?:[456](?:\.\d+)?)|o\d+)\b/i)?.[1]
+      || modelOption.match(/\b(?:gpt[-\s]*)?((?:[456](?:\.\d+)?)|o\d+)\b/i)?.[1]
       || '';
+
+    if (hasSlider) {
+      modelRows = [
+        {
+          label: 'Instant',
+          mode: 'Instant',
+          effort: 'Instant',
+          checked: sliderVal === 0 ? 'true' : 'false',
+          rect: rectOf(slider),
+          effortOptions: ['Instant'],
+        },
+        {
+          label: 'Thinking',
+          mode: 'Thinking',
+          effort: (sliderVal >= 1 && sliderVal <= 3) ? selectedEffort : 'Extra High',
+          checked: (sliderVal >= 1 && sliderVal <= 3) ? 'true' : 'false',
+          rect: rectOf(slider),
+          effortOptions: ['Medium', 'High', 'Extra High'],
+          selectedEffort: (sliderVal >= 1 && sliderVal <= 3) ? selectedEffort : '',
+        },
+        {
+          label: 'Pro',
+          mode: 'Pro',
+          effort: 'Pro',
+          checked: sliderVal === 4 ? 'true' : 'false',
+          rect: rectOf(slider),
+          effortOptions: ['Pro'],
+        },
+      ];
+      for (const m of modelRadios) {
+        modelRows.push({
+          label: m.label,
+          mode: 'Thinking',
+          effort: selectedEffort || 'Extra High',
+          checked: m.checked ? 'true' : 'false',
+          rect: m.rect,
+        });
+      }
+    }
+
     const configure = [...document.querySelectorAll('[data-testid="model-configure-modal"], [role="menuitem"]')]
       .filter(isVisible)
       .map((el) => ({
@@ -3868,10 +3999,14 @@ async function getModelMenuState(page) {
 
     return {
       current: {
-        label: header || modelOption,
+        label: hasSlider ? (checkedModel ? `${checkedModel} • ${selectedEffort}` : selectedEffort) : (header || modelOption),
         model: currentModel,
+        effort: selectedEffort,
       },
       rows: modelRows,
+      models: modelRadios,
+      efforts: effortLevels.map((lvl, idx) => ({ label: lvl, selected: idx === sliderVal })),
+      hasSlider,
       configure,
     };
   });
@@ -4252,36 +4387,43 @@ async function inspectModelConfigurator(page, options = {}) {
     button: buttonState?.model || '',
     current: menu.current,
     modes: menu.rows,
+    models: menu.models || [],
+    efforts: menu.efforts || [],
+    hasSlider: Boolean(menu.hasSlider),
     configureAvailable: Boolean(menu.configure),
   };
 
   if (options.includeDetails) {
-    const buttonSelection = parseModeAndEffort(result.button || '');
-    for (const row of result.modes) {
-      const effortState = await readEffortStateForRow(page, row);
-      row.effortOptions = effortState.options;
-      row.selectedEffort = row.checked === 'true'
-        && buttonSelection.effort
-        && normalizeModelLabel(row.mode) === normalizeModelLabel(buttonSelection.mode)
-        ? buttonSelection.effort
-        : effortState.selected;
+    if (!menu.hasSlider) {
+      const buttonSelection = parseModeAndEffort(result.button || '');
+      for (const row of result.modes) {
+        const effortState = await readEffortStateForRow(page, row);
+        row.effortOptions = effortState.options;
+        row.selectedEffort = row.checked === 'true'
+          && buttonSelection.effort
+          && normalizeModelLabel(row.mode) === normalizeModelLabel(buttonSelection.mode)
+          ? buttonSelection.effort
+          : effortState.selected;
+      }
+      const selectedEffortRow = result.modes.find((row) => row.checked === 'true' && row.selectedEffort);
+      if (selectedEffortRow && !buttonSelection.effort) {
+        result.button = `${selectedEffortRow.mode} ${selectedEffortRow.selectedEffort}`;
+      }
     }
-    const selectedEffortRow = result.modes.find((row) => row.checked === 'true' && row.selectedEffort);
-    if (selectedEffortRow && !buttonSelection.effort) {
-      result.button = `${selectedEffortRow.mode} ${selectedEffortRow.selectedEffort}`;
-    }
-    try {
-      await openConfigureModalFromMenu(page);
-      result.configure = await getConfigureModalState(page, true);
-    } catch (error) {
-      result.configureError = error.message || String(error);
-    }
-    if (result.configure?.effortOptions?.length) {
-      const selectedMode = normalizeModelLabel(result.configure.selectedMode);
-      const selectedRow = result.modes.find((row) => row.checked === 'true'
-        || selectedMode.includes(normalizeModelLabel(row.mode)));
-      if (selectedRow && !selectedRow.effortOptions.length) {
-        selectedRow.effortOptions = result.configure.effortOptions;
+    if (menu.configure) {
+      try {
+        await openConfigureModalFromMenu(page);
+        result.configure = await getConfigureModalState(page, true);
+      } catch (error) {
+        result.configureError = error.message || String(error);
+      }
+      if (result.configure?.effortOptions?.length) {
+        const selectedMode = normalizeModelLabel(result.configure.selectedMode);
+        const selectedRow = result.modes.find((row) => row.checked === 'true'
+          || selectedMode.includes(normalizeModelLabel(row.mode)));
+        if (selectedRow && !selectedRow.effortOptions.length) {
+          selectedRow.effortOptions = result.configure.effortOptions;
+        }
       }
     }
   }
@@ -4296,16 +4438,28 @@ async function listModelOptions(page) {
   const lines = [];
   if (config.current?.label) lines.push(`Current: ${config.current.label}`);
   if (config.button) lines.push(`Selected: ${config.button}`);
-  for (const row of config.modes || []) {
-    const effortParts = [];
-    const displaySelectedEffort = row.selectedEffort
-      && (!row.effort || normalizeModelLabel(row.effort) === normalizeModelLabel(row.selectedEffort))
-      ? row.selectedEffort
-      : '';
-    if (displaySelectedEffort) effortParts.push(`selected effort: ${displaySelectedEffort}`);
-    if (row.effortOptions?.length) effortParts.push(`efforts: ${row.effortOptions.join(', ')}`);
-    const suffix = effortParts.length ? ` (${effortParts.join('; ')})` : '';
-    lines.push(`${row.label}${suffix}`);
+  if (config.models?.length) {
+    lines.push(`Models: ${config.models.map((m) => {
+      const isLatest = /^latest/i.test(m.name || m.label);
+      const suffix = isLatest ? ' (GPT-6 / Astra)' : '';
+      return `${m.label}${suffix}${m.checked ? ' [selected]' : ''}`;
+    }).join(', ')}`);
+  }
+  if (config.efforts?.length) {
+    lines.push(`Effort levels: ${config.efforts.map((e) => `${e.label}${e.selected ? ' [selected]' : ''}`).join(', ')}`);
+  }
+  if (!config.hasSlider) {
+    for (const row of config.modes || []) {
+      const effortParts = [];
+      const displaySelectedEffort = row.selectedEffort
+        && (!row.effort || normalizeModelLabel(row.effort) === normalizeModelLabel(row.selectedEffort))
+        ? row.selectedEffort
+        : '';
+      if (displaySelectedEffort) effortParts.push(`selected effort: ${displaySelectedEffort}`);
+      if (row.effortOptions?.length) effortParts.push(`efforts: ${row.effortOptions.join(', ')}`);
+      const suffix = effortParts.length ? ` (${effortParts.join('; ')})` : '';
+      lines.push(`${row.label}${suffix}`);
+    }
   }
   if (config.configureAvailable) lines.push('Configure...');
   if (config.configureError) lines.push(`Configure unavailable: ${config.configureError}`);
@@ -4322,10 +4476,16 @@ async function listModelOptions(page) {
 }
 
 async function listReasoningOptions(page) {
+  const menuState = await inspectModelConfigurator(page).catch(() => null);
+  if (menuState?.efforts?.length) {
+    return menuState.efforts.map((e) => `${e.label}${e.selected ? ' (selected)' : ''}`);
+  }
   const state = await getTargetAppState(page);
-  return state.reasoningControls
+  const controls = state.reasoningControls
     .map((item) => item.text || item.aria || item.title || item.testid)
     .filter(Boolean);
+  if (controls.length) return controls;
+  return ['Instant', 'Medium', 'High', 'Extra High', 'Pro'];
 }
 
 function normalizeModelLabel(text) {
@@ -4545,11 +4705,125 @@ async function applyModelChoice(page, choice) {
   await page.waitForTimeout(700);
 }
 
+async function applySliderModelSelection(page, selection, menuState, label) {
+  // 1. Model selection
+  if (selection.model) {
+    let targetModelRegex = null;
+    if (selection.model === '5.6' || /5\.6|sol/i.test(selection.normalized)) {
+      targetModelRegex = /5\.6|sol/i;
+    } else if (selection.model === '5.5' || /5\.5/i.test(selection.normalized)) {
+      targetModelRegex = /5\.5/i;
+    } else if (selection.model === 'Latest' || /latest|astra|(?<!\.)\b6\b(?!\.)/i.test(selection.normalized)) {
+      targetModelRegex = /latest/i;
+    } else {
+      targetModelRegex = new RegExp(selection.model, 'i');
+    }
+
+    const currentChecked = await page.evaluate(() => {
+      const checkedRadio = Array.from(document.querySelectorAll('[role="menuitemradio"]')).find((r) => r.getAttribute('aria-checked') === 'true');
+      return checkedRadio ? (checkedRadio.innerText || '').trim() : '';
+    });
+
+    if (!targetModelRegex.test(currentChecked)) {
+      // Ensure advanced view is open
+      await page.evaluate(() => {
+        const menu = document.querySelector('.d1BZWq_Menu');
+        const toggle = document.querySelector('.d1BZWq_ViewToggle, [aria-label="Select model"]');
+        if (menu && menu.getAttribute('data-view') !== 'advanced' && toggle) {
+          toggle.click();
+        }
+      });
+      await page.waitForTimeout(400);
+
+      // Click target model radio via evaluate click
+      await page.evaluate((pattern) => {
+        const regex = new RegExp(pattern, 'i');
+        const target = Array.from(document.querySelectorAll('[role="menuitemradio"]')).find((r) => regex.test(r.innerText || ''));
+        if (target) {
+          target.click();
+          return target.innerText.trim();
+        }
+        return null;
+      }, targetModelRegex.source);
+      await page.waitForTimeout(400);
+    }
+  }
+
+  // 2. Effort selection
+  const targetEffort = selection.effort || (selection.mode === 'Instant' ? 'Instant' : (selection.mode === 'Pro' ? 'Pro' : ''));
+  if (targetEffort) {
+    const effortMap = {
+      'instant': 0, 'fast': 0, 'auto': 0,
+      'medium': 1, 'light': 1, 'low': 1,
+      'high': 2, 'standard': 2,
+      'extra high': 3, 'extended': 3,
+      'pro': 4, 'heavy': 4,
+    };
+    const targetIndex = effortMap[targetEffort.toLowerCase()];
+    if (targetIndex !== undefined) {
+      // Ensure simple view is open
+      await page.evaluate(() => {
+        const menu = document.querySelector('.d1BZWq_Menu');
+        const toggle = document.querySelector('.d1BZWq_ViewToggle, [aria-label="Select model"]');
+        if (menu && menu.getAttribute('data-view') === 'advanced' && toggle) {
+          toggle.click();
+        }
+      });
+      await page.waitForTimeout(400);
+
+      const sliderControl = page.locator('.d1BZWq_SliderControl');
+      const slider = page.locator('[role="slider"]');
+      if (await sliderControl.count() && await slider.count()) {
+        await sliderControl.first().focus();
+        let currentVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '0', 10);
+        let steps = 0;
+        while (currentVal !== targetIndex && steps < 10) {
+          steps++;
+          if (currentVal < targetIndex) {
+            await page.keyboard.press('ArrowRight');
+          } else {
+            await page.keyboard.press('ArrowLeft');
+          }
+          await page.waitForTimeout(100);
+          const nextVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '0', 10);
+          if (nextVal === currentVal) break;
+          currentVal = nextVal;
+        }
+      }
+    }
+  }
+
+  // Close picker
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(400);
+
+  const selectedPill = await page.evaluate(() => {
+    const btn = document.querySelector('form button.__composer-pill, form button:not(#composer-plus-btn)[aria-haspopup="menu"]');
+    return btn ? btn.innerText.replace(/\s+/g, ' ').trim() : '';
+  });
+
+  const available = (menuState.models || []).map((m) => m.label).concat(
+    (menuState.efforts || []).map((e) => e.label)
+  );
+
+  return {
+    requested: label,
+    selected: selectedPill || label,
+    fallback: false,
+    available,
+  };
+}
+
 async function selectModel(page, label) {
   const selection = parseModelSelection(label);
   const currentButtonSelection = parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '');
   if (!await openModelSwitcher(page)) throw new Error('No visible model picker found');
-  let state = await hydrateModelRows(page, (await getModelMenuState(page)).rows, currentButtonSelection);
+  const menuState = await getModelMenuState(page);
+  if (menuState.hasSlider) {
+    return applySliderModelSelection(page, selection, menuState, label);
+  }
+  let state = await hydrateModelRows(page, menuState.rows, currentButtonSelection);
   const currentModel = state.current?.model || '';
   const needsConfigure = Boolean(selection.model && (!currentModel || selection.model !== currentModel));
   if (needsConfigure) {

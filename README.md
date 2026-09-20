@@ -70,11 +70,12 @@ progress; it does not open model UI or run the startup settle/reconcile path.
 live model/reasoning options; reserve that for model-picker debugging, not
 ordinary readiness checks.
 
-`--models` opens the live model picker and Configure dialog, then reports the
-current header, selected composer button, visible mode rows, reasoning-effort
-flyout options, and the Configure dialog's model list. These labels are scraped
-from the current UI because model names and picker layout change over time,
-including headers such as `Latest` or `Legacy`.
+`--models` opens the live model picker, then reports the
+current model/effort, selected composer button, available models
+(e.g., `Latest` representing GPT-6 / Astra, `GPT-5.6 Sol`, `GPT-5.5`),
+and reasoning effort slider levels (`Instant`, `Medium`, `High`,
+`Extra High`, `Pro`). These options are inspected dynamically from the
+live UI.
 
 `--search <query>` opens the target app's left-navigation search UI, enters the
 query, prints visible results, and closes the search dialog. Add
@@ -106,19 +107,16 @@ auto-dismiss targets. Model-picker commands must not use account/profile or
 settings controls as model switchers; if a settings dialog is open, close it
 explicitly before inspecting or selecting models.
 
-The current compact Intelligence picker can expose effort-only composer labels
-such as `Medium`, `High`, and `Extra High` instead of older model/mode labels.
-Treat those labels as model-picker controls only when they are inside the
-composer control area. Do not use greeting/account-name buttons or sidebar
-profile controls as model-picker candidates.
+The current Intelligence picker combines a 5-point reasoning effort slider
+(`Instant`, `Medium`, `High`, `Extra High`, `Pro`) in simple view with a model selection
+list (`Latest` representing GPT-6 / Astra, `GPT-5.6 Sol`, `GPT-5.5`) in advanced view.
+In the composer, the pill button displays the selected effort or model prefix when closed
+and a placeholder while open.
 
-Model and reasoning availability is account/subscription-dependent. Some
-accounts expose only `Instant`; others expose Thinking tiers such as `Medium`,
-`High`, and `Extra High`; Pro-capable accounts can expose Pro tiers such as
-`Pro Standard` and `Pro Extended` through a row-specific effort flyout. CB reads
-the live picker before selecting. If the requested tier is absent, it selects
-the highest available tier that does not exceed the requested rank and reports
-the fallback instead of silently changing the model.
+Model and reasoning availability is account/subscription-dependent. CB reads the
+live picker before selecting. If a requested tier or model is targeted, CB toggles
+between the slider view and the model list view, updates the selection, and returns
+to the composer.
 
 Watch target app state for orchestration:
 
