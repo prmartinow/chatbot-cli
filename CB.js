@@ -27,7 +27,7 @@ const TARGET_APP_BRAND_TOKEN = ['chat', 'gpt'].join('');
 const TARGET_APP_BASE_URL = normalizeTargetAppUrl(process.env.CHATBOT_WEB_URL || `https://${TARGET_APP_BRAND_TOKEN}.com/`);
 const TARGET_APP_BASE = new URL(TARGET_APP_BASE_URL);
 const CDP_CONNECT_TIMEOUT_MS = Number(process.env.CHATBOT_CDP_CONNECT_TIMEOUT_MS || 60000);
-const SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
+const SESSION_ID_RE = /^(?:WEB:)?[a-f0-9-]{20,}$/i;
 const PASTE_SETTLE_MS = 1000;
 const RESPONSE_POLL_MS = 3000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 180000;
@@ -529,9 +529,119 @@ async function getCombinedGenerationState(page, state = null) {
   };
 }
 
+
+async function getBranchInfo(page, index = null) {
+  if (!page) return null;
+  const url = page.url ? page.url() : '';
+
+  // Vector 1: Ephemeral route prefix (/c/WEB:<uuid>)
+  const isEphemeralRoute = /\/c\/WEB:[a-f0-9-]+/i.test(url);
+  const ephemeralSessionId = isEphemeralRoute ? (url.match(/\/c\/(WEB:[a-f0-9-]+)/i)?.[1] || '') : '';
+
+  // Vector 2 & Vector 3: Live DOM evaluation (branch divider and sidebar/document title)
+  const domInfo = await page.evaluate(() => {
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+
+    // Vector 2: Divider element
+    const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
+    const branchLink = Array.from(document.querySelectorAll('a[href*="/c/"]'))
+      .find((a) => textOf(a.parentElement).startsWith('Branched from') || textOf(a).startsWith('Branched from'));
+
+    let dividerData = null;
+    if (branchLink) {
+      const dividerContainer = branchLink.closest('.mx-auto') || branchLink;
+      let precedingTurnCount = 0;
+      for (const turn of turns) {
+        if (turn.compareDocumentPosition(dividerContainer) & 4) { // Node.DOCUMENT_POSITION_FOLLOWING
+          precedingTurnCount++;
+        }
+      }
+
+      const href = branchLink.getAttribute('href') || '';
+      const parentSessionMatch = href.match(/\/c\/([a-f0-9-]+)/i);
+      dividerData = {
+        hasDivider: true,
+        branchText: textOf(branchLink.parentElement) || textOf(branchLink),
+        parentSessionId: parentSessionMatch ? parentSessionMatch[1] : '',
+        precedingTurnCount,
+        totalTurns: turns.length,
+      };
+    }
+
+    // Vector 3: Sidebar active title and document title
+    const activeSidebarLink = document.querySelector('nav a[aria-current="page"], nav li[data-active="true"] a, nav a.bg-token-sidebar-surface-secondary');
+    const sidebarTitle = activeSidebarLink ? textOf(activeSidebarLink) : '';
+    const docTitle = document.title || '';
+
+    return {
+      dividerData,
+      sidebarTitle,
+      docTitle,
+    };
+  }).catch(() => null);
+
+  const titleToCheck = domInfo?.docTitle || domInfo?.sidebarTitle || '';
+  const branchTitleMatch = titleToCheck.match(/^Branch\s*[·•\-\|]\s*(.+)$/i);
+  const hasBranchTitlePrefix = Boolean(branchTitleMatch);
+  const inferredParentTitle = branchTitleMatch ? branchTitleMatch[1].trim() : '';
+
+  const hasDivider = Boolean(domInfo?.dividerData?.hasDivider);
+  const isFork = Boolean(isEphemeralRoute || hasDivider || hasBranchTitlePrefix);
+  if (!isFork) return null;
+
+  const detectionVectors = [];
+  if (isEphemeralRoute) detectionVectors.push('ephemeral_route');
+  if (hasDivider) detectionVectors.push('dom_divider');
+  if (hasBranchTitlePrefix) detectionVectors.push('title_prefix');
+
+  let parentSessionId = domInfo?.dividerData?.parentSessionId || '';
+  if (!parentSessionId && inferredParentTitle && index?.conversations) {
+    const parentByTitle = index.conversations.find((c) => c.title && c.title.trim().toLowerCase() === inferredParentTitle.toLowerCase());
+    if (parentByTitle?.sessionId) {
+      parentSessionId = parentByTitle.sessionId;
+    }
+  }
+
+  return {
+    isFork: true,
+    detectionVectors,
+    isEphemeralRoute,
+    ephemeralSessionId,
+    parentSessionId,
+    inferredParentTitle,
+    forkTurn: domInfo?.dividerData?.precedingTurnCount ?? 0,
+    branchText: domInfo?.dividerData?.branchText || (hasBranchTitlePrefix ? titleToCheck : ''),
+  };
+}
+
 async function syncTranscriptFromPage(page, args, options = {}) {
   refreshSessionTranscript(page, args);
   ensureTranscript(args.transcript);
+
+  const branchInfo = await getBranchInfo(page).catch(() => null);
+  let transcriptText = fs.readFileSync(args.transcript, 'utf8');
+  let entries = parseTranscriptEntries(transcriptText);
+
+  if (entries.length === 0 && branchInfo?.parentSessionId) {
+    const parentTranscriptPath = transcriptPathForSession(branchInfo.parentSessionId);
+    if (fs.existsSync(parentTranscriptPath)) {
+      const parentText = fs.readFileSync(parentTranscriptPath, 'utf8');
+      const parentEntries = parseTranscriptEntries(parentText);
+      const prefixCount = branchInfo.forkTurn > 0 ? branchInfo.forkTurn : parentEntries.length;
+      const seedEntries = parentEntries.slice(0, prefixCount);
+
+      if (seedEntries.length > 0) {
+        for (const entry of seedEntries) {
+          appendTranscript(args.transcript, entry.role, entry.text);
+        }
+        transcriptText = fs.readFileSync(args.transcript, 'utf8');
+        entries = parseTranscriptEntries(transcriptText);
+        if (options.verbose || process.env.CHATBOT_DEBUG) {
+          info(`[sync] Seeded branched transcript from parent session ${branchInfo.parentSessionId} (${seedEntries.length} turns)`);
+        }
+      }
+    }
+  }
 
   const generation = options.generation || await getCombinedGenerationState(page, options.state || null);
   let turns = (await getConversationTurns(page))
@@ -547,8 +657,6 @@ async function syncTranscriptFromPage(page, args, options = {}) {
       reason: 'active_generation',
     });
   }
-  let transcriptText = fs.readFileSync(args.transcript, 'utf8');
-  let entries = parseTranscriptEntries(transcriptText);
   let startIndex = findTranscriptSyncStart(entries, turns);
 
   if (startIndex === -1) {
@@ -830,6 +938,8 @@ function upsertConversation(index, patch) {
     const duplicates = index.conversations.filter((item) => item !== record && (
       (sessionId && item.sessionId === sessionId && (!item.alias || item.alias === alias))
       || (alias && item.alias === alias)
+      || (sessionId && item.ephemeralSessionId && item.ephemeralSessionId === sessionId)
+      || (patch.ephemeralSessionId && item.sessionId === patch.ephemeralSessionId)
     ));
     for (const duplicate of duplicates) {
       for (const [key, value] of Object.entries(duplicate)) {
@@ -860,6 +970,7 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
   const turns = await getConversationTurns(page).catch(() => []);
   const latestAssistant = [...turns].reverse()
     .find((turn) => turn.role === 'assistant' && turn.text && !isProgressOnlyText(turn.text));
+  const branchInfo = await getBranchInfo(page).catch(() => null);
 
   return withSchedulerLock(() => {
     const index = loadConversationIndex();
@@ -873,6 +984,12 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
       cdp: args.cdp,
       turnCount: turns.length,
       latestAssistantChars: latestAssistant?.text?.length || 0,
+      isFork: Boolean(branchInfo?.isFork),
+      parentSessionId: branchInfo?.parentSessionId || '',
+      forkTurn: branchInfo?.forkTurn ?? 0,
+      isEphemeralRoute: Boolean(branchInfo?.isEphemeralRoute),
+      ephemeralSessionId: branchInfo?.ephemeralSessionId || '',
+      branchDetectionVectors: branchInfo?.detectionVectors || [],
       lastObservedAt: nowIso(),
       ...recordExtra,
     });
@@ -2469,6 +2586,11 @@ function summarizeState(state, modelConfig = null) {
   const config = compactModelConfig(modelConfig);
   lines.push(`URL: ${state.url}`);
   lines.push(`Model: ${state.model || 'unknown'}`);
+  if (state.branchInfo?.isFork) {
+    const parent = state.branchInfo.parentSessionId ? ` (parent: ${state.branchInfo.parentSessionId})` : '';
+    const vectors = state.branchInfo.detectionVectors?.length ? ` [detected via: ${state.branchInfo.detectionVectors.join(', ')}]` : '';
+    lines.push(`Branch status: Forked branch at turn ${state.branchInfo.forkTurn}${parent}${vectors}`);
+  }
   if (state.maxLengthReached) {
     lines.push(`Thread limit: Maximum conversation length reached. Run 'CB --compact-handoff' to seed continuation thread.`);
   }
@@ -6662,6 +6784,7 @@ async function main() {
     if (args.status) {
       await prepareConversationForRead(page, args);
       const state = await getTargetAppState(page);
+      state.branchInfo = await getBranchInfo(page).catch(() => null);
       const modelConfig = args.deepStatus ? await inspectStatusModelConfig(page) : null;
       if (modelConfig) state.modelConfig = compactModelConfig(modelConfig);
       if (args.stateJsonl) {
