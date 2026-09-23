@@ -20,8 +20,16 @@ const {
   acquireConversationLease,
   releaseConversationLease,
   reconcilePendingRoundsFromTranscript,
+  bootstrapLeaseKey,
+  bootstrapLeasePath,
+  acquireBootstrapLease,
+  releaseBootstrapLease,
+  assertNewChatBootstrapRoute,
+  attestUserTurn,
+  waitForAcceptedTurnAttestation,
   waitForSessionIdInUrl,
   terminalErrorForAwaitedTurn,
+  normalizeTurnText,
   messageHash,
   cbError,
 } = require('../CB.js');
@@ -255,4 +263,114 @@ test('waitForSessionIdInUrl: Ignores provisional WEB route and waits for stable 
   };
   const timedOutId = await waitForSessionIdInUrl(mockPageTimeout, 50);
   assert.equal(timedOutId, '');
+});
+
+test('normalizeTurnText: Strips markdown syntax, UI buttons, and collapses whitespace', () => {
+  const raw = '# Header with `code` and **bold** text and ~strike~\nShow more';
+  assert.equal(normalizeTurnText(raw), 'Header with code and bold text and strike');
+
+  const withNbsp = 'Hello\u00a0world\nShow less';
+  assert.equal(normalizeTurnText(withNbsp), 'Hello world');
+});
+
+test('assertNewChatBootstrapRoute: Throws on route drift before dispatch', () => {
+  // Canonical root: passes
+  assert.doesNotThrow(() => {
+    assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/' });
+  });
+
+  // Provisional route: drifts
+  assert.throws(
+    () => {
+      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' });
+    },
+    (err) => err.code === 'NEW_CHAT_ROUTE_DRIFT'
+  );
+
+  // Stable conversation route: drifts
+  assert.throws(
+    () => {
+      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/11111111-1111-1111-1111-111111111111' });
+    },
+    (err) => err.code === 'NEW_CHAT_ROUTE_DRIFT'
+  );
+});
+
+test('attestUserTurn: Hierarchical verification across messageId, testid, and content hash', () => {
+  const prompt = 'Plan architecture';
+  const promptHash = messageHash(normalizeTurnText(prompt));
+  const ref = {
+    messageId: 'msg-u-100',
+    testid: 'turn-u-100',
+    textHash: promptHash,
+  };
+
+  // Level 1: exact messageId match
+  const turnsWithMessageId = [
+    { role: 'user', messageId: 'msg-u-100', testid: 'turn-u-100', text: prompt },
+  ];
+  const res1 = attestUserTurn(turnsWithMessageId, ref);
+  assert.equal(res1.attested, true);
+  assert.equal(res1.method, 'message_id');
+
+  // Level 1 mismatch: mounted turns have messageIds, but ours is missing
+  const turnsWithOtherId = [
+    { role: 'user', messageId: 'msg-u-200', testid: 'turn-u-200', text: prompt },
+  ];
+  const resMismatch = attestUserTurn(turnsWithOtherId, ref);
+  assert.equal(resMismatch.attested, false);
+  assert.equal(resMismatch.definitiveMismatch, true);
+
+  // Level 2: testid + textHash match when messageIds not exposed
+  const turnsWithTestidOnly = [
+    { role: 'user', testid: 'turn-u-100', text: prompt },
+  ];
+  const refNoMsgId = { testid: 'turn-u-100', textHash: promptHash };
+  const res2 = attestUserTurn(turnsWithTestidOnly, refNoMsgId);
+  assert.equal(res2.attested, true);
+  assert.equal(res2.method, 'testid_hash');
+
+  // Level 3: unique text hash
+  const turnsUnmounted = [
+    { role: 'user', testid: 'turn-dynamic', text: prompt },
+  ];
+  const refHashOnly = { textHash: promptHash };
+  const res3 = attestUserTurn(turnsUnmounted, refHashOnly);
+  assert.equal(res3.attested, true);
+  assert.equal(res3.method, 'unique_text_hash');
+
+  // Level 3 failure: ambiguous duplicate text hash
+  const turnsAmbiguous = [
+    { role: 'user', testid: 'turn-1', text: prompt },
+    { role: 'user', testid: 'turn-2', text: prompt },
+  ];
+  const resAmbiguous = attestUserTurn(turnsAmbiguous, refHashOnly);
+  assert.equal(resAmbiguous.attested, false);
+  assert.equal(resAmbiguous.definitiveMismatch, true);
+});
+
+test('BootstrapLease: Exclusive acquisition per CDP endpoint and verified release', () => {
+  const mockArgs1 = { cdp: 'http://127.0.0.1:9241' };
+  const mockArgs2 = { cdp: 'http://127.0.0.1:9242' };
+
+  const handle1 = acquireBootstrapLease(mockArgs1, 'op-1');
+  assert.notEqual(handle1, null);
+  assert.equal(fs.existsSync(handle1.leasePath), true);
+
+  // Second acquisition on same CDP port fails
+  assert.throws(
+    () => acquireBootstrapLease(mockArgs1, 'op-2'),
+    (err) => err.code === 'BOOTSTRAP_LEASE_BUSY'
+  );
+
+  // Independent CDP endpoint does not block
+  const handle2 = acquireBootstrapLease(mockArgs2, 'op-3');
+  assert.notEqual(handle2, null);
+  assert.equal(fs.existsSync(handle2.leasePath), true);
+
+  // Clean up
+  releaseBootstrapLease(handle1);
+  releaseBootstrapLease(handle2);
+  assert.equal(fs.existsSync(handle1.leasePath), false);
+  assert.equal(fs.existsSync(handle2.leasePath), false);
 });
