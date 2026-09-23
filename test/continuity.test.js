@@ -27,6 +27,8 @@ const {
   acquireBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
+  syncTranscriptFromPage,
+  prepareConversationForRead,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,
@@ -586,4 +588,34 @@ test('withBrowserLaneLease: Executes action under exclusive lane lock and verifi
   // Outside callback, lease is cleanly released
   const p = browserLaneLeasePath(mockArgs);
   assert.equal(fs.existsSync(p), false);
+});
+
+test('syncTranscriptFromPage: Enforces thread identity against expectedSessionId and pins transcript', async () => {
+  const mockPageDrifted = {
+    url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+  };
+  const mockArgs = {
+    expectedSessionId: '22222222-2222-4222-8222-222222222222',
+    transcript: '',
+  };
+
+  await assert.rejects(
+    async () => syncTranscriptFromPage(mockPageDrifted, mockArgs),
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT'
+  );
+});
+
+test('prepareConversationForRead: Resolves expectedSessionId without calling page navigation', async () => {
+  let navCalled = false;
+  const mockPage = {
+    url: () => 'https://chatgpt.com/',
+    goto: () => { navCalled = true; },
+  };
+  const mockArgs = {
+    conversation: '33333333-3333-4333-8333-333333333333',
+  };
+
+  await prepareConversationForRead(mockPage, mockArgs);
+  assert.equal(mockArgs.expectedSessionId, '33333333-3333-4333-8333-333333333333');
+  assert.equal(navCalled, false);
 });

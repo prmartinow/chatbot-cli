@@ -664,7 +664,14 @@ async function getBranchInfo(page, index = null) {
 }
 
 async function syncTranscriptFromPage(page, args, options = {}) {
-  refreshSessionTranscript(page, args);
+  if (args.expectedSessionId) {
+    await assertThreadIdentity(page, args.expectedSessionId, 'before transcript synchronization');
+    if (!args.transcriptOverride) {
+      args.transcript = transcriptPathForSession(args.expectedSessionId);
+    }
+  } else {
+    refreshSessionTranscript(page, args);
+  }
   ensureTranscript(args.transcript);
 
   const index = loadConversationIndex();
@@ -5920,10 +5927,6 @@ async function prepareConversationForRead(page, args) {
     throw new Error(`Conversation "${args.conversation}" is not resolved to a target app session id yet`);
   }
   args.expectedSessionId = sessionId;
-  await withBrowserLaneLease(args, randomId('read-nav'), async () => {
-    await openConversationBySessionId(page, sessionId);
-    refreshSessionTranscript(page, args);
-  });
 }
 
 function recordPromptConversation(args, page, response, explicitSessionId = '') {
@@ -7492,12 +7495,12 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/models') {
-      const options = await listModelOptions(page);
+      const options = await withBrowserLaneLease(args, randomId('interactive-models'), () => listModelOptions(page));
       console.log(options.length ? options.join('\n') : 'No visible model options found.');
       continue;
     }
     if (input.type === 'command' && input.text === '/reasoning') {
-      const options = await listReasoningOptions(page);
+      const options = await withBrowserLaneLease(args, randomId('interactive-reasoning'), () => listReasoningOptions(page));
       console.log(options.length ? options.join('\n') : 'No visible reasoning controls found.');
       continue;
     }
@@ -7507,7 +7510,7 @@ async function interactive(page, args) {
         console.log('Usage: /model <visible label>');
         continue;
       }
-      const result = await selectModel(page, label);
+      const result = await withBrowserLaneLease(args, randomId('interactive-model'), () => selectModel(page, label));
       console.log(formatModelSelectionResult(result));
       continue;
     }
@@ -7517,7 +7520,7 @@ async function interactive(page, args) {
         console.log('Usage: /reasoning <visible label>');
         continue;
       }
-      const result = await selectReasoning(page, label);
+      const result = await withBrowserLaneLease(args, randomId('interactive-reasoning'), () => selectReasoning(page, label));
       console.log(formatModelSelectionResult(result, 'reasoning'));
       continue;
     }
@@ -7561,14 +7564,17 @@ async function interactive(page, args) {
         console.log('Usage: /search-open <query>[ | index-or-title]');
         continue;
       }
-      const result = await searchTargetApp(page, query, { open });
-      if (result.opened) {
-        refreshSessionTranscript(page, args);
-        await indexCurrentConversation(page, args, 'conversation_search_opened', {
-          searchQuery: query,
-          openedTitle: result.opened.title || '',
-        }).catch(() => {});
-      }
+      const result = await withBrowserLaneLease(args, randomId('interactive-search-open'), async () => {
+        const res = await searchTargetApp(page, query, { open });
+        if (res.opened) {
+          refreshSessionTranscript(page, args);
+          await indexCurrentConversation(page, args, 'conversation_search_opened', {
+            searchQuery: query,
+            openedTitle: res.opened.title || '',
+          }).catch(() => {});
+        }
+        return res;
+      });
       printSearchResults(result);
       continue;
     }
@@ -7577,7 +7583,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/dismiss-blocker') {
-      const result = await dismissBlockingModal(page);
+      const result = await withBrowserLaneLease(args, randomId('interactive-dismiss'), () => dismissBlockingModal(page));
       printBlockingDismissal(result);
       continue;
     }
@@ -7609,7 +7615,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/stop') {
-      const stopped = await stopGeneration(page);
+      const stopped = await withBrowserLaneLease(args, randomId('interactive-stop'), () => stopGeneration(page));
       console.log(stopped ? `Clicked generation control: ${stopped}` : 'No visible generation control found.');
       continue;
     }
@@ -7625,7 +7631,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/recover-interrupted') {
-      const recovery = await recoverInterruptedConnection(page, args);
+      const recovery = await withBrowserLaneLease(args, randomId('interactive-recover'), () => recoverInterruptedConnection(page, args));
       console.log(recovery.recovered ? `Recovery successful on ${recovery.url}. Composer is ready.` : `Recovery failed.`);
       continue;
     }
@@ -7729,26 +7735,46 @@ async function main() {
 
     if (args.recoverQueue) {
       await prepareConversationForRead(page, args);
-      const recovery = await recoverScheduledQueue(page, args);
+      const action = async () => {
+        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+          await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        return await recoverScheduledQueue(page, args);
+      };
+      const recovery = args.expectedSessionId
+        ? await withBrowserLaneLease(args, randomId('recover-queue-op'), action)
+        : await action();
       printQueueRecovery(recovery, args.stateJsonl);
       return;
     }
 
     if (args.syncTranscript) {
       await prepareConversationForRead(page, args);
-      const state = await getTargetAppState(page).catch(() => null);
-      const generation = await getCombinedGenerationState(page, state);
-      const result = await syncTranscriptFromPage(page, args, { state, generation });
-      const activeSessionId = sessionIdFromUrl(page.url());
-      const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {
-        skipSessionIds: generation.isGenerating && activeSessionId ? [activeSessionId] : [],
-      });
-      await indexCurrentConversation(page, args, 'conversation_sync', {
-        recoveredRoundCount: recoveredRounds.length,
-        syncedTurnCount: result.appended.length,
-      }).catch((error) => {
-        info(`[index] ${error.message || error}`);
-      });
+      const action = async () => {
+        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+          await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        const state = await getTargetAppState(page).catch(() => null);
+        const generation = await getCombinedGenerationState(page, state);
+        const result = await syncTranscriptFromPage(page, args, { state, generation });
+        const activeSessionId = sessionIdFromUrl(page.url());
+        const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {
+          skipSessionIds: generation.isGenerating && activeSessionId ? [activeSessionId] : [],
+        });
+        await indexCurrentConversation(page, args, 'conversation_sync', {
+          expectedSessionId: args.expectedSessionId || activeSessionId,
+          preserveTranscript: Boolean(args.expectedSessionId),
+          recoveredRoundCount: recoveredRounds.length,
+          syncedTurnCount: result.appended.length,
+        }).catch((error) => {
+          info(`[index] ${error.message || error}`);
+        });
+        return { result, recoveredRounds, activeSessionId, generation };
+      };
+      const { result, recoveredRounds, activeSessionId, generation } = args.expectedSessionId
+        ? await withBrowserLaneLease(args, randomId('sync-op'), action)
+        : await action();
+
       const text = args.latestAssistant ? await latestAssistantText(page) : '';
       if (args.stateJsonl) {
         console.log(JSON.stringify({
@@ -7772,7 +7798,15 @@ async function main() {
 
     if (args.latestAssistant) {
       await prepareConversationForRead(page, args);
-      const text = await latestAssistantText(page);
+      const action = async () => {
+        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+          await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        return await latestAssistantText(page);
+      };
+      const text = args.expectedSessionId
+        ? await withBrowserLaneLease(args, randomId('latest-op'), action)
+        : await action();
       if (!text) throw new Error('No completed assistant response found in the live target app DOM');
       console.log(text);
       return;
@@ -7780,10 +7814,19 @@ async function main() {
 
     if (args.status) {
       await prepareConversationForRead(page, args);
-      const state = await getTargetAppState(page);
-      state.branchInfo = await getBranchInfo(page).catch(() => null);
-      const modelConfig = args.deepStatus ? await inspectStatusModelConfig(page) : null;
-      if (modelConfig) state.modelConfig = compactModelConfig(modelConfig);
+      const action = async () => {
+        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+          await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        const state = await getTargetAppState(page);
+        state.branchInfo = await getBranchInfo(page).catch(() => null);
+        const modelConfig = args.deepStatus ? await inspectStatusModelConfig(page) : null;
+        if (modelConfig) state.modelConfig = compactModelConfig(modelConfig);
+        return { state, modelConfig };
+      };
+      const { state, modelConfig } = (args.expectedSessionId || args.deepStatus)
+        ? await withBrowserLaneLease(args, randomId('status-op'), action)
+        : await action();
       if (args.stateJsonl) {
         console.log(JSON.stringify(buildStateEvent(state, null, args.transcript || '')));
       } else {
@@ -7798,20 +7841,27 @@ async function main() {
     }
 
     if (args.dismissBlocker) {
-      const result = await dismissBlockingModal(page);
+      const result = await withBrowserLaneLease(args, randomId('dismiss-op'), () => dismissBlockingModal(page));
       printBlockingDismissal(result, args.stateJsonl);
       return;
     }
 
     if (args.searchQuery) {
-      const result = await searchTargetApp(page, args.searchQuery, searchOptionsFromArgs(args));
-      if (result.opened) {
-        refreshSessionTranscript(page, args);
-        await indexCurrentConversation(page, args, 'conversation_search_opened', {
-          searchQuery: args.searchQuery,
-          openedTitle: result.opened.title || '',
-        }).catch(() => {});
-      }
+      const searchOpts = searchOptionsFromArgs(args);
+      const action = async () => {
+        const result = await searchTargetApp(page, args.searchQuery, searchOpts);
+        if (result.opened) {
+          refreshSessionTranscript(page, args);
+          await indexCurrentConversation(page, args, 'conversation_search_opened', {
+            searchQuery: args.searchQuery,
+            openedTitle: result.opened.title || '',
+          }).catch(() => {});
+        }
+        return result;
+      };
+      const result = searchOpts.open
+        ? await withBrowserLaneLease(args, randomId('search-open-op'), action)
+        : await action();
       printSearchResults(result, args.stateJsonl);
       return;
     }
@@ -7884,6 +7934,8 @@ if (require.main === module) {
 
 module.exports = {
   canonicalRawPrompt,
+  syncTranscriptFromPage,
+  prepareConversationForRead,
   roundAllowsTranscriptRecovery,
   assertThreadIdentity,
   isCanonicalTargetRoot,
