@@ -30,6 +30,9 @@ const {
   assertNewChatBootstrapRoute,
   roundAllowsTranscriptRecovery,
   canonicalRawPrompt,
+  isCanonicalTargetRoot,
+  prepareConversationForPrompt,
+  ask,
   attestUserTurn,
   waitForAcceptedTurnAttestation,
   waitForSessionIdInUrl,
@@ -341,20 +344,60 @@ test('assertThreadIdentity: Strictly validates origin in addition to session ID'
   );
 });
 
-test('roundAllowsTranscriptRecovery: Disallows recovery when sessionBindingState is not authoritative', () => {
-  // Disallowed states: generic recovery must never bind or complete these
+test('roundAllowsTranscriptRecovery: Strictly requires durable stable UUID for all authoritative states', () => {
+  const stableUuid = '11111111-1111-1111-1111-111111111111';
+
+  // Disallowed unauthoritative states
   assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'mismatch', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'mismatch', sessionId: stableUuid }), false);
   assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'unverifiable', sessionId: '' }), false);
   assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'candidate', sessionId: '' }), false);
   assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'unbound', sessionId: '' }), false);
 
-  // Authoritative states
-  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'attested', sessionId: '11111111-1111-1111-1111-111111111111' }), true);
-  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'not_applicable', sessionId: '11111111-1111-1111-1111-111111111111' }), true);
+  // Authoritative states MUST have a durable stable UUID
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'not_applicable', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'attested', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'attested', sessionId: stableUuid }), true);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'not_applicable', sessionId: stableUuid }), true);
 
   // Legacy rounds without sessionBindingState require a stable UUID
-  assert.equal(roundAllowsTranscriptRecovery({ sessionId: '11111111-1111-1111-1111-111111111111' }), true);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionId: stableUuid }), true);
   assert.equal(roundAllowsTranscriptRecovery({ sessionId: '' }), false);
+});
+
+test('isCanonicalTargetRoot: Correctly identifies root without route IDs', () => {
+  const testBase = new URL('https://chat.example.com/');
+  assert.equal(isCanonicalTargetRoot('https://chat.example.com/', testBase), true);
+  assert.equal(isCanonicalTargetRoot('https://chat.example.com', testBase), true);
+  assert.equal(isCanonicalTargetRoot('https://chat.example.com/c/11111111-1111-1111-1111-111111111111', testBase), false);
+  assert.equal(isCanonicalTargetRoot('https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222', testBase), false);
+  assert.equal(isCanonicalTargetRoot('https://attacker.example.com/', testBase), false);
+});
+
+test('prepareConversationForPrompt: Auto-promotes canonical root sends and rejects provisional routes', async () => {
+  // Canonical root -> auto-promotes args.newConversation = true
+  const rootArgs = { conversation: '' };
+  const rootPage = { url: () => 'https://chatgpt.com/' };
+  await prepareConversationForPrompt(rootPage, rootArgs);
+  assert.equal(rootArgs.newConversation, true);
+
+  // Provisional route -> fails closed with NEW_CHAT_MODE_REQUIRED
+  const provArgs = { conversation: '' };
+  const provPage = { url: () => 'https://chatgpt.com/c/WEB:22222222-2222-2222-2222-222222222222' };
+  await assert.rejects(
+    async () => {
+      await prepareConversationForPrompt(provPage, provArgs);
+    },
+    (err) => err.code === 'NEW_CHAT_MODE_REQUIRED'
+  );
+
+  // Stable existing conversation -> sets args.expectedSessionId
+  const stableUuid = '11111111-1111-1111-1111-111111111111';
+  const existingArgs = { conversation: '' };
+  const existingPage = { url: () => `https://chatgpt.com/c/${stableUuid}` };
+  await prepareConversationForPrompt(existingPage, existingArgs);
+  assert.equal(existingArgs.expectedSessionId, stableUuid);
+  assert.equal(Boolean(existingArgs.newConversation), false);
 });
 
 test('canonicalRawPrompt: Preserves exact formatting and indentation while normalizing line endings', () => {

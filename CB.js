@@ -803,6 +803,17 @@ function isEphemeralRouteId(id) {
   return /^WEB:/i.test(String(id || ''));
 }
 
+function isCanonicalTargetRoot(rawUrl, targetBase = TARGET_APP_BASE) {
+  try {
+    const parsed = new URL(rawUrl);
+    const expectedPath = targetBase.pathname.replace(/\/+$/, '') || '/';
+    const actualPath = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.origin === targetBase.origin && actualPath === expectedPath && !routeSessionIdFromUrl(rawUrl);
+  } catch {
+    return false;
+  }
+}
+
 async function assertThreadIdentity(page, expectedSessionId, phase, targetBase = TARGET_APP_BASE) {
   if (!expectedSessionId) return;
 
@@ -2161,11 +2172,15 @@ function canonicalRawPrompt(text) {
 
 function roundAllowsTranscriptRecovery(round) {
   if (!round) return false;
+  const stable = Boolean(round.sessionId && STABLE_SESSION_ID_RE.test(round.sessionId));
   const state = round.sessionBindingState;
   if (!state) {
-    return Boolean(round.sessionId && STABLE_SESSION_ID_RE.test(round.sessionId));
+    return stable;
   }
-  return state === 'not_applicable' || state === 'attested';
+  if (state === 'not_applicable' || state === 'attested') {
+    return stable;
+  }
+  return false;
 }
 
 function normalizeIdentityText(text) {
@@ -5830,6 +5845,21 @@ async function prepareConversationForPrompt(page, args) {
     return;
   }
   if (!args.conversation || isCurrentConversationRef(args.conversation)) {
+    const rawUrl = page.url();
+    const currentSessionId = sessionIdFromUrl(rawUrl);
+    if (!currentSessionId) {
+      if (isCanonicalTargetRoot(rawUrl)) {
+        info('[mode] Active tab is at canonical root; promoting prompt to hardened new-conversation transaction');
+        args.newConversation = true;
+        return;
+      }
+      throw cbError(
+        'NEW_CHAT_MODE_REQUIRED',
+        `Current page (${rawUrl}) has no stable conversation identity; use --new-conversation or target an existing thread with --conversation`,
+        { url: rawUrl }
+      );
+    }
+    args.expectedSessionId = currentSessionId;
     const state = await getTargetAppState(page).catch(() => null);
     if (state?.maxLengthReached) {
       info('[state] Note: Maximum conversation length advisory banner visible on thread. If prompt is rejected, consider branching the last prompt or running CB --compact-handoff.');
@@ -6329,8 +6359,7 @@ function printQueueRecovery(result, jsonl = false) {
 async function runScheduledJob(page, job, runnerArgs) {
   const target = job.run?.target || resolveRunnableTarget(job, loadConversationIndex());
   if (target.action === 'new') {
-    info(`[queue] #${job.seq} ${job.id}: starting new conversation${target.alias ? ` alias=${target.alias}` : ''}`);
-    await openNewConversation(page);
+    info(`[queue] #${job.seq} ${job.id}: starting new conversation under bootstrap lease${target.alias ? ` alias=${target.alias}` : ''}`);
   } else if (target.action === 'open') {
     info(`[queue] #${job.seq} ${job.id}: opening conversation ${target.sessionId}${target.alias ? ` alias=${target.alias}` : ''}`);
     await openConversationBySessionId(page, target.sessionId);
@@ -6348,6 +6377,7 @@ async function runScheduledJob(page, job, runnerArgs) {
   const jobArgs = {
     ...runnerArgs,
     jobId: job.id,
+    newConversation: target.action === 'new',
     expectedSessionId: target.action === 'open' ? target.sessionId : '',
     transcript: null,
     transcriptOverride: false,
@@ -6647,11 +6677,23 @@ async function watchTargetAppState(page, args) {
 async function ask(page, message, args) {
   let bootstrapLease = null;
   let leaseHandle = null;
-  let expectedSessionId = args.expectedSessionId
-    || (!args.newConversation ? sessionIdFromUrl(page.url()) : '');
+
+  const rawUrl = page.url();
+  const currentSessionId = sessionIdFromUrl(rawUrl);
+  const implicitNewChat = !args.newConversation && !args.expectedSessionId && !currentSessionId && isCanonicalTargetRoot(rawUrl);
+  const isNewChat = Boolean(args.newConversation || implicitNewChat);
+  let expectedSessionId = args.expectedSessionId || (!isNewChat ? currentSessionId : '');
+
+  if (!isNewChat && !expectedSessionId) {
+    throw cbError(
+      'NEW_CHAT_MODE_REQUIRED',
+      `Current page (${rawUrl}) has no stable conversation identity; use --new-conversation or target an existing thread with --conversation`,
+      { url: rawUrl }
+    );
+  }
 
   try {
-    if (args.newConversation) {
+    if (isNewChat) {
       bootstrapLease = acquireBootstrapLease(args, args.jobId || randomId('bootstrap-op'));
       await openNewConversation(page);
       assertNewChatBootstrapRoute(page);
@@ -6722,11 +6764,11 @@ async function ask(page, message, args) {
     const acceptedUserTurn = await sendMessage(page, message, baselineLastTurnId, {
       expectedSessionId,
       roundId: round.id,
-      requireNewChatRoot: Boolean(args.newConversation),
+      requireNewChatRoot: isNewChat,
     });
     const acceptedUserTurnRef = turnRef(acceptedUserTurn);
 
-    if (args.newConversation) {
+    if (isNewChat) {
       updateRound(round.id, {
         sessionBindingState: 'unbound',
         acceptedUserTurn: acceptedUserTurnRef,
@@ -7787,6 +7829,9 @@ module.exports = {
   canonicalRawPrompt,
   roundAllowsTranscriptRecovery,
   assertThreadIdentity,
+  isCanonicalTargetRoot,
+  prepareConversationForPrompt,
+  ask,
   normalizeIdentityText,
   normalizePromptForRenderedComparison,
   normalizeTurnText,
