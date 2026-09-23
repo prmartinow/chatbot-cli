@@ -28,6 +28,8 @@ const {
   acquireBootstrapLease,
   releaseBootstrapLease,
   assertNewChatBootstrapRoute,
+  roundAllowsTranscriptRecovery,
+  canonicalRawPrompt,
   attestUserTurn,
   waitForAcceptedTurnAttestation,
   waitForSessionIdInUrl,
@@ -60,15 +62,16 @@ test('ID Model: STABLE vs ROUTE Session ID separation with synthetic IDs', () =>
 });
 
 test('assertThreadIdentity: Throws on drift to root or provisional route', async () => {
+  const testBase = new URL('https://chat.example.com/');
   const expectedId = '11111111-1111-1111-1111-111111111111';
 
   // Matching URL: passes
-  await assertThreadIdentity({ url: () => `https://chat.example.com/c/${expectedId}` }, expectedId, 'test_phase');
+  await assertThreadIdentity({ url: () => `https://chat.example.com/c/${expectedId}` }, expectedId, 'test_phase', testBase);
 
   // Root URL: drifts
   await assert.rejects(
     async () => {
-      await assertThreadIdentity({ url: () => 'https://chat.example.com/' }, expectedId, 'test_phase');
+      await assertThreadIdentity({ url: () => 'https://chat.example.com/' }, expectedId, 'test_phase', testBase);
     },
     (err) => err.code === 'THREAD_IDENTITY_DRIFT'
   );
@@ -76,7 +79,7 @@ test('assertThreadIdentity: Throws on drift to root or provisional route', async
   // Provisional WEB route: drifts
   await assert.rejects(
     async () => {
-      await assertThreadIdentity({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' }, expectedId, 'test_phase');
+      await assertThreadIdentity({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' }, expectedId, 'test_phase', testBase);
     },
     (err) => err.code === 'THREAD_IDENTITY_DRIFT'
   );
@@ -287,16 +290,26 @@ test('bootstrapLeaseKey: Normalizes localhost vs 127.0.0.1 to identical lease lo
   assert.equal(key1, key2);
 });
 
-test('assertNewChatBootstrapRoute: Throws on route drift before dispatch', () => {
-  // Canonical root: passes
+test('assertNewChatBootstrapRoute: Strictly enforces canonical targetBase origin, pathname, and absence of route ID', () => {
+  const testBase = new URL('https://chat.example.com/');
+
+  // Canonical root on matching origin: passes
   assert.doesNotThrow(() => {
-    assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/' });
+    assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/' }, testBase);
   });
+
+  // Foreign origin drift: throws even on root path
+  assert.throws(
+    () => {
+      assertNewChatBootstrapRoute({ url: () => 'https://evil.example.com/' }, testBase);
+    },
+    (err) => err.code === 'NEW_CHAT_ROUTE_DRIFT'
+  );
 
   // Provisional route: drifts
   assert.throws(
     () => {
-      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' });
+      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' }, testBase);
     },
     (err) => err.code === 'NEW_CHAT_ROUTE_DRIFT'
   );
@@ -304,10 +317,51 @@ test('assertNewChatBootstrapRoute: Throws on route drift before dispatch', () =>
   // Stable conversation route: drifts
   assert.throws(
     () => {
-      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/11111111-1111-1111-1111-111111111111' });
+      assertNewChatBootstrapRoute({ url: () => 'https://chat.example.com/c/11111111-1111-1111-1111-111111111111' }, testBase);
     },
     (err) => err.code === 'NEW_CHAT_ROUTE_DRIFT'
   );
+});
+
+test('assertThreadIdentity: Strictly validates origin in addition to session ID', async () => {
+  const testBase = new URL('https://chat.example.com/');
+  const stableId = '11111111-1111-1111-1111-111111111111';
+
+  // Valid origin and matching session ID: passes
+  await assert.doesNotReject(async () => {
+    await assertThreadIdentity({ url: () => `https://chat.example.com/c/${stableId}` }, stableId, 'test-phase', testBase);
+  });
+
+  // Foreign origin with matching session ID: throws THREAD_IDENTITY_DRIFT
+  await assert.rejects(
+    async () => {
+      await assertThreadIdentity({ url: () => `https://attacker.example.com/c/${stableId}` }, stableId, 'test-phase', testBase);
+    },
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT'
+  );
+});
+
+test('roundAllowsTranscriptRecovery: Disallows recovery when sessionBindingState is not authoritative', () => {
+  // Disallowed states: generic recovery must never bind or complete these
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'mismatch', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'unverifiable', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'candidate', sessionId: '' }), false);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'unbound', sessionId: '' }), false);
+
+  // Authoritative states
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'attested', sessionId: '11111111-1111-1111-1111-111111111111' }), true);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionBindingState: 'not_applicable', sessionId: '11111111-1111-1111-1111-111111111111' }), true);
+
+  // Legacy rounds without sessionBindingState require a stable UUID
+  assert.equal(roundAllowsTranscriptRecovery({ sessionId: '11111111-1111-1111-1111-111111111111' }), true);
+  assert.equal(roundAllowsTranscriptRecovery({ sessionId: '' }), false);
+});
+
+test('canonicalRawPrompt: Preserves exact formatting and indentation while normalizing line endings', () => {
+  const code = 'function test() {\r\n  const x = 1;\r\n  return x;\r\n}';
+  const canonical = canonicalRawPrompt(code);
+  assert.equal(canonical, 'function test() {\n  const x = 1;\n  return x;\n}');
+  assert.notEqual(messageHash(canonicalRawPrompt('foo  bar')), messageHash(canonicalRawPrompt('foo bar')));
 });
 
 test('attestUserTurn: Hierarchical verification across messageId, testid, and content hash', () => {

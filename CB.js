@@ -803,7 +803,7 @@ function isEphemeralRouteId(id) {
   return /^WEB:/i.test(String(id || ''));
 }
 
-async function assertThreadIdentity(page, expectedSessionId, phase) {
+async function assertThreadIdentity(page, expectedSessionId, phase, targetBase = TARGET_APP_BASE) {
   if (!expectedSessionId) return;
 
   if (!STABLE_SESSION_ID_RE.test(expectedSessionId)) {
@@ -814,18 +814,31 @@ async function assertThreadIdentity(page, expectedSessionId, phase) {
     );
   }
 
-  const url = page?.url ? page.url() : '';
-  const routeId = routeSessionIdFromUrl(url);
-  const stableId = sessionIdFromUrl(url);
-
-  if (stableId !== expectedSessionId) {
+  const rawUrl = page?.url ? page.url() : '';
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
     throw cbError(
       'THREAD_IDENTITY_DRIFT',
-      `Conversation identity changed during ${phase}: expected=${expectedSessionId}, route=${routeId || '(none)'}, url=${url}`,
+      `Invalid conversation URL during ${phase}: ${rawUrl}`,
+      { expectedSessionId, url: rawUrl, phase }
+    );
+  }
+
+  const routeId = routeSessionIdFromUrl(rawUrl);
+  const stableId = sessionIdFromUrl(rawUrl);
+
+  if (parsed.origin !== targetBase.origin || stableId !== expectedSessionId) {
+    throw cbError(
+      'THREAD_IDENTITY_DRIFT',
+      `Conversation identity changed during ${phase}: expectedOrigin=${targetBase.origin}, actualOrigin=${parsed.origin}, expected=${expectedSessionId}, route=${routeId || '(none)'}, url=${rawUrl}`,
       {
         expectedSessionId,
+        expectedOrigin: targetBase.origin,
+        actualOrigin: parsed.origin,
         actualRouteId: routeId,
-        url,
+        url: rawUrl,
         phase,
       }
     );
@@ -1257,7 +1270,7 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     acceptedUserTurn: extra.acceptedUserTurn || null,
     dispatchStartedAt: '',
     dispatchAcceptedAt: '',
-    messageHash: messageHash(normalizeIdentityText(message)),
+    messageHash: messageHash(canonicalRawPrompt(message)),
     messageChars: message.length,
     messageHead: normalizeIdentityText(message).slice(0, 240),
     messageTail: normalizeIdentityText(message).slice(-240),
@@ -1300,13 +1313,17 @@ function transcriptUserEntryMatchesRound(entry, round) {
   if (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared') {
     return false;
   }
+  const rawHash = messageHash(canonicalRawPrompt(entry.text));
+  const renderedHash = messageHash(normalizeTurnText(entry.text));
   if (round.acceptedUserTurn?.textHash) {
-    return messageHash(normalizeTurnText(entry.text)) === round.acceptedUserTurn.textHash;
+    return (
+      rawHash === round.messageHash
+      || rawHash === round.acceptedUserTurn.textHash
+      || renderedHash === round.messageHash
+      || renderedHash === round.acceptedUserTurn.textHash
+    );
   }
-  if (round.dispatchState === 'uncertain' || round.dispatchState === 'dispatching') {
-    return messageHash(normalizeTurnText(entry.text)) === round.messageHash;
-  }
-  return messageHash(normalizeTurnText(entry.text)) === round.messageHash;
+  return rawHash === round.messageHash || renderedHash === round.messageHash;
 }
 
 function responseAfterRound(entries, round) {
@@ -1387,6 +1404,9 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
     for (const round of state.rounds) {
       if (round.status !== 'pending') continue;
       if (round.dispatchState === 'prepared' || round.dispatchState === 'aborted_precommit') {
+        continue;
+      }
+      if (!roundAllowsTranscriptRecovery(round)) {
         continue;
       }
       const roundSessionId = sessionIdFromSchedulerRecord(round) || sessionId;
@@ -1687,7 +1707,12 @@ async function findTargetAppPage(browser, args = {}) {
 
 async function getConversationTurns(page) {
   const turns = await page.evaluate(() => {
-    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const textOf = (el) => {
+      if (!el) return '';
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('button, [role="button"]').forEach((b) => b.remove());
+      return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+    };
     return [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
       .map((turn, index) => {
         const roleEls = turn.matches('[data-message-author-role]')
@@ -2059,9 +2084,19 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
   try {
     if (!ready.button.exists) {
       await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before pressing Enter to submit', { preferLast: true });
+      if (requireNewChatRoot) {
+        assertNewChatBootstrapRoute(page);
+      } else if (expectedSessionId) {
+        await assertThreadIdentity(page, expectedSessionId, 'immediately before Enter dispatch');
+      }
       await page.keyboard.press('Enter');
     } else {
       await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
+      if (requireNewChatRoot) {
+        assertNewChatBootstrapRoute(page);
+      } else if (expectedSessionId) {
+        await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
+      }
       await page.locator(SEND_BUTTON_SELECTORS.join(', '))
         .first()
         .click({ timeout: 5000 });
@@ -2118,6 +2153,19 @@ function responseAfterMessage(turns, message, baselineLastTurnId) {
 
 function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
   return Boolean(findUserTurnAfterBaseline(turns, message, baselineLastTurnId));
+}
+
+function canonicalRawPrompt(text) {
+  return String(text ?? '').replace(/\r\n?/g, '\n');
+}
+
+function roundAllowsTranscriptRecovery(round) {
+  if (!round) return false;
+  const state = round.sessionBindingState;
+  if (!state) {
+    return Boolean(round.sessionId && STABLE_SESSION_ID_RE.test(round.sessionId));
+  }
+  return state === 'not_applicable' || state === 'attested';
 }
 
 function normalizeIdentityText(text) {
@@ -2565,9 +2613,8 @@ function assertNewChatBootstrapRoute(page, targetBase = TARGET_APP_BASE) {
   const routeId = routeSessionIdFromUrl(current.href);
   const expectedPath = targetBase.pathname.replace(/\/+$/, '') || '/';
   const actualPath = current.pathname.replace(/\/+$/, '') || '/';
-  const isAllowedOrigin = current.origin === targetBase.origin || current.hostname.endsWith('example.com');
   if (
-    !isAllowedOrigin
+    current.origin !== targetBase.origin
     || actualPath !== expectedPath
     || routeId
   ) {
@@ -6048,6 +6095,7 @@ function recoverQueueStateFromRounds(page, args, context) {
     };
 
     for (const round of roundState.rounds) {
+      if (!roundAllowsTranscriptRecovery(round)) continue;
       const normalized = normalizeSchedulerSessionRecord(round);
       if (normalized.sessionId && (
         round.sessionId !== normalized.sessionId
@@ -6062,6 +6110,7 @@ function recoverQueueStateFromRounds(page, args, context) {
     for (const job of queue.jobs) {
       if (!scheduledJobNeedsReconciliation(job.status)) continue;
       const round = findRoundForJob(roundState.rounds, job, index);
+      if (round && !roundAllowsTranscriptRecovery(round)) continue;
       const sessionId = sessionIdFromSchedulerRecord(round) || sessionIdFromSchedulerRecord(job.result) || '';
       if (!round && !sessionId) continue;
 
@@ -7735,6 +7784,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+  canonicalRawPrompt,
+  roundAllowsTranscriptRecovery,
+  assertThreadIdentity,
   normalizeIdentityText,
   normalizePromptForRenderedComparison,
   normalizeTurnText,
