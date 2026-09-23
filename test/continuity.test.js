@@ -29,6 +29,7 @@ const {
   withBrowserLaneLease,
   takeBrowserLaneLease,
   findTargetAppPage,
+  compactActiveConversation,
   syncTranscriptFromPage,
   prepareConversationForRead,
   bootstrapLeaseKey,
@@ -696,4 +697,26 @@ test('findTargetAppPage: Acquires browserLaneLease for fallback page creation wh
   // Clean up
   releaseBrowserLaneLease(mockArgs._laneLease);
   assert.equal(fs.existsSync(mockArgs._laneLease.leasePath), false);
+});
+
+test('compactActiveConversation: Uses args.expectedSessionId and rejects drifted page URL with THREAD_IDENTITY_DRIFT', async () => {
+  const mockPageDrifted = {
+    url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+    waitForTimeout: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    locator: () => ({
+      last: () => ({
+        waitFor: async () => {},
+      }),
+    }),
+  };
+  const mockArgs = {
+    expectedSessionId: '22222222-2222-4222-8222-222222222222',
+  };
+
+  await assert.rejects(
+    async () => compactActiveConversation(mockPageDrifted, mockArgs),
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT'
+  );
 });

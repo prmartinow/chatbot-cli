@@ -7351,13 +7351,17 @@ You are acting as our research and architecture advisor in this new continuation
 async function compactActiveConversation(page, args = {}) {
   await settlePage(page);
   const currentUrl = page.url();
-  const sessionId = sessionIdFromUrl(currentUrl) || args.conversation;
+  const sessionId = args.expectedSessionId || sessionIdFromUrl(currentUrl) || args.conversation;
   if (!sessionId) {
     throw new Error('Cannot compact conversation: no session ID found in active URL or --conversation');
   }
 
-  refreshSessionTranscript(page, args);
-  await syncTranscriptFromPage(page, args).catch(() => {});
+  if (args.expectedSessionId && !args.transcriptOverride) {
+    args.transcript = transcriptPathForSession(args.expectedSessionId);
+  } else {
+    refreshSessionTranscript(page, args);
+  }
+  await syncTranscriptFromPage(page, args);
 
   const transcriptPath = args.transcript || transcriptPathForSession(sessionId);
   if (!fs.existsSync(transcriptPath)) {
@@ -7414,12 +7418,22 @@ ${compaction.latestRecommendations}
 
 async function executeCompactionHandoff(page, args) {
   info('[handoff] Extracting and compacting context from current thread...');
-  const result = await withBrowserLaneLease(args, randomId('handoff-compact'), () => compactActiveConversation(page, args));
+  await prepareConversationForRead(page, args);
+  const result = await withBrowserLaneLease(args, randomId('handoff-compact'), async () => {
+    if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+      await openConversationBySessionId(page, args.expectedSessionId);
+    }
+    if (args.expectedSessionId) {
+      await assertThreadIdentity(page, args.expectedSessionId, 'before conversation compaction');
+    }
+    return await compactActiveConversation(page, args);
+  });
   info(`[handoff] Compaction artifacts saved to:
   - JSON: ${result.jsonPath}
   - Markdown: ${result.mdPath}
   - Turn 1 Prompt: ${result.promptPath}`);
 
+  args.expectedSessionId = '';
   args.newConversation = true;
   args.conversation = '';
   args.handoffNewSession = true;
@@ -7627,7 +7641,10 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/download') {
-      const saved = await withBrowserLaneLease(args, randomId('interactive-download'), () => downloadLatestArtifacts(page, args));
+      const saved = await withBrowserLaneLease(args, randomId('interactive-download'), async () => {
+        refreshSessionTranscript(page, args);
+        return await downloadLatestArtifacts(page, args);
+      });
       console.log(saved.map(formatSavedArtifact).join('\n'));
       printSavedArtifacts(saved);
       continue;
@@ -7878,7 +7895,16 @@ async function main() {
     }
 
     if (args.compactConversation) {
-      const result = await withBrowserLaneLease(args, randomId('compact-op'), () => compactActiveConversation(page, args));
+      await prepareConversationForRead(page, args);
+      const result = await withBrowserLaneLease(args, randomId('compact-op'), async () => {
+        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+          await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        if (args.expectedSessionId) {
+          await assertThreadIdentity(page, args.expectedSessionId, 'before conversation compaction');
+        }
+        return await compactActiveConversation(page, args);
+      });
       console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
       console.log(`JSON: ${result.jsonPath}`);
       console.log(`Markdown: ${result.mdPath}`);
@@ -7910,7 +7936,10 @@ async function main() {
     }
 
     if (args.downloadArtifacts && typeof args.message !== 'string') {
-      const saved = await withBrowserLaneLease(args, randomId('download-op'), () => downloadLatestArtifacts(page, args));
+      const saved = await withBrowserLaneLease(args, randomId('download-op'), async () => {
+        refreshSessionTranscript(page, args);
+        return await downloadLatestArtifacts(page, args);
+      });
       console.log(saved.map(formatSavedArtifact).join('\n'));
       if (args.showArtifacts) printSavedArtifacts(saved);
       return;
@@ -7950,6 +7979,7 @@ if (require.main === module) {
 module.exports = {
   canonicalRawPrompt,
   findTargetAppPage,
+  compactActiveConversation,
   syncTranscriptFromPage,
   prepareConversationForRead,
   roundAllowsTranscriptRecovery,
