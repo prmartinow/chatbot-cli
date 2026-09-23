@@ -30,6 +30,7 @@ const {
   takeBrowserLaneLease,
   findTargetAppPage,
   compactActiveConversation,
+  compactTargetConversation,
   syncTranscriptFromPage,
   prepareConversationForRead,
   bootstrapLeaseKey,
@@ -719,4 +720,31 @@ test('compactActiveConversation: Uses args.expectedSessionId and rejects drifted
     async () => compactActiveConversation(mockPageDrifted, mockArgs),
     (err) => err.code === 'THREAD_IDENTITY_DRIFT'
   );
+});
+
+test('compactTargetConversation: Resolves explicit conversation, navigates, and asserts thread identity', async () => {
+  let navTarget = '';
+  const mockPage = {
+    url: () => navTarget || 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+    goto: async (url) => { navTarget = url; },
+    evaluate: async () => true,
+    waitForTimeout: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    locator: () => ({
+      last: () => ({
+        waitFor: async () => {},
+      }),
+    }),
+  };
+  const mockArgs = {
+    conversation: '22222222-2222-4222-8222-222222222222',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    async () => compactTargetConversation(mockPage, mockArgs),
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT' || err.message.includes('did not hydrate') || err.message.includes('Transcript file not found')
+  );
+  assert.equal(mockArgs.expectedSessionId, '22222222-2222-4222-8222-222222222222');
 });

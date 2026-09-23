@@ -7416,10 +7416,9 @@ ${compaction.latestRecommendations}
   };
 }
 
-async function executeCompactionHandoff(page, args) {
-  info('[handoff] Extracting and compacting context from current thread...');
+async function compactTargetConversation(page, args, operationId = 'compact-op') {
   await prepareConversationForRead(page, args);
-  const result = await withBrowserLaneLease(args, randomId('handoff-compact'), async () => {
+  return await withBrowserLaneLease(args, randomId(operationId), async () => {
     if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
       await openConversationBySessionId(page, args.expectedSessionId);
     }
@@ -7428,6 +7427,11 @@ async function executeCompactionHandoff(page, args) {
     }
     return await compactActiveConversation(page, args);
   });
+}
+
+async function executeCompactionHandoff(page, args) {
+  info('[handoff] Extracting and compacting context from current thread...');
+  const result = await compactTargetConversation(page, args, 'handoff-compact');
   info(`[handoff] Compaction artifacts saved to:
   - JSON: ${result.jsonPath}
   - Markdown: ${result.mdPath}
@@ -7440,6 +7444,11 @@ async function executeCompactionHandoff(page, args) {
 
   info('[handoff] Submitting Turn 1 compaction seed prompt under bootstrap lease...');
   const response = await ask(page, result.turn1Prompt, args);
+
+  // Reset handoff flags so subsequent interactive messages continue in the newly created thread
+  args.newConversation = false;
+  args.handoffNewSession = false;
+  args.conversation = '';
 
   console.log('\n================================================================================');
   console.log('[HANDOFF COMPLETE] Context successfully seeded into new thread:');
@@ -7655,7 +7664,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/compact') {
-      const result = await withBrowserLaneLease(args, randomId('interactive-compact'), () => compactActiveConversation(page, args));
+      const result = await compactTargetConversation(page, args, 'interactive-compact');
       console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
       console.log(`Markdown: ${result.mdPath}`);
       console.log(`Prompt: ${result.promptPath}`);
@@ -7895,16 +7904,7 @@ async function main() {
     }
 
     if (args.compactConversation) {
-      await prepareConversationForRead(page, args);
-      const result = await withBrowserLaneLease(args, randomId('compact-op'), async () => {
-        if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
-          await openConversationBySessionId(page, args.expectedSessionId);
-        }
-        if (args.expectedSessionId) {
-          await assertThreadIdentity(page, args.expectedSessionId, 'before conversation compaction');
-        }
-        return await compactActiveConversation(page, args);
-      });
+      const result = await compactTargetConversation(page, args, 'compact-op');
       console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
       console.log(`JSON: ${result.jsonPath}`);
       console.log(`Markdown: ${result.mdPath}`);
@@ -7980,6 +7980,7 @@ module.exports = {
   canonicalRawPrompt,
   findTargetAppPage,
   compactActiveConversation,
+  compactTargetConversation,
   syncTranscriptFromPage,
   prepareConversationForRead,
   roundAllowsTranscriptRecovery,
