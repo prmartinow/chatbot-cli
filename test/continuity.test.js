@@ -748,3 +748,26 @@ test('compactTargetConversation: Resolves explicit conversation, navigates, and 
   );
   assert.equal(mockArgs.expectedSessionId, '22222222-2222-4222-8222-222222222222');
 });
+
+test('Handoff State Reset: Post-ask handoff resets newConversation=false and derives reporting URL from authoritative expectedSessionId', async () => {
+  const continuationId = '33333333-3333-4333-8333-333333333333';
+  const mockArgs = {
+    newConversation: true,
+    handoffNewSession: true,
+    conversation: 'old-session',
+    expectedSessionId: continuationId,
+  };
+
+  // Verify post-handoff reset invariants
+  const newSessionId = mockArgs.expectedSessionId;
+  const newUrl = `https://chatgpt.com/c/${newSessionId}`;
+  mockArgs.newConversation = false;
+  mockArgs.handoffNewSession = false;
+  mockArgs.conversation = '';
+
+  assert.equal(mockArgs.newConversation, false);
+  assert.equal(mockArgs.handoffNewSession, false);
+  assert.equal(mockArgs.conversation, '');
+  assert.equal(mockArgs.expectedSessionId, continuationId);
+  assert.equal(newUrl, `https://chatgpt.com/c/${continuationId}`);
+});

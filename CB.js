@@ -7446,13 +7446,15 @@ async function executeCompactionHandoff(page, args) {
   const response = await ask(page, result.turn1Prompt, args);
 
   // Reset handoff flags so subsequent interactive messages continue in the newly created thread
+  const newSessionId = args.expectedSessionId;
+  const newUrl = targetConversationUrl(newSessionId);
   args.newConversation = false;
   args.handoffNewSession = false;
   args.conversation = '';
 
   console.log('\n================================================================================');
   console.log('[HANDOFF COMPLETE] Context successfully seeded into new thread:');
-  console.log(`URL: ${page.url()}`);
+  console.log(`URL: ${newUrl}`);
   console.log('--------------------------------------------------------------------------------');
   console.log('RESEARCH AGENT RESPONSE & CLARIFYING QUESTIONS (Turn 1):');
   console.log('--------------------------------------------------------------------------------');
@@ -7463,8 +7465,8 @@ async function executeCompactionHandoff(page, args) {
 
   return {
     oldSessionId: result.compaction.sessionId,
-    newSessionId: sessionIdFromUrl(page.url()),
-    newUrl: page.url(),
+    newSessionId,
+    newUrl,
     response,
   };
 }
