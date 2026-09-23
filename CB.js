@@ -922,11 +922,22 @@ function saveRoundState(state) {
 
 const CONVERSATION_LEASES_DIR = path.join(SCHEDULER_DIR, 'leases');
 
+function normalizeCdpUrl(cdpUrl) {
+  try {
+    const parsed = new URL(cdpUrl);
+    const host = parsed.hostname === 'localhost' ? '127.0.0.1' : parsed.hostname;
+    return `${parsed.protocol}//${host}:${parsed.port || '9222'}`;
+  } catch {
+    return String(cdpUrl || DEFAULT_CDP);
+  }
+}
+
 function bootstrapLeaseKey(args) {
+  const normalizedCdp = normalizeCdpUrl(args.cdp || DEFAULT_CDP);
   const scope = [
     'new-chat-v1',
     TARGET_APP_BASE.origin,
-    String(args.cdp || DEFAULT_CDP),
+    normalizedCdp,
   ].join('|');
 
   return crypto
@@ -1230,6 +1241,9 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     id,
     status: 'pending',
     dispatchState: extra.dispatchState || 'prepared',
+    sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
+    candidateSessionId: '',
+    sessionAttestation: null,
     createdAt: now,
     updatedAt: now,
     pid: process.pid,
@@ -1243,10 +1257,10 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     acceptedUserTurn: extra.acceptedUserTurn || null,
     dispatchStartedAt: '',
     dispatchAcceptedAt: '',
-    messageHash: messageHash(normalizeTurnText(message)),
+    messageHash: messageHash(normalizeIdentityText(message)),
     messageChars: message.length,
-    messageHead: normalizeTurnText(message).slice(0, 240),
-    messageTail: normalizeTurnText(message).slice(-240),
+    messageHead: normalizeIdentityText(message).slice(0, 240),
+    messageTail: normalizeIdentityText(message).slice(-240),
     responseChars: 0,
     lastError: '',
   };
@@ -2000,8 +2014,10 @@ async function confirmNewConversationAccepted(page, message, baselineLastTurnId)
 }
 
 async function sendMessage(page, message, baselineLastTurnId = '', options = {}) {
-  const { expectedSessionId = '', roundId = '' } = options;
-  if (expectedSessionId) {
+  const { expectedSessionId = '', roundId = '', requireNewChatRoot = false } = options;
+  if (requireNewChatRoot) {
+    assertNewChatBootstrapRoute(page);
+  } else if (expectedSessionId) {
     await assertThreadIdentity(page, expectedSessionId, 'before finding the composer');
   }
 
@@ -2018,13 +2034,17 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
   await page.keyboard.insertText(message);
   await waitForComposerInsertion(page, message);
 
-  if (expectedSessionId) {
+  if (requireNewChatRoot) {
+    assertNewChatBootstrapRoute(page);
+  } else if (expectedSessionId) {
     await assertThreadIdentity(page, expectedSessionId, 'after composer insertion');
   }
 
   const ready = await waitForSendReady(page);
 
-  if (expectedSessionId) {
+  if (requireNewChatRoot) {
+    assertNewChatBootstrapRoute(page);
+  } else if (expectedSessionId) {
     await assertThreadIdentity(page, expectedSessionId, 'before dispatching prompt');
   }
 
@@ -2100,13 +2120,23 @@ function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
   return Boolean(findUserTurnAfterBaseline(turns, message, baselineLastTurnId));
 }
 
-function normalizeTurnText(text) {
-  return (text || '')
+function normalizeIdentityText(text) {
+  return String(text || '')
     .replace(/\u00a0/g, ' ')
     .replace(/(?:Show more|Show less)\s*$/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizePromptForRenderedComparison(text) {
+  return normalizeIdentityText(text)
     .replace(/[`*_#~]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function normalizeTurnText(text) {
+  return normalizeIdentityText(text);
 }
 
 function terminalErrorForAwaitedTurn(pageState, outcome, acceptedUserTurnRef) {
@@ -2530,12 +2560,20 @@ function assistantResponseText(roleTexts, turnText) {
   return stripLeadingProgressPrefix(turnText);
 }
 
-function assertNewChatBootstrapRoute(page) {
-  const routeId = routeSessionIdFromUrl(page.url());
-  if (routeId) {
+function assertNewChatBootstrapRoute(page, targetBase = TARGET_APP_BASE) {
+  const current = new URL(page.url());
+  const routeId = routeSessionIdFromUrl(current.href);
+  const expectedPath = targetBase.pathname.replace(/\/+$/, '') || '/';
+  const actualPath = current.pathname.replace(/\/+$/, '') || '/';
+  const isAllowedOrigin = current.origin === targetBase.origin || current.hostname.endsWith('example.com');
+  if (
+    !isAllowedOrigin
+    || actualPath !== expectedPath
+    || routeId
+  ) {
     throw cbError(
       'NEW_CHAT_ROUTE_DRIFT',
-      `New-chat transaction left canonical root before dispatch: ${routeId}`,
+      `New-chat transaction left canonical root before dispatch: expected=${TARGET_APP_BASE.origin}${expectedPath} actual=${current.origin}${actualPath} routeId=${routeId || 'none'}`,
       {
         routeId,
         url: page.url(),
@@ -2669,15 +2707,21 @@ async function waitForAcceptedTurnAttestation(page, sessionId, acceptedUserTurnR
 }
 
 function turnMatchesMessage(turnText, message) {
-  const normalizedTurn = normalizeTurnText(turnText);
-  const normalizedMessage = normalizeTurnText(message);
-  if (!normalizedTurn || !normalizedMessage) return false;
-  if (normalizedTurn === normalizedMessage || normalizedTurn.includes(normalizedMessage)) return true;
-  if (normalizedMessage.length < 1000) return false;
+  const identityTurn = normalizeIdentityText(turnText);
+  const identityMessage = normalizeIdentityText(message);
+  if (!identityTurn || !identityMessage) return false;
+  if (identityTurn === identityMessage || identityTurn.includes(identityMessage)) return true;
 
-  const head = normalizedMessage.slice(0, 200);
-  const tail = normalizedMessage.slice(-200);
-  return normalizedTurn.includes(head) && normalizedTurn.includes(tail);
+  // Fallback for markdown-rendered DOM elements where punctuation was converted to HTML tags
+  const renderedTurn = normalizePromptForRenderedComparison(turnText);
+  const renderedMessage = normalizePromptForRenderedComparison(message);
+  if (renderedTurn === renderedMessage || renderedTurn.includes(renderedMessage)) return true;
+  if (renderedMessage.length >= 1000) {
+    const head = renderedMessage.slice(0, 200);
+    const tail = renderedMessage.slice(-200);
+    return renderedTurn.includes(head) && renderedTurn.includes(tail);
+  }
+  return false;
 }
 
 async function getGenerationState(page) {
@@ -6627,48 +6671,64 @@ async function ask(page, message, args) {
     }
 
     const acceptedUserTurn = await sendMessage(page, message, baselineLastTurnId, {
-        expectedSessionId,
-        roundId: round.id,
-      });
-      const acceptedUserTurnRef = turnRef(acceptedUserTurn);
+      expectedSessionId,
+      roundId: round.id,
+      requireNewChatRoot: Boolean(args.newConversation),
+    });
+    const acceptedUserTurnRef = turnRef(acceptedUserTurn);
 
-      if (args.newConversation) {
+    if (args.newConversation) {
+      updateRound(round.id, {
+        sessionBindingState: 'unbound',
+        acceptedUserTurn: acceptedUserTurnRef,
+      }, 'round_new_session_unbound');
+
+      const candidateSessionId = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_TIMEOUT_MS);
+      if (!candidateSessionId) {
         updateRound(round.id, {
           sessionBindingState: 'unbound',
-          acceptedUserTurn: acceptedUserTurnRef,
-        }, 'round_new_session_unbound');
+          lastError: 'No stable conversation ID appeared after accepted Send',
+        }, 'round_session_binding_uncertain');
+        throw cbError('NEW_SESSION_ID_UNCERTAIN', 'No stable conversation ID appeared after accepted Send', { roundId: round.id });
+      }
 
-        const candidateSessionId = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_TIMEOUT_MS);
-        if (!candidateSessionId) {
-          throw cbError('NEW_SESSION_ID_UNCERTAIN', 'No stable conversation ID appeared after accepted Send', { roundId: round.id });
-        }
+      updateRound(round.id, {
+        candidateSessionId,
+        sessionBindingState: 'candidate',
+      }, 'round_session_candidate');
 
+      let attestation = null;
+      try {
+        attestation = await waitForAcceptedTurnAttestation(page, candidateSessionId, acceptedUserTurnRef);
+      } catch (attestationError) {
+        const bindingState = attestationError.code === 'NEW_SESSION_ATTRIBUTION_MISMATCH' ? 'mismatch' : 'unverifiable';
         updateRound(round.id, {
           candidateSessionId,
-          sessionBindingState: 'candidate',
-        }, 'round_session_candidate');
-
-        const attestation = await waitForAcceptedTurnAttestation(page, candidateSessionId, acceptedUserTurnRef);
-
-        expectedSessionId = candidateSessionId;
-        args.expectedSessionId = candidateSessionId;
-        args.transcript = transcriptPathForSession(candidateSessionId);
-
-        updateRound(round.id, {
-          sessionId: candidateSessionId,
-          expectedSessionId: candidateSessionId,
-          url: targetConversationUrl(candidateSessionId),
-          transcript: args.transcript,
-          sessionBindingState: 'attested',
-          sessionAttestation: {
-            method: attestation.method,
-            at: nowIso(),
-          },
-        }, 'round_session_bound');
-
-        // Overlapping lease: acquire stable session lease while bootstrap lease is held
-        leaseHandle = acquireConversationLease(candidateSessionId, round.id);
+          sessionBindingState: bindingState,
+          lastError: attestationError.message || String(attestationError),
+        }, 'round_session_attribution_failed');
+        throw attestationError;
       }
+
+      expectedSessionId = candidateSessionId;
+      args.expectedSessionId = candidateSessionId;
+      args.transcript = transcriptPathForSession(candidateSessionId);
+
+      updateRound(round.id, {
+        sessionId: candidateSessionId,
+        expectedSessionId: candidateSessionId,
+        url: targetConversationUrl(candidateSessionId),
+        transcript: args.transcript,
+        sessionBindingState: 'attested',
+        sessionAttestation: {
+          method: attestation.method,
+          at: nowIso(),
+        },
+      }, 'round_session_bound');
+
+      // Overlapping lease: acquire stable session lease while bootstrap lease is held
+      leaseHandle = acquireConversationLease(candidateSessionId, round.id);
+    }
     refreshSessionTranscript(page, args);
     await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
     appendTranscript(args.transcript, 'user', message);
@@ -7675,6 +7735,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+  normalizeIdentityText,
+  normalizePromptForRenderedComparison,
+  normalizeTurnText,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,
@@ -7684,7 +7747,6 @@ module.exports = {
   waitForAcceptedTurnAttestation,
   waitForSessionIdInUrl,
   terminalErrorForAwaitedTurn,
-  normalizeTurnText,
   messageHash,
   acquireConversationLease,
   releaseConversationLease,

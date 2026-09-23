@@ -20,6 +20,9 @@ const {
   acquireConversationLease,
   releaseConversationLease,
   reconcilePendingRoundsFromTranscript,
+  normalizeIdentityText,
+  normalizePromptForRenderedComparison,
+  normalizeTurnText,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,
@@ -29,7 +32,6 @@ const {
   waitForAcceptedTurnAttestation,
   waitForSessionIdInUrl,
   terminalErrorForAwaitedTurn,
-  normalizeTurnText,
   messageHash,
   cbError,
 } = require('../CB.js');
@@ -265,12 +267,24 @@ test('waitForSessionIdInUrl: Ignores provisional WEB route and waits for stable 
   assert.equal(timedOutId, '');
 });
 
-test('normalizeTurnText: Strips markdown syntax, UI buttons, and collapses whitespace', () => {
+test('normalizeIdentityText: Preserves markdown syntax while stripping UI buttons and collapsing whitespace', () => {
   const raw = '# Header with `code` and **bold** text and ~strike~\nShow more';
-  assert.equal(normalizeTurnText(raw), 'Header with code and bold text and strike');
+  // Identity preserves all markdown syntax tokens
+  assert.equal(normalizeIdentityText(raw), '# Header with `code` and **bold** text and ~strike~');
+  assert.notEqual(messageHash(normalizeIdentityText('C# API')), messageHash(normalizeIdentityText('C API')));
+  assert.notEqual(messageHash(normalizeIdentityText('*foo*')), messageHash(normalizeIdentityText('foo')));
+
+  // Rendered comparison strips markdown for matching HTML-rendered bubbles
+  assert.equal(normalizePromptForRenderedComparison(raw), 'Header with code and bold text and strike');
 
   const withNbsp = 'Hello\u00a0world\nShow less';
-  assert.equal(normalizeTurnText(withNbsp), 'Hello world');
+  assert.equal(normalizeIdentityText(withNbsp), 'Hello world');
+});
+
+test('bootstrapLeaseKey: Normalizes localhost vs 127.0.0.1 to identical lease lock', () => {
+  const key1 = bootstrapLeaseKey({ cdp: 'http://127.0.0.1:9241' });
+  const key2 = bootstrapLeaseKey({ cdp: 'http://localhost:9241' });
+  assert.equal(key1, key2);
 });
 
 test('assertNewChatBootstrapRoute: Throws on route drift before dispatch', () => {
