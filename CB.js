@@ -1019,6 +1019,28 @@ function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
   });
 }
 
+function browserLaneLeasePath(args) {
+  return path.join(CONVERSATION_LEASES_DIR, `lane-${bootstrapLeaseKey(args)}.lock`);
+}
+
+function acquireBrowserLaneLease(args, transactionId) {
+  return acquireNamedLease(
+    browserLaneLeasePath(args),
+    {
+      kind: 'browser_lane',
+      transactionId,
+      cdp: args.cdp || DEFAULT_CDP,
+      targetOrigin: TARGET_APP_BASE.origin,
+    },
+    'BROWSER_LANE_BUSY',
+    'Another process is currently mutating or sending through this target browser lane'
+  );
+}
+
+function releaseBrowserLaneLease(leaseHandle) {
+  return releaseConversationLease(leaseHandle);
+}
+
 function acquireBootstrapLease(args, transactionId) {
   return acquireNamedLease(
     bootstrapLeasePath(args),
@@ -6361,8 +6383,7 @@ async function runScheduledJob(page, job, runnerArgs) {
   if (target.action === 'new') {
     info(`[queue] #${job.seq} ${job.id}: starting new conversation under bootstrap lease${target.alias ? ` alias=${target.alias}` : ''}`);
   } else if (target.action === 'open') {
-    info(`[queue] #${job.seq} ${job.id}: opening conversation ${target.sessionId}${target.alias ? ` alias=${target.alias}` : ''}`);
-    await openConversationBySessionId(page, target.sessionId);
+    info(`[queue] #${job.seq} ${job.id}: targeting conversation ${target.sessionId}${target.alias ? ` alias=${target.alias}` : ''}`);
   } else {
     throw new Error(target.reason || 'scheduled job target is not runnable');
   }
@@ -6675,6 +6696,7 @@ async function watchTargetAppState(page, args) {
 }
 
 async function ask(page, message, args) {
+  let laneLease = null;
   let bootstrapLease = null;
   let leaseHandle = null;
 
@@ -6693,11 +6715,15 @@ async function ask(page, message, args) {
   }
 
   try {
+    laneLease = acquireBrowserLaneLease(args, args.jobId || randomId('lane-op'));
     if (isNewChat) {
       bootstrapLease = acquireBootstrapLease(args, args.jobId || randomId('bootstrap-op'));
       await openNewConversation(page);
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
+      if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+        await openConversationBySessionId(page, expectedSessionId);
+      }
       await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
     }
 
@@ -6820,9 +6846,17 @@ async function ask(page, message, args) {
       // Overlapping lease: acquire stable session lease while bootstrap lease is held
       leaseHandle = acquireConversationLease(candidateSessionId, round.id);
     }
-    refreshSessionTranscript(page, args);
+
+    const authoritativeSessionId = expectedSessionId || round.sessionId;
+    if (authoritativeSessionId) {
+      args.transcript = args.transcript || transcriptPathForSession(authoritativeSessionId);
+    } else {
+      refreshSessionTranscript(page, args);
+    }
     await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
-    appendTranscript(args.transcript, 'user', message);
+    if (args.transcript) {
+      appendTranscript(args.transcript, 'user', message);
+    }
 
     const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
     let response = '';
@@ -6834,7 +6868,7 @@ async function ask(page, message, args) {
         args.timeout,
         streamer ? (event) => streamer.update(event) : null,
         {
-          expectedSessionId: expectedSessionId || sessionIdFromUrl(page.url()),
+          expectedSessionId: authoritativeSessionId,
           acceptedUserTurnRef,
         }
       );
@@ -6877,6 +6911,7 @@ async function ask(page, message, args) {
   } finally {
     releaseConversationLease(leaseHandle);
     releaseBootstrapLease(bootstrapLease);
+    releaseBrowserLaneLease(laneLease);
   }
 }
 
@@ -7841,6 +7876,9 @@ module.exports = {
   normalizeIdentityText,
   normalizePromptForRenderedComparison,
   normalizeTurnText,
+  browserLaneLeasePath,
+  acquireBrowserLaneLease,
+  releaseBrowserLaneLease,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,

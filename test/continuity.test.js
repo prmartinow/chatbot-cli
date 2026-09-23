@@ -23,6 +23,9 @@ const {
   normalizeIdentityText,
   normalizePromptForRenderedComparison,
   normalizeTurnText,
+  browserLaneLeasePath,
+  acquireBrowserLaneLease,
+  releaseBrowserLaneLease,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,
@@ -531,4 +534,30 @@ test('Operational Contract: Dedicated browser tab/lane or serialized execution p
 
   releaseBootstrapLease(lease1);
   assert.equal(fs.existsSync(lease1.leasePath), false);
+});
+
+test('BrowserLaneLease: Exclusive acquisition per CDP endpoint and verified release', () => {
+  const mockArgs1 = { cdp: 'http://127.0.0.1:9241' };
+  const mockArgs2 = { cdp: 'http://127.0.0.1:9242' };
+
+  const handle1 = acquireBrowserLaneLease(mockArgs1, 'lane-op-1');
+  assert.notEqual(handle1, null);
+  assert.equal(fs.existsSync(handle1.leasePath), true);
+
+  // Second acquisition on same CDP port fails with BROWSER_LANE_BUSY
+  assert.throws(
+    () => acquireBrowserLaneLease(mockArgs1, 'lane-op-2'),
+    (err) => err.code === 'BROWSER_LANE_BUSY'
+  );
+
+  // Independent CDP endpoint does not block
+  const handle2 = acquireBrowserLaneLease(mockArgs2, 'lane-op-3');
+  assert.notEqual(handle2, null);
+  assert.equal(fs.existsSync(handle2.leasePath), true);
+
+  // Clean up
+  releaseBrowserLaneLease(handle1);
+  releaseBrowserLaneLease(handle2);
+  assert.equal(fs.existsSync(handle1.leasePath), false);
+  assert.equal(fs.existsSync(handle2.leasePath), false);
 });
