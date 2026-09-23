@@ -1741,6 +1741,9 @@ function printQueueStatus(args) {
 async function findTargetAppPage(browser, args = {}) {
   const context = browser.contexts()[0] || await browser.newContext();
   if (args.newTab) {
+    if (!args._laneLease) {
+      args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
+    }
     const page = await context.newPage();
     await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     return page;
@@ -6732,7 +6735,8 @@ async function ask(page, message, args) {
   }
 
   try {
-    laneLease = acquireBrowserLaneLease(args, args.jobId || randomId('lane-op'));
+    laneLease = args._laneLease || acquireBrowserLaneLease(args, args.jobId || randomId('lane-op'));
+    args._laneLease = null;
     if (isNewChat) {
       bootstrapLease = acquireBootstrapLease(args, args.jobId || randomId('bootstrap-op'));
       await openNewConversation(page);
@@ -7490,7 +7494,9 @@ async function interactive(page, args) {
     if (input.type === 'command' && (input.text === '/status' || input.text.startsWith('/status '))) {
       const deepStatus = /\b(deep|config|models?|inspect)\b/i.test(input.text);
       const state = await getTargetAppState(page);
-      const modelConfig = deepStatus ? await inspectStatusModelConfig(page) : null;
+      const modelConfig = deepStatus
+        ? await withBrowserLaneLease(args, randomId('interactive-deep-status'), () => inspectStatusModelConfig(page))
+        : null;
       console.log(summarizeState(state, modelConfig));
       continue;
     }
@@ -7530,7 +7536,7 @@ async function interactive(page, args) {
         console.log('Usage: /search <query>');
         continue;
       }
-      const result = await searchTargetApp(page, query);
+      const result = await withBrowserLaneLease(args, randomId('interactive-search'), () => searchTargetApp(page, query));
       printSearchResults(result);
       continue;
     }
@@ -7544,10 +7550,10 @@ async function interactive(page, args) {
         console.log('Usage: /search-all <query>');
         continue;
       }
-      const result = await searchTargetApp(page, query, {
+      const result = await withBrowserLaneLease(args, randomId('interactive-search-all'), () => searchTargetApp(page, query, {
         loadAll: true,
         maxScrolls: SEARCH_ALL_MAX_SCROLLS,
-      });
+      }));
       printSearchResults(result);
       continue;
     }
@@ -7609,7 +7615,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/download') {
-      const saved = await downloadLatestArtifacts(page, args);
+      const saved = await withBrowserLaneLease(args, randomId('interactive-download'), () => downloadLatestArtifacts(page, args));
       console.log(saved.map(formatSavedArtifact).join('\n'));
       printSavedArtifacts(saved);
       continue;
@@ -7704,17 +7710,9 @@ async function main() {
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
     if (passiveCurrentPageRead) {
       refreshSessionTranscript(page, args);
-    } else if (args.searchQuery) {
-      await settlePage(page);
-      refreshSessionTranscript(page, args);
     } else {
       await settlePage(page);
       refreshSessionTranscript(page, args);
-      if (!args.syncTranscript) {
-        await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch((error) => {
-          info(`[sync] ${error.message || error}`);
-        });
-      }
     }
 
     if (args.schedule) {
@@ -7739,11 +7737,12 @@ async function main() {
         if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
           await openConversationBySessionId(page, args.expectedSessionId);
         }
+        if (args.expectedSessionId) {
+          await assertThreadIdentity(page, args.expectedSessionId, 'before queue recovery');
+        }
         return await recoverScheduledQueue(page, args);
       };
-      const recovery = args.expectedSessionId
-        ? await withBrowserLaneLease(args, randomId('recover-queue-op'), action)
-        : await action();
+      const recovery = await withBrowserLaneLease(args, randomId('recover-queue-op'), action);
       printQueueRecovery(recovery, args.stateJsonl);
       return;
     }
@@ -7771,9 +7770,7 @@ async function main() {
         });
         return { result, recoveredRounds, activeSessionId, generation };
       };
-      const { result, recoveredRounds, activeSessionId, generation } = args.expectedSessionId
-        ? await withBrowserLaneLease(args, randomId('sync-op'), action)
-        : await action();
+      const { result, recoveredRounds, activeSessionId, generation } = await withBrowserLaneLease(args, randomId('sync-op'), action);
 
       const text = args.latestAssistant ? await latestAssistantText(page) : '';
       if (args.stateJsonl) {
@@ -7802,6 +7799,9 @@ async function main() {
         if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
           await openConversationBySessionId(page, args.expectedSessionId);
         }
+        if (args.expectedSessionId) {
+          await assertThreadIdentity(page, args.expectedSessionId, 'before latest assistant read');
+        }
         return await latestAssistantText(page);
       };
       const text = args.expectedSessionId
@@ -7817,6 +7817,9 @@ async function main() {
       const action = async () => {
         if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
           await openConversationBySessionId(page, args.expectedSessionId);
+        }
+        if (args.expectedSessionId) {
+          await assertThreadIdentity(page, args.expectedSessionId, 'before reading status');
         }
         const state = await getTargetAppState(page);
         state.branchInfo = await getBranchInfo(page).catch(() => null);
@@ -7859,9 +7862,7 @@ async function main() {
         }
         return result;
       };
-      const result = searchOpts.open
-        ? await withBrowserLaneLease(args, randomId('search-open-op'), action)
-        : await action();
+      const result = await withBrowserLaneLease(args, randomId('search-op'), action);
       printSearchResults(result, args.stateJsonl);
       return;
     }
@@ -7899,7 +7900,7 @@ async function main() {
     }
 
     if (args.downloadArtifacts && typeof args.message !== 'string') {
-      const saved = await downloadLatestArtifacts(page, args);
+      const saved = await withBrowserLaneLease(args, randomId('download-op'), () => downloadLatestArtifacts(page, args));
       console.log(saved.map(formatSavedArtifact).join('\n'));
       if (args.showArtifacts) printSavedArtifacts(saved);
       return;
@@ -7918,6 +7919,10 @@ async function main() {
 
     await interactive(page, args);
   } finally {
+    if (args._laneLease) {
+      releaseBrowserLaneLease(args._laneLease);
+      args._laneLease = null;
+    }
     await Promise.race([
       browser.close().catch(() => {}),
       new Promise((resolve) => setTimeout(resolve, 2000)),
@@ -7934,6 +7939,7 @@ if (require.main === module) {
 
 module.exports = {
   canonicalRawPrompt,
+  findTargetAppPage,
   syncTranscriptFromPage,
   prepareConversationForRead,
   roundAllowsTranscriptRecovery,

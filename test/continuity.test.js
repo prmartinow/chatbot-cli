@@ -27,6 +27,7 @@ const {
   acquireBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
+  findTargetAppPage,
   syncTranscriptFromPage,
   prepareConversationForRead,
   bootstrapLeaseKey,
@@ -618,4 +619,32 @@ test('prepareConversationForRead: Resolves expectedSessionId without calling pag
   await prepareConversationForRead(mockPage, mockArgs);
   assert.equal(mockArgs.expectedSessionId, '33333333-3333-4333-8333-333333333333');
   assert.equal(navCalled, false);
+});
+
+test('findTargetAppPage: Acquires and assigns browserLaneLease before creating newTab', async () => {
+  const mockArgs = {
+    newTab: true,
+    cdp: 'http://127.0.0.1:9241',
+  };
+  const mockBrowser = {
+    contexts: () => [{
+      newPage: async () => ({
+        goto: async () => {},
+      }),
+    }],
+    newContext: async () => ({
+      newPage: async () => ({
+        goto: async () => {},
+      }),
+    }),
+  };
+
+  const page = await findTargetAppPage(mockBrowser, mockArgs);
+  assert.notEqual(page, null);
+  assert.notEqual(mockArgs._laneLease, null);
+  assert.equal(fs.existsSync(mockArgs._laneLease.leasePath), true);
+
+  // Clean up
+  releaseBrowserLaneLease(mockArgs._laneLease);
+  assert.equal(fs.existsSync(mockArgs._laneLease.leasePath), false);
 });
