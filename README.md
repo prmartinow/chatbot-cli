@@ -106,10 +106,10 @@ behavior and reports if the blocker remains or is not safe to dismiss
 automatically.
 
 `--recover-interrupted` recovers from mid-generation connection drops or stream
-stalls ("Connection interrupted. Waiting for the complete answer"). It clicks
-the active stop control, reloads the exact same conversation URL, and verifies
-the composer is editable, keeping conversational cache intact without branching
-into a new conversation.
+stalls ("Connection interrupted. Waiting for the complete answer") fail-closed.
+It avoids clicking "Stop answering" or executing destructive naked page reloads
+(which risk stream desync and off-thread dispatch), instead passively tracking
+generation to completion and reconciling the turn via the write-ahead log.
 
 `--compact-conversation` parses the active or specified conversation transcript,
 extracts high-signal architecture details (overarching mission, verified code
@@ -263,6 +263,40 @@ Multiline paste works directly at `CB>`. Long pasted text that target app conver
 
 Long Markdown prompts are matched back to target app turns with normalized text anchors, so code fences, inline backticks, ProseMirror spacing, and collapsed "show more" rendering do not block response capture.
 
+
+## Continuity, Leases & Concurrency Architecture
+
+CB implements a fail-closed continuity architecture designed to prevent cross-thread
+prompt bleed, off-thread root dispatches, and false-success classifications:
+
+### Operational Concurrency Invariant
+- **Single-Writer-Per-CDP-Tab**: Exactly one mutating CB process may control a given
+  physical Chromium browser tab at a time.
+- Concurrent writers targeting different conversations must either:
+  1. Operate across distinct browser tabs / CDP contexts, or
+  2. Be scheduled and serialized sequentially through the queue runner.
+
+### Pre-Send Write-Ahead Log (WAL)
+- Every prompt dispatch journals through `outputs/scheduler/rounds.jsonl`.
+- State transitions are monotonic: `prepared` -> `dispatching` -> `accepted` (or `uncertain` / `aborted_precommit`).
+- Dead `prepared` processes cleanly abort without contaminating queues; dead `dispatching` processes isolate as `uncertain`.
+
+### Dual Writer Leases
+- **Conversation Leases**: File-backed locks (`outputs/scheduler/leases/<sessionId>.lock`) with atomic token validation prevent concurrent processes from sending into the same thread.
+- **Bootstrap Writer Leases**: Scoped per CDP endpoint (`bootstrap-<key>.lock`), held from new chat creation until post-send handoff, preventing concurrent processes from colliding on the root composer (`/`).
+
+### 3-Tier Stable-ID Turn Attestation
+- Candidate conversation IDs discovered after a new-chat dispatch must attest the accepted user prompt inside the target DOM before binding:
+  1. `message_id`: Exact match on `data-message-id`.
+  2. `testid_hash`: Exact match on turn testid and raw prompt content hash.
+  3. `unique_text_hash`: Unique prompt text match across mounted turns.
+- Mismatches or timeouts throw `NEW_SESSION_ATTRIBUTION_MISMATCH` / `NEW_SESSION_ATTRIBUTION_UNVERIFIED` and fail closed without reloading or blind resending.
+
+### Immutable Session Identity & Authoritative Recovery
+- Once a round is bound, `round.sessionId` and `expectedSessionId` are strictly immutable.
+- Response-error paths record observed page drift purely as diagnostic metadata (`observedSessionId`, `observedUrl`) without rewriting the authoritative round identity.
+- Completion persistence re-asserts thread identity before writing transcripts.
+- `roundAllowsTranscriptRecovery()` strictly requires authoritative binding (`not_applicable` or `attested`) and a durable stable UUID.
 
 ## Known recovery procedures
 
