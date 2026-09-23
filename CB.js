@@ -1041,6 +1041,15 @@ function releaseBrowserLaneLease(leaseHandle) {
   return releaseConversationLease(leaseHandle);
 }
 
+async function withBrowserLaneLease(args, operationId, fn) {
+  const lease = acquireBrowserLaneLease(args, operationId);
+  try {
+    return await fn();
+  } finally {
+    releaseBrowserLaneLease(lease);
+  }
+}
+
 function acquireBootstrapLease(args, transactionId) {
   return acquireNamedLease(
     bootstrapLeasePath(args),
@@ -1236,11 +1245,13 @@ function upsertConversation(index, patch) {
 }
 
 async function indexCurrentConversation(page, args, event = 'conversation_observed', extra = {}) {
-  const { suppressAlias = false, indexAlias, ...recordExtra } = extra;
-  const sessionId = sessionIdFromUrl(page.url());
+  const { suppressAlias = false, indexAlias, expectedSessionId = '', preserveTranscript = false, ...recordExtra } = extra;
+  const sessionId = expectedSessionId || sessionIdFromUrl(page.url());
   if (!sessionId) return null;
 
-  refreshSessionTranscript(page, args);
+  if (!preserveTranscript) {
+    refreshSessionTranscript(page, args);
+  }
   const title = await page.title().catch(() => '');
   const turns = await getConversationTurns(page).catch(() => []);
   const latestAssistant = [...turns].reverse()
@@ -5896,7 +5907,7 @@ async function prepareConversationForPrompt(page, args) {
     throw new Error(`Conversation "${args.conversation}" is not resolved to a target app session id yet`);
   }
   args.expectedSessionId = sessionId;
-  await openConversationBySessionId(page, sessionId);
+  // Navigation for existing threads is ask()-owned strictly under the acquired browserLaneLease
 }
 
 async function prepareConversationForRead(page, args) {
@@ -5909,12 +5920,14 @@ async function prepareConversationForRead(page, args) {
     throw new Error(`Conversation "${args.conversation}" is not resolved to a target app session id yet`);
   }
   args.expectedSessionId = sessionId;
-  await openConversationBySessionId(page, sessionId);
-  refreshSessionTranscript(page, args);
+  await withBrowserLaneLease(args, randomId('read-nav'), async () => {
+    await openConversationBySessionId(page, sessionId);
+    refreshSessionTranscript(page, args);
+  });
 }
 
-function recordPromptConversation(args, page, response) {
-  const sessionId = sessionIdFromUrl(page.url());
+function recordPromptConversation(args, page, response, explicitSessionId = '') {
+  const sessionId = explicitSessionId || args.expectedSessionId || sessionIdFromUrl(page.url());
   if (!sessionId && !args.alias) return null;
   return withSchedulerLock(() => {
     const index = loadConversationIndex();
@@ -5923,7 +5936,7 @@ function recordPromptConversation(args, page, response) {
       alias,
       sessionId,
       status: sessionId ? 'active' : 'pending',
-      url: page.url(),
+      url: sessionId ? targetConversationUrl(sessionId) : page.url(),
       transcript: sessionId ? transcriptPathForSession(sessionId) : '',
       cdp: args.cdp,
       lastResponseChars: response.length,
@@ -6021,8 +6034,8 @@ function finishScheduledJob(jobId, patch, eventType) {
   });
 }
 
-function recordResolvedConversation(job, page, response) {
-  const sessionId = sessionIdFromUrl(page.url());
+function recordResolvedConversation(job, page, response, explicitSessionId = '') {
+  const sessionId = explicitSessionId || sessionIdFromUrl(page.url());
   if (!sessionId) return null;
   return withSchedulerLock(() => {
     const index = loadConversationIndex();
@@ -6031,7 +6044,7 @@ function recordResolvedConversation(job, page, response) {
       alias,
       sessionId,
       status: 'active',
-      url: page.url(),
+      url: targetConversationUrl(sessionId),
       title: '',
       transcript: transcriptPathForSession(sessionId),
       cdp: job.cdp || '',
@@ -6106,6 +6119,7 @@ function queueHoldStatusForError(error) {
     case 'CONVERSATION_NOT_HYDRATED':
     case 'CONVERSATION_LEASE_BUSY':
     case 'BOOTSTRAP_LEASE_BUSY':
+    case 'BROWSER_LANE_BUSY':
     case 'NEW_SESSION_ID_UNCERTAIN':
     case 'NEW_SESSION_ATTRIBUTION_MISMATCH':
     case 'NEW_SESSION_ATTRIBUTION_UNVERIFIED':
@@ -6411,8 +6425,8 @@ async function runScheduledJob(page, job, runnerArgs) {
     stream: runnerArgs.stream && job.options?.stream !== false,
   };
   const response = await ask(page, job.message, jobArgs);
-  const conversation = recordResolvedConversation(job, page, response);
-  const sessionId = sessionIdFromUrl(page.url());
+  const sessionId = jobArgs.expectedSessionId || sessionIdFromUrl(page.url());
+  const conversation = recordResolvedConversation(job, page, response, sessionId);
   return {
     completedAt: nowIso(),
     sessionId,
@@ -6849,14 +6863,18 @@ async function ask(page, message, args) {
 
     const authoritativeSessionId = expectedSessionId || round.sessionId;
     if (authoritativeSessionId) {
-      args.transcript = args.transcript || transcriptPathForSession(authoritativeSessionId);
+      await assertThreadIdentity(page, authoritativeSessionId, 'before persisting accepted user turn');
+      args.transcript = args.transcriptOverride ? args.transcript : transcriptPathForSession(authoritativeSessionId);
     } else {
       refreshSessionTranscript(page, args);
     }
-    await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
     if (args.transcript) {
       appendTranscript(args.transcript, 'user', message);
     }
+    await indexCurrentConversation(page, args, 'conversation_prompt_accepted', {
+      expectedSessionId: authoritativeSessionId,
+      preserveTranscript: true,
+    }).catch(() => {});
 
     const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
     let response = '';
@@ -6901,7 +6919,10 @@ async function ask(page, message, args) {
       url: finalSessionId ? targetConversationUrl(finalSessionId) : page.url(),
       transcript: finalTranscript,
     }, 'round_completed');
-    await indexCurrentConversation(page, args, 'conversation_turn_completed').catch(() => {});
+    await indexCurrentConversation(page, args, 'conversation_turn_completed', {
+      expectedSessionId: finalSessionId,
+      preserveTranscript: true,
+    }).catch(() => {});
     if (args.downloadArtifacts) {
       const saved = await downloadLatestArtifacts(page, args);
       info(`[artifacts] saved ${saved.length} item(s): ${saved.map(formatSavedArtifact).join(', ')}`);
@@ -7380,16 +7401,11 @@ async function executeCompactionHandoff(page, args) {
   - Markdown: ${result.mdPath}
   - Turn 1 Prompt: ${result.promptPath}`);
 
-  info('[handoff] Navigating to fresh conversation on ChatGPT...');
-  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await settlePage(page);
-
   args.newConversation = true;
   args.conversation = '';
   args.handoffNewSession = true;
-  refreshSessionTranscript(page, args);
 
-  info('[handoff] Submitting Turn 1 compaction seed prompt...');
+  info('[handoff] Submitting Turn 1 compaction seed prompt under bootstrap lease...');
   const response = await ask(page, result.turn1Prompt, args);
 
   console.log('\n================================================================================');
@@ -7815,19 +7831,19 @@ async function main() {
     }
 
     if (args.recoverInterrupted) {
-      const recovery = await recoverInterruptedConnection(page, args);
+      const recovery = await withBrowserLaneLease(args, randomId('recover-op'), () => recoverInterruptedConnection(page, args));
       console.log(recovery.recovered ? `Recovery successful on ${recovery.url}. Composer is ready.` : `Recovery failed: ${recovery.error || 'Composer not ready'}`);
       return;
     }
 
     if (args.models) {
-      const options = await listModelOptions(page);
+      const options = await withBrowserLaneLease(args, randomId('models-op'), () => listModelOptions(page));
       console.log(options.length ? options.join('\n') : 'No visible model options found.');
       return;
     }
 
     if (args.stop) {
-      const stopped = await stopGeneration(page);
+      const stopped = await withBrowserLaneLease(args, randomId('stop-op'), () => stopGeneration(page));
       console.log(stopped ? `Clicked generation control: ${stopped}` : 'No visible generation control found.');
       return;
     }
@@ -7844,7 +7860,7 @@ async function main() {
       if (!message) throw new Error('No message provided');
       await prepareConversationForPrompt(page, args);
       const response = await ask(page, message, args);
-      recordPromptConversation(args, page, response);
+      recordPromptConversation(args, page, response, args.expectedSessionId);
       if (!args.stream) console.log(response);
       console.error(`Saved transcript: ${args.transcript}`);
       return;
@@ -7879,6 +7895,7 @@ module.exports = {
   browserLaneLeasePath,
   acquireBrowserLaneLease,
   releaseBrowserLaneLease,
+  withBrowserLaneLease,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,

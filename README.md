@@ -105,11 +105,11 @@ sending a prompt or running another UI feature. It only uses safe close/Escape
 behavior and reports if the blocker remains or is not safe to dismiss
 automatically.
 
-`--recover-interrupted` recovers from mid-generation connection drops or stream
-stalls ("Connection interrupted. Waiting for the complete answer") fail-closed.
-It avoids clicking "Stop answering" or executing destructive naked page reloads
-(which risk stream desync and off-thread dispatch), instead passively tracking
-generation to completion and reconciling the turn via the write-ahead log.
+`--recover-interrupted` inspects connection and generation state fail-closed.
+If generation is actively in progress, it refuses destructive action and leaves
+the active answer stream intact. If generation has finished and the UI has settled,
+it hydrates the target conversation and verifies the composer is editable without
+performing destructive reloads or clicking Stop.
 
 `--compact-conversation` parses the active or specified conversation transcript,
 extracts high-signal architecture details (overarching mission, verified code
@@ -166,9 +166,9 @@ node CB.js --queue-status
 `--run-queue` processes scheduled prompts in strict queue order. It only considers the first non-done job: `running`, `waiting`, `needs_recovery`, or `failed` jobs block later pending work until they are recovered, reset, or intentionally skipped. It sends one prompt, waits for target app to finish, records the transcript/session id, then starts the next queued prompt. If target app is still generating when a timeout fires, the job is held as `waiting` and the runner stops instead of marking it failed and continuing. Pre-send UI blockers such as subscription modals or `modal-conversation-history-rate-limit` are held as `needs_recovery`; no prompt is considered submitted and the next queued job must not start. Known safe blockers such as `#modal-subscription-failure` and identified artifact/lightbox close overlays are auto-dismissed by clicking only visible Close controls and then rechecking the blocker state. Payment, upgrade, login, captcha, destructive, or unknown dialogs are not clicked. A follow-up can target a future conversation alias before target app has assigned the real `/c/<session-id>`; the first `--new-conversation --alias ...` job resolves that alias after the answer lands, and later jobs open the resolved session id.
 
 If a new-conversation job displays the submitted user turn but the backend never
-assigns a `/c/<session-id>` URL, CB reloads once after the acceptance window. If
-the session id still does not appear, the job is held as `needs_recovery` and
-the queue stops instead of waiting forever or advancing to the next prompt.
+assigns a stable `/c/<session-id>` UUID, CB deliberately does not reload (which
+would discard the in-flight stream). Instead, it throws `NEW_SESSION_ID_UNCERTAIN`
+fail-closed, marks the job as `needs_recovery`, and halts the queue.
 
 `--recover-queue` never sends a new prompt. It syncs the active target app conversation, skips any in-flight assistant preface while the stop control is visible, updates matching rounds/jobs after the final answer is complete, audits already-done jobs for stale response counts, and reports the first queue blocker or next pending job. Use `--conversation <session-id-or-alias>` with `--recover-queue`, `--sync-transcript`, `--latest-assistant`, or `--status` to inspect or recover a specific existing conversation without sending a message. Scheduler completion is driven by target app state, not by a timer: queued jobs have no response timeout by default, and older jobs that only stored the default `180000` timeout do not inherit it. Use `--timeout <ms>` only as an explicit watchdog, or `--timeout 0` to force no timeout.
 
@@ -185,10 +185,9 @@ prompt text or a recognized long-form pasted-text attachment. After submitting,
 it waits for a matching user turn to appear after the baseline turn before it
 records the prompt as accepted or appends it to the transcript.
 For brand-new conversations, the matching user turn is not enough: CB also
-requires the URL to move to `/c/<session-id>`. If no session id appears within
-30 seconds, CB reloads once and rechecks. If the session id still does not
-appear, CB treats the send as recoverable and does not append transcript or
-index state for that prompt.
+requires the URL to move to a stable `/c/<session-id>` UUID. If no stable session id
+appears within the acceptance timeout, CB fails closed with `NEW_SESSION_ID_UNCERTAIN`
+without reloading. The transaction is marked uncertain and preserved for manual inspection.
 Before typing or clicking send, CB also checks the center point of the composer
 and send button with `document.elementFromPoint()`. If a visible modal, dialog,
 or open overlay covers that point and cannot be safely dismissed, CB reports a
@@ -270,20 +269,23 @@ CB implements a fail-closed continuity architecture designed to prevent cross-th
 prompt bleed, off-thread root dispatches, and false-success classifications:
 
 ### Operational Concurrency Invariant
-- **Single-Writer-Per-CDP-Tab**: Exactly one mutating CB process may control a given
-  physical Chromium browser tab at a time.
-- Concurrent writers targeting different conversations must either:
-  1. Operate across distinct browser tabs / CDP contexts, or
-  2. Be scheduled and serialized sequentially through the queue runner.
+- **Single-Writer-Per-CDP-Endpoint**: Exactly one mutating CB process may control a given
+  physical Chromium browser instance / CDP endpoint at a time.
+- All mutating commands (sending prompts, navigating conversations, selecting models/reasoning,
+  uploading attachments, and dismissing blockers) acquire a browser-lane lease keyed by the
+  normalized CDP endpoint URL (e.g. `http://127.0.0.1:9241`).
+- Concurrent writers must target distinct CDP ports/browser instances or serialize sequentially
+  through the queue runner.
 
 ### Pre-Send Write-Ahead Log (WAL)
 - Every prompt dispatch journals through `outputs/scheduler/rounds.jsonl`.
 - State transitions are monotonic: `prepared` -> `dispatching` -> `accepted` (or `uncertain` / `aborted_precommit`).
 - Dead `prepared` processes cleanly abort without contaminating queues; dead `dispatching` processes isolate as `uncertain`.
 
-### Dual Writer Leases
-- **Conversation Leases**: File-backed locks (`outputs/scheduler/leases/<sessionId>.lock`) with atomic token validation prevent concurrent processes from sending into the same thread.
-- **Bootstrap Writer Leases**: Scoped per CDP endpoint (`bootstrap-<key>.lock`), held from new chat creation until post-send handoff, preventing concurrent processes from colliding on the root composer (`/`).
+### Three-Layer Writer Leases
+- **Browser-Lane Lease**: Scoped per CDP endpoint (`outputs/scheduler/leases/lane-<key>.lock`), acquired at the start of any mutating operation (including navigation, model selection, attachments, and prompt dispatch) and held until completion, ensuring no second process can clobber the physical tab.
+- **Bootstrap Writer Lease**: Scoped per CDP endpoint (`bootstrap-<key>.lock`), held from root composer setup until post-send stable-ID attestation, preventing concurrent processes from colliding on `/`.
+- **Conversation Lease**: File-backed lock (`<sessionId>.lock`) with atomic token validation, preventing concurrent processes from appending into the same conversation.
 
 ### 3-Tier Stable-ID Turn Attestation
 - Candidate conversation IDs discovered after a new-chat dispatch must attest the accepted user prompt inside the target DOM before binding:

@@ -26,6 +26,7 @@ const {
   browserLaneLeasePath,
   acquireBrowserLaneLease,
   releaseBrowserLaneLease,
+  withBrowserLaneLease,
   bootstrapLeaseKey,
   bootstrapLeasePath,
   acquireBootstrapLease,
@@ -224,6 +225,8 @@ test('queueHoldStatusForError: Maps invariant error codes to state machine', () 
   assert.equal(queueHoldStatusForError({ code: 'DISPATCH_UNCERTAIN' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_NOT_HYDRATED' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_LEASE_BUSY' }), 'needs_recovery');
+  assert.equal(queueHoldStatusForError({ code: 'BOOTSTRAP_LEASE_BUSY' }), 'needs_recovery');
+  assert.equal(queueHoldStatusForError({ code: 'BROWSER_LANE_BUSY' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'NEW_SESSION_ID_UNCERTAIN' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'THREAD_IDENTITY_DRIFT' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'CONCURRENT_CONVERSATION_MUTATION' }), 'failed');
@@ -560,4 +563,27 @@ test('BrowserLaneLease: Exclusive acquisition per CDP endpoint and verified rele
   releaseBrowserLaneLease(handle2);
   assert.equal(fs.existsSync(handle1.leasePath), false);
   assert.equal(fs.existsSync(handle2.leasePath), false);
+});
+
+test('withBrowserLaneLease: Executes action under exclusive lane lock and verifies release', async () => {
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  let insideRan = false;
+
+  await withBrowserLaneLease(mockArgs, 'op-wrapper', async () => {
+    insideRan = true;
+    // Inside callback, lane lease exists
+    const p = browserLaneLeasePath(mockArgs);
+    assert.equal(fs.existsSync(p), true);
+
+    // Concurrent acquisition fails
+    assert.throws(
+      () => acquireBrowserLaneLease(mockArgs, 'op-concurrent'),
+      (err) => err.code === 'BROWSER_LANE_BUSY'
+    );
+  });
+
+  assert.equal(insideRan, true);
+  // Outside callback, lease is cleanly released
+  const p = browserLaneLeasePath(mockArgs);
+  assert.equal(fs.existsSync(p), false);
 });
