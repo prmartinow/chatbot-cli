@@ -27,6 +27,7 @@ const {
   acquireBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
+  takeBrowserLaneLease,
   findTargetAppPage,
   syncTranscriptFromPage,
   prepareConversationForRead,
@@ -633,6 +634,54 @@ test('findTargetAppPage: Acquires and assigns browserLaneLease before creating n
       }),
     }],
     newContext: async () => ({
+      newPage: async () => ({
+        goto: async () => {},
+      }),
+    }),
+  };
+
+  const page = await findTargetAppPage(mockBrowser, mockArgs);
+  assert.notEqual(page, null);
+  assert.notEqual(mockArgs._laneLease, null);
+  assert.equal(fs.existsSync(mockArgs._laneLease.leasePath), true);
+
+  // Clean up
+  releaseBrowserLaneLease(mockArgs._laneLease);
+  assert.equal(fs.existsSync(mockArgs._laneLease.leasePath), false);
+});
+
+test('takeBrowserLaneLease & withBrowserLaneLease: Adopts pre-acquired args._laneLease without self-conflict', async () => {
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  mockArgs._laneLease = acquireBrowserLaneLease(mockArgs, 'pre-held-op');
+  assert.notEqual(mockArgs._laneLease, null);
+
+  let ran = false;
+  await withBrowserLaneLease(mockArgs, 'adopted-op', async () => {
+    ran = true;
+    assert.equal(mockArgs._laneLease, null);
+    const p = browserLaneLeasePath(mockArgs);
+    assert.equal(fs.existsSync(p), true);
+  });
+
+  assert.equal(ran, true);
+  const p = browserLaneLeasePath(mockArgs);
+  assert.equal(fs.existsSync(p), false);
+});
+
+test('findTargetAppPage: Acquires browserLaneLease for fallback page creation when no existing target page is open', async () => {
+  const mockArgs = {
+    newTab: false,
+    cdp: 'http://127.0.0.1:9241',
+  };
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [],
+      newPage: async () => ({
+        goto: async () => {},
+      }),
+    }],
+    newContext: async () => ({
+      pages: () => [],
       newPage: async () => ({
         goto: async () => {},
       }),

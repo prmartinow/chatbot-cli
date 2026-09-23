@@ -1048,8 +1048,17 @@ function releaseBrowserLaneLease(leaseHandle) {
   return releaseConversationLease(leaseHandle);
 }
 
+function takeBrowserLaneLease(args, operationId) {
+  if (args._laneLease) {
+    const lease = args._laneLease;
+    args._laneLease = null;
+    return lease;
+  }
+  return acquireBrowserLaneLease(args, operationId);
+}
+
 async function withBrowserLaneLease(args, operationId, fn) {
-  const lease = acquireBrowserLaneLease(args, operationId);
+  const lease = takeBrowserLaneLease(args, operationId);
   try {
     return await fn();
   } finally {
@@ -1739,11 +1748,11 @@ function printQueueStatus(args) {
 }
 
 async function findTargetAppPage(browser, args = {}) {
-  const context = browser.contexts()[0] || await browser.newContext();
   if (args.newTab) {
     if (!args._laneLease) {
       args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
     }
+    const context = browser.contexts()[0] || await browser.newContext();
     const page = await context.newPage();
     await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     return page;
@@ -1754,8 +1763,12 @@ async function findTargetAppPage(browser, args = {}) {
     if (page) return page;
   }
 
+  if (!args._laneLease) {
+    args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
+  }
+  const context = browser.contexts()[0] || await browser.newContext();
   const page = await context.newPage();
-  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded' });
+  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   return page;
 }
 
@@ -6735,8 +6748,7 @@ async function ask(page, message, args) {
   }
 
   try {
-    laneLease = args._laneLease || acquireBrowserLaneLease(args, args.jobId || randomId('lane-op'));
-    args._laneLease = null;
+    laneLease = takeBrowserLaneLease(args, args.jobId || randomId('lane-op'));
     if (isNewChat) {
       bootstrapLease = acquireBootstrapLease(args, args.jobId || randomId('bootstrap-op'));
       await openNewConversation(page);
@@ -7402,7 +7414,7 @@ ${compaction.latestRecommendations}
 
 async function executeCompactionHandoff(page, args) {
   info('[handoff] Extracting and compacting context from current thread...');
-  const result = await compactActiveConversation(page, args);
+  const result = await withBrowserLaneLease(args, randomId('handoff-compact'), () => compactActiveConversation(page, args));
   info(`[handoff] Compaction artifacts saved to:
   - JSON: ${result.jsonPath}
   - Markdown: ${result.mdPath}
@@ -7626,7 +7638,7 @@ async function interactive(page, args) {
       continue;
     }
     if (input.type === 'command' && input.text === '/compact') {
-      const result = await compactActiveConversation(page, args);
+      const result = await withBrowserLaneLease(args, randomId('interactive-compact'), () => compactActiveConversation(page, args));
       console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
       console.log(`Markdown: ${result.mdPath}`);
       console.log(`Prompt: ${result.promptPath}`);
@@ -7708,12 +7720,7 @@ async function main() {
   try {
     const page = await findTargetAppPage(browser, args);
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
-    if (passiveCurrentPageRead) {
-      refreshSessionTranscript(page, args);
-    } else {
-      await settlePage(page);
-      refreshSessionTranscript(page, args);
-    }
+    refreshSessionTranscript(page, args);
 
     if (args.schedule) {
       const job = enqueueScheduledJob(args, page);
@@ -7722,7 +7729,7 @@ async function main() {
     }
 
     if (args.runQueue) {
-      const recovery = await recoverScheduledQueue(page, args);
+      const recovery = await withBrowserLaneLease(args, randomId('run-queue-recovery'), () => recoverScheduledQueue(page, args));
       if (recovery.blocked) {
         printQueueRecovery(recovery, args.stateJsonl);
         return;
@@ -7753,6 +7760,9 @@ async function main() {
         if (args.expectedSessionId && sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
           await openConversationBySessionId(page, args.expectedSessionId);
         }
+        if (args.expectedSessionId) {
+          await assertThreadIdentity(page, args.expectedSessionId, 'before transcript synchronization');
+        }
         const state = await getTargetAppState(page).catch(() => null);
         const generation = await getCombinedGenerationState(page, state);
         const result = await syncTranscriptFromPage(page, args, { state, generation });
@@ -7768,11 +7778,11 @@ async function main() {
         }).catch((error) => {
           info(`[index] ${error.message || error}`);
         });
-        return { result, recoveredRounds, activeSessionId, generation };
+        const text = args.latestAssistant ? await latestAssistantText(page) : '';
+        return { result, recoveredRounds, activeSessionId, generation, text };
       };
-      const { result, recoveredRounds, activeSessionId, generation } = await withBrowserLaneLease(args, randomId('sync-op'), action);
+      const { result, recoveredRounds, activeSessionId, generation, text } = await withBrowserLaneLease(args, randomId('sync-op'), action);
 
-      const text = args.latestAssistant ? await latestAssistantText(page) : '';
       if (args.stateJsonl) {
         console.log(JSON.stringify({
           type: 'transcript_sync',
@@ -7868,7 +7878,7 @@ async function main() {
     }
 
     if (args.compactConversation) {
-      const result = await compactActiveConversation(page, args);
+      const result = await withBrowserLaneLease(args, randomId('compact-op'), () => compactActiveConversation(page, args));
       console.log(`Compacted session ${result.compaction.sessionId} (${result.compaction.turnCount} turns):`);
       console.log(`JSON: ${result.jsonPath}`);
       console.log(`Markdown: ${result.mdPath}`);
@@ -7952,6 +7962,7 @@ module.exports = {
   normalizeTurnText,
   browserLaneLeasePath,
   acquireBrowserLaneLease,
+  takeBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
   bootstrapLeaseKey,
