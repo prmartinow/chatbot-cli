@@ -27,8 +27,17 @@ const TARGET_APP_BRAND_TOKEN = ['chat', 'gpt'].join('');
 const TARGET_APP_BASE_URL = normalizeTargetAppUrl(process.env.CHATBOT_WEB_URL || `https://${TARGET_APP_BRAND_TOKEN}.com/`);
 const TARGET_APP_BASE = new URL(TARGET_APP_BASE_URL);
 const CDP_CONNECT_TIMEOUT_MS = Number(process.env.CHATBOT_CDP_CONNECT_TIMEOUT_MS || 60000);
-const SESSION_ID_RE = /^(?:WEB:)?[a-f0-9-]{20,}$/i;
+const STABLE_SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
+const ROUTE_SESSION_ID_RE = /^(?:WEB:)?[a-f0-9-]{20,}$/i;
+const SESSION_ID_RE = STABLE_SESSION_ID_RE;
 const PASTE_SETTLE_MS = 1000;
+
+function cbError(code, message, meta = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, meta);
+  return error;
+}
 const RESPONSE_POLL_MS = 3000;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 180000;
 const RESPONSE_STABLE_FALLBACK_MS = 30000;
@@ -471,9 +480,14 @@ function ensureTranscript(filePath) {
   }
 }
 
-function appendTranscript(filePath, role, text) {
+function formatTranscriptEntry(role, text, at = null) {
   const label = role === 'user' ? 'USER' : 'ASSISTANT';
-  const entry = `[${new Date().toISOString()}] ${label}\n${text.trim()}\n\n`;
+  const timestamp = at || new Date().toISOString();
+  return `[${timestamp}] ${label}\n${text.trim()}\n\n`;
+}
+
+function appendTranscript(filePath, role, text, at = null) {
+  const entry = formatTranscriptEntry(role, text, at);
   fs.appendFileSync(filePath, entry, 'utf8');
 }
 
@@ -532,38 +546,47 @@ async function getCombinedGenerationState(page, state = null) {
 
 async function getBranchInfo(page, index = null) {
   if (!page) return null;
-  const url = page.url ? page.url() : '';
 
-  // Vector 1: Ephemeral route prefix (/c/WEB:<uuid>)
-  const isEphemeralRoute = /\/c\/WEB:[a-f0-9-]+/i.test(url);
-  const ephemeralSessionId = isEphemeralRoute ? (url.match(/\/c\/(WEB:[a-f0-9-]+)/i)?.[1] || '') : '';
-
-  // Vector 2 & Vector 3: Live DOM evaluation (branch divider and sidebar/document title)
+  // Single atomic evaluate capturing location and live DOM
   const domInfo = await page.evaluate(() => {
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
 
-    // Vector 2: Divider element
+    const href = location.href;
+    const pathname = location.pathname;
+
+    // Vector 2: Divider element (scoped to outside conversation turns)
     const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'));
     const branchLink = Array.from(document.querySelectorAll('a[href*="/c/"]'))
-      .find((a) => textOf(a.parentElement).startsWith('Branched from') || textOf(a).startsWith('Branched from'));
+      .filter(isVisible)
+      .filter((a) => !a.closest('[data-testid^="conversation-turn-"]'))
+      .find((a) => {
+        const parentText = textOf(a.parentElement);
+        const selfText = textOf(a);
+        return parentText.startsWith('Branched from') || selfText.startsWith('Branched from');
+      });
 
     let dividerData = null;
     if (branchLink) {
-      const dividerContainer = branchLink.closest('.mx-auto') || branchLink;
       let precedingTurnCount = 0;
+      const postDividerTurnTestids = [];
       for (const turn of turns) {
-        if (turn.compareDocumentPosition(dividerContainer) & 4) { // Node.DOCUMENT_POSITION_FOLLOWING
+        if (turn.compareDocumentPosition(branchLink) & 4) { // Node.DOCUMENT_POSITION_FOLLOWING
           precedingTurnCount++;
+        } else {
+          const testid = turn.getAttribute('data-testid');
+          if (testid) postDividerTurnTestids.push(testid);
         }
       }
 
-      const href = branchLink.getAttribute('href') || '';
-      const parentSessionMatch = href.match(/\/c\/([a-f0-9-]+)/i);
+      const linkHref = branchLink.getAttribute('href') || '';
+      const parentSessionMatch = linkHref.match(/\/c\/([a-f0-9-]+)/i);
       dividerData = {
         hasDivider: true,
         branchText: textOf(branchLink.parentElement) || textOf(branchLink),
         parentSessionId: parentSessionMatch ? parentSessionMatch[1] : '',
         precedingTurnCount,
+        postDividerTurnTestids,
         totalTurns: turns.length,
       };
     }
@@ -574,43 +597,66 @@ async function getBranchInfo(page, index = null) {
     const docTitle = document.title || '';
 
     return {
+      href,
+      pathname,
       dividerData,
       sidebarTitle,
       docTitle,
     };
   }).catch(() => null);
 
-  const titleToCheck = domInfo?.docTitle || domInfo?.sidebarTitle || '';
-  const branchTitleMatch = titleToCheck.match(/^Branch\s*[·•\-\|]\s*(.+)$/i);
+  if (!domInfo) return null;
+
+  // Vector 1: Ephemeral route prefix (/c/WEB:<uuid>)
+  const isEphemeralRoute = /\/c\/WEB:[a-f0-9-]+/i.test(domInfo.pathname);
+  const ephemeralSessionId = isEphemeralRoute ? (domInfo.pathname.match(/\/c\/(WEB:[a-f0-9-]+)/i)?.[1] || '') : '';
+  const routeKind = isEphemeralRoute ? 'provisional' : 'stable';
+
+  // Title vector check (both docTitle and sidebarTitle)
+  const docTitleMatch = (domInfo.docTitle || '').match(/^Branch\s*[·•\-\|]\s*(.+)$/i);
+  const sidebarTitleMatch = (domInfo.sidebarTitle || '').match(/^Branch\s*[·•\-\|]\s*(.+)$/i);
+  const branchTitleMatch = docTitleMatch || sidebarTitleMatch;
   const hasBranchTitlePrefix = Boolean(branchTitleMatch);
   const inferredParentTitle = branchTitleMatch ? branchTitleMatch[1].trim() : '';
 
-  const hasDivider = Boolean(domInfo?.dividerData?.hasDivider);
-  const isFork = Boolean(isEphemeralRoute || hasDivider || hasBranchTitlePrefix);
-  if (!isFork) return null;
+  const hasDivider = Boolean(domInfo.dividerData?.hasDivider);
+  // Ephemeral route alone proves provisional routing, NOT fork lineage!
+  const isFork = Boolean(hasDivider || hasBranchTitlePrefix);
+  if (!isFork && !isEphemeralRoute) return null;
 
   const detectionVectors = [];
   if (isEphemeralRoute) detectionVectors.push('ephemeral_route');
   if (hasDivider) detectionVectors.push('dom_divider');
   if (hasBranchTitlePrefix) detectionVectors.push('title_prefix');
 
-  let parentSessionId = domInfo?.dividerData?.parentSessionId || '';
+  let parentSessionId = domInfo.dividerData?.parentSessionId || '';
+  if (parentSessionId && !STABLE_SESSION_ID_RE.test(parentSessionId)) {
+    parentSessionId = '';
+  }
+
   if (!parentSessionId && inferredParentTitle && index?.conversations) {
     const parentByTitle = index.conversations.find((c) => c.title && c.title.trim().toLowerCase() === inferredParentTitle.toLowerCase());
-    if (parentByTitle?.sessionId) {
+    if (parentByTitle?.sessionId && STABLE_SESSION_ID_RE.test(parentByTitle.sessionId)) {
       parentSessionId = parentByTitle.sessionId;
     }
   }
 
+  // forkTurn is nullable: integer count if verified by divider, otherwise null
+  const forkTurn = hasDivider && typeof domInfo.dividerData?.precedingTurnCount === 'number'
+    ? domInfo.dividerData.precedingTurnCount
+    : null;
+
   return {
-    isFork: true,
+    isFork,
+    routeKind,
     detectionVectors,
     isEphemeralRoute,
     ephemeralSessionId,
     parentSessionId,
     inferredParentTitle,
-    forkTurn: domInfo?.dividerData?.precedingTurnCount ?? 0,
-    branchText: domInfo?.dividerData?.branchText || (hasBranchTitlePrefix ? titleToCheck : ''),
+    forkTurn,
+    postDividerTurnTestids: domInfo.dividerData?.postDividerTurnTestids || [],
+    branchText: domInfo.dividerData?.branchText || (hasBranchTitlePrefix ? (domInfo.docTitle || domInfo.sidebarTitle) : ''),
   };
 }
 
@@ -618,27 +664,39 @@ async function syncTranscriptFromPage(page, args, options = {}) {
   refreshSessionTranscript(page, args);
   ensureTranscript(args.transcript);
 
-  const branchInfo = await getBranchInfo(page).catch(() => null);
+  const index = loadConversationIndex();
+  const branchInfo = await getBranchInfo(page, index).catch(() => null);
   let transcriptText = fs.readFileSync(args.transcript, 'utf8');
   let entries = parseTranscriptEntries(transcriptText);
 
-  if (entries.length === 0 && branchInfo?.parentSessionId) {
+  // Copy-on-fork transcript seeding: strictly fail-closed
+  if (entries.length === 0
+    && branchInfo?.isFork
+    && branchInfo.parentSessionId
+    && STABLE_SESSION_ID_RE.test(branchInfo.parentSessionId)
+    && Number.isInteger(branchInfo.forkTurn)
+    && branchInfo.forkTurn > 0) {
     const parentTranscriptPath = transcriptPathForSession(branchInfo.parentSessionId);
     if (fs.existsSync(parentTranscriptPath)) {
       const parentText = fs.readFileSync(parentTranscriptPath, 'utf8');
       const parentEntries = parseTranscriptEntries(parentText);
-      const prefixCount = branchInfo.forkTurn > 0 ? branchInfo.forkTurn : parentEntries.length;
-      const seedEntries = parentEntries.slice(0, prefixCount);
+      if (parentEntries.length >= branchInfo.forkTurn) {
+        const seedEntries = parentEntries.slice(0, branchInfo.forkTurn);
+        if (seedEntries.length > 0) {
+          // Atomic write preserving ancestral timestamps
+          const tempSeedPath = `${args.transcript}.seed-${Date.now()}`;
+          const formattedEntries = seedEntries.map((e) => formatTranscriptEntry(e.role, e.text, e.at)).join('');
+          fs.writeFileSync(tempSeedPath, formattedEntries, 'utf8');
+          fs.renameSync(tempSeedPath, args.transcript);
 
-      if (seedEntries.length > 0) {
-        for (const entry of seedEntries) {
-          appendTranscript(args.transcript, entry.role, entry.text);
+          transcriptText = fs.readFileSync(args.transcript, 'utf8');
+          entries = parseTranscriptEntries(transcriptText);
+          if (options.verbose || process.env.CHATBOT_DEBUG) {
+            info(`[sync] Seeded branched transcript from parent session ${branchInfo.parentSessionId} (${seedEntries.length} turns)`);
+          }
         }
-        transcriptText = fs.readFileSync(args.transcript, 'utf8');
-        entries = parseTranscriptEntries(transcriptText);
-        if (options.verbose || process.env.CHATBOT_DEBUG) {
-          info(`[sync] Seeded branched transcript from parent session ${branchInfo.parentSessionId} (${seedEntries.length} turns)`);
-        }
+      } else {
+        info(`[sync] Parent transcript has fewer entries (${parentEntries.length}) than forkTurn (${branchInfo.forkTurn}); skipping copy-on-fork seed to avoid partial ancestry`);
       }
     }
   }
@@ -657,26 +715,32 @@ async function syncTranscriptFromPage(page, args, options = {}) {
       reason: 'active_generation',
     });
   }
+
+  // If transcript was already seeded with ancestor turns and we have explicit post-divider turn IDs,
+  // scope live sync to post-divider turns only to avoid DOM virtualization false-stale mismatches.
+  if (entries.length > 0 && branchInfo?.postDividerTurnTestids?.length) {
+    const postDividerSet = new Set(branchInfo.postDividerTurnTestids);
+    const postDividerTurns = turns.filter((t) => postDividerSet.has(t.testid));
+    if (postDividerTurns.length > 0) {
+      turns = postDividerTurns;
+    }
+  }
+
   let startIndex = findTranscriptSyncStart(entries, turns);
 
   if (startIndex === -1) {
-    // A stale transcript tail (e.g. a leftover `new-chat.txt` from a prior clean
-    // test) makes the live-DOM sync unrecoverable. Rather than throw and take
-    // down the queue runner, quarantine the mismatched file and retry once
-    // against a fresh transcript. This mirrors the documented manual recovery.
     const stale = args.transcript;
     const quarantined = `${stale}.stale-${new Date().toISOString().replace(/[:.]/g, '-')}`;
     try {
       fs.renameSync(stale, quarantined);
-      info(`[sync] transcript tail did not match live turns; quarantined ${stale} -> ${quarantined}`);
-    } catch (renameError) {
-      info(`[sync] could not quarantine stale transcript ${stale}: ${renameError.message}`);
+      info(`[sync] Quarantined stale transcript ${path.basename(stale)} -> ${path.basename(quarantined)}`);
+      ensureTranscript(args.transcript);
+      entries = [];
+      startIndex = 0;
+    } catch (error) {
+      warn(`[sync] Failed to quarantine stale transcript: ${error.message}`);
+      return { appended: 0, total: entries.length, skipped };
     }
-    ensureTranscript(args.transcript);
-    transcriptText = fs.readFileSync(args.transcript, 'utf8');
-    entries = parseTranscriptEntries(transcriptText);
-    startIndex = findTranscriptSyncStart(entries, turns);
-    if (startIndex === -1) startIndex = 0; // fresh transcript: append all live turns
   }
 
   const appended = [];
@@ -711,17 +775,55 @@ function messageHash(message) {
   return crypto.createHash('sha256').update(String(message || '')).digest('hex');
 }
 
-function sessionIdFromUrl(url) {
+function routeSessionIdFromUrl(url) {
   try {
     const parsed = new URL(url);
     const parts = parsed.pathname.split('/').filter(Boolean);
     const cIndex = parts.indexOf('c');
-    if (cIndex !== -1 && parts[cIndex + 1] && SESSION_ID_RE.test(parts[cIndex + 1])) {
+    if (cIndex !== -1 && parts[cIndex + 1] && ROUTE_SESSION_ID_RE.test(parts[cIndex + 1])) {
       return parts[cIndex + 1];
     }
   } catch {}
 
   return '';
+}
+
+function sessionIdFromUrl(url) {
+  const routeId = routeSessionIdFromUrl(url);
+  return STABLE_SESSION_ID_RE.test(routeId) ? routeId : '';
+}
+
+function isEphemeralRouteId(id) {
+  return /^WEB:/i.test(String(id || ''));
+}
+
+async function assertThreadIdentity(page, expectedSessionId, phase) {
+  if (!expectedSessionId) return;
+
+  if (!STABLE_SESSION_ID_RE.test(expectedSessionId)) {
+    throw cbError(
+      'INVALID_EXPECTED_SESSION',
+      `Expected session is not stable: ${expectedSessionId}`,
+      { expectedSessionId, phase }
+    );
+  }
+
+  const url = page?.url ? page.url() : '';
+  const routeId = routeSessionIdFromUrl(url);
+  const stableId = sessionIdFromUrl(url);
+
+  if (stableId !== expectedSessionId) {
+    throw cbError(
+      'THREAD_IDENTITY_DRIFT',
+      `Conversation identity changed during ${phase}: expected=${expectedSessionId}, route=${routeId || '(none)'}, url=${url}`,
+      {
+        expectedSessionId,
+        actualRouteId: routeId,
+        url,
+        phase,
+      }
+    );
+  }
 }
 
 function transcriptPathForSession(sessionId) {
@@ -810,6 +912,47 @@ function saveRoundState(state) {
   state.version = 1;
   state.updatedAt = nowIso();
   atomicWriteJson(ROUND_STATE_PATH, state);
+}
+
+const CONVERSATION_LEASES_DIR = path.join(APP_DIR, 'outputs', 'scheduler', 'leases');
+
+function acquireConversationLease(sessionId, roundId) {
+  if (!sessionId || !STABLE_SESSION_ID_RE.test(sessionId)) return null;
+  fs.mkdirSync(CONVERSATION_LEASES_DIR, { recursive: true });
+  const leasePath = path.join(CONVERSATION_LEASES_DIR, `${sessionId}.lock`);
+  const payload = {
+    pid: process.pid,
+    roundId,
+    sessionId,
+    createdAt: nowIso(),
+  };
+  try {
+    const fd = fs.openSync(leasePath, 'wx');
+    fs.writeFileSync(fd, JSON.stringify(payload, null, 2), 'utf8');
+    fs.closeSync(fd);
+    return leasePath;
+  } catch (err) {
+    if (err.code === 'EEXIST') {
+      try {
+        const existing = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+        if (existing.pid && !processExists(existing.pid)) {
+          fs.writeFileSync(leasePath, JSON.stringify(payload, null, 2), 'utf8');
+          return leasePath;
+        }
+      } catch {}
+      throw cbError('CONVERSATION_LEASE_BUSY', `Conversation ${sessionId} is locked by active process ${process.pid}`, { sessionId });
+    }
+    throw err;
+  }
+}
+
+function releaseConversationLease(leasePath) {
+  if (!leasePath) return;
+  try {
+    if (fs.existsSync(leasePath)) {
+      fs.unlinkSync(leasePath);
+    }
+  } catch {}
 }
 
 function processExists(pid) {
@@ -1003,22 +1146,28 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
   });
 }
 
-function registerPendingRound(args, page, message, baselineLastTurnId) {
-  const sessionId = sessionIdFromUrl(page.url());
+function registerPendingRound(args, page, message, baselineLastTurnId, extra = {}) {
+  const sessionId = extra.expectedSessionId || sessionIdFromUrl(page.url());
   const transcript = args.transcript || (sessionId ? transcriptPathForSession(sessionId) : '');
   const id = randomId('round');
   const now = nowIso();
   const round = {
     id,
     status: 'pending',
+    dispatchState: extra.dispatchState || 'prepared',
     createdAt: now,
     updatedAt: now,
     pid: process.pid,
     sessionId,
+    expectedSessionId: extra.expectedSessionId || sessionId,
+    jobId: extra.jobId || '',
     url: page.url(),
     transcript,
     cdp: args.cdp,
     baselineLastTurnId,
+    acceptedUserTurn: extra.acceptedUserTurn || null,
+    dispatchStartedAt: '',
+    dispatchAcceptedAt: '',
     messageHash: messageHash(message),
     messageChars: message.length,
     messageHead: normalizeTurnText(message).slice(0, 240),
@@ -1077,8 +1226,12 @@ function responseAfterRound(entries, round) {
   }
   if (userIndex === -1) return '';
 
-  return entries.slice(userIndex + 1)
-    .filter((entry) => entry.role === 'assistant' && entry.text && !isProgressOnlyText(entry.text))
+  const after = entries.slice(userIndex + 1);
+  const nextUserIndex = after.findIndex((entry) => entry.role === 'user');
+  const ownTurnWindow = nextUserIndex === -1 ? after : after.slice(0, nextUserIndex);
+
+  return ownTurnWindow
+    .filter((entry) => entry.role === 'assistant' && entry.text && !isProgressOnlyText(entry.text) && !isErrorOnlyResponseText(entry.text))
     .reduce((best, entry) => (entry.text.length >= best.length ? entry.text : best), '');
 }
 
@@ -1403,9 +1556,14 @@ async function getConversationTurns(page) {
           || turn.getAttribute('data-turn')
           || '';
         const roleTexts = roleEls.map(textOf).filter(Boolean);
+        const messageId = turn.getAttribute('data-message-id')
+          || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
+          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+          || '';
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
+          messageId,
           role,
           text: roleTexts[0] || textOf(turn),
           roleTexts,
@@ -1418,12 +1576,79 @@ async function getConversationTurns(page) {
     .map((turn) => ({
       index: turn.index,
       testid: turn.testid,
+      messageId: turn.messageId || '',
       role: turn.role,
       text: turn.role === 'assistant'
         ? assistantResponseText(turn.roleTexts?.length ? turn.roleTexts : turn.text, turn.turnText)
         : turn.text,
     }))
     .filter((turn) => turn.role && turn.text);
+}
+
+function turnRef(turn) {
+  return {
+    messageId: turn?.messageId || '',
+    testid: turn?.testid || '',
+    role: turn?.role || '',
+    textHash: messageHash(normalizeTurnText(turn?.text || '')),
+  };
+}
+
+function turnMatchesRef(turn, ref) {
+  if (!turn || !ref) return false;
+  if (ref.messageId && turn.messageId) {
+    return ref.messageId === turn.messageId;
+  }
+  if (ref.testid && ref.textHash) {
+    return turn.testid === ref.testid && messageHash(normalizeTurnText(turn.text)) === ref.textHash;
+  }
+  return Boolean(ref.textHash && messageHash(normalizeTurnText(turn.text)) === ref.textHash);
+}
+
+function responseAfterAcceptedTurn(turns, acceptedUserTurnRef) {
+  if (!acceptedUserTurnRef) {
+    return { text: '', assistantTurn: null, userTurnMissing: false, concurrentUserTurn: null };
+  }
+
+  const userIndex = turns.findIndex((turn) =>
+    turn.role === 'user' && turnMatchesRef(turn, acceptedUserTurnRef)
+  );
+
+  if (userIndex === -1) {
+    return {
+      text: '',
+      assistantTurn: null,
+      userTurnMissing: true,
+      concurrentUserTurn: null,
+    };
+  }
+
+  for (let i = userIndex + 1; i < turns.length; i++) {
+    const turn = turns[i];
+    if (turn.role === 'user') {
+      return {
+        text: '',
+        assistantTurn: null,
+        userTurnMissing: false,
+        concurrentUserTurn: turn,
+      };
+    }
+    if (turn.role === 'assistant') {
+      return {
+        text: isProgressOnlyText(turn.text) ? '' : turn.text,
+        assistantTurn: turn,
+        userTurnMissing: false,
+        concurrentUserTurn: null,
+      };
+    }
+  }
+
+  return {
+    text: '',
+    assistantTurn: null,
+    userTurnMissing: false,
+    concurrentUserTurn: null,
+  };
 }
 
 async function getAssistantTurns(page) {
@@ -1594,12 +1819,16 @@ function findUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
     && turnMatchesMessage(turn.text, message)) || null;
 }
 
-async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout = PROMPT_ACCEPTED_TIMEOUT_MS) {
+async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout = PROMPT_ACCEPTED_TIMEOUT_MS, options = {}) {
+  const { expectedSessionId = '' } = options;
   const start = Date.now();
   let lastTurns = [];
   let lastComposer = null;
 
   while (Date.now() - start < timeout) {
+    if (expectedSessionId) {
+      await assertThreadIdentity(page, expectedSessionId, 'while awaiting prompt acceptance');
+    }
     await ensureNoBlockingModal(page, 'while verifying the prompt was accepted');
     lastTurns = await getConversationTurns(page).catch(() => []);
     const userTurn = findUserTurnAfterBaseline(lastTurns, message, baselineLastTurnId);
@@ -1644,7 +1873,12 @@ async function confirmNewConversationAccepted(page, message, baselineLastTurnId)
   throw new Error(`Prompt was submitted but target app did not assign a session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms; reloaded once and still no session id. User turn after reload: ${userTurn ? 'yes' : 'no'}. Generating: ${generation.isGenerating ? 'yes' : 'no'}. Latest turn: ${latestSummary}. No transcript entry was recorded; retry or recover manually.`);
 }
 
-async function sendMessage(page, message, baselineLastTurnId = '') {
+async function sendMessage(page, message, baselineLastTurnId = '', options = {}) {
+  const { expectedSessionId = '', roundId = '' } = options;
+  if (expectedSessionId) {
+    await assertThreadIdentity(page, expectedSessionId, 'before finding the composer');
+  }
+
   await ensureNoBlockingModal(page, 'before finding the composer');
   const composer = await findComposer(page);
   try {
@@ -1658,27 +1892,56 @@ async function sendMessage(page, message, baselineLastTurnId = '') {
   await page.keyboard.insertText(message);
   await waitForComposerInsertion(page, message);
 
+  if (expectedSessionId) {
+    await assertThreadIdentity(page, expectedSessionId, 'after composer insertion');
+  }
+
   const ready = await waitForSendReady(page);
 
-  if (!ready.button.exists) {
-    await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before pressing Enter to submit', { preferLast: true });
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(700);
-    return waitForPromptAccepted(page, message, baselineLastTurnId);
+  if (expectedSessionId) {
+    await assertThreadIdentity(page, expectedSessionId, 'before dispatching prompt');
   }
 
-  try {
-    await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
-    await page.locator(SEND_BUTTON_SELECTORS.join(', '))
-      .first()
-      .click({ timeout: 5000 });
-  } catch (error) {
-    const modal = await getBlockingModal(page);
-    if (modal) throw new Error(blockingModalErrorMessage(modal, 'while clicking the send button'));
-    throw error;
+  if (roundId) {
+    updateRound(roundId, {
+      dispatchState: 'dispatching',
+      dispatchStartedAt: nowIso(),
+    }, 'round_dispatching');
   }
-  await page.waitForTimeout(700);
-  return waitForPromptAccepted(page, message, baselineLastTurnId);
+
+  let acceptedUserTurn;
+  try {
+    if (!ready.button.exists) {
+      await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before pressing Enter to submit', { preferLast: true });
+      await page.keyboard.press('Enter');
+    } else {
+      await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
+      await page.locator(SEND_BUTTON_SELECTORS.join(', '))
+        .first()
+        .click({ timeout: 5000 });
+    }
+    await page.waitForTimeout(700);
+    acceptedUserTurn = await waitForPromptAccepted(page, message, baselineLastTurnId, PROMPT_ACCEPTED_TIMEOUT_MS, { expectedSessionId });
+  } catch (error) {
+    if (roundId) {
+      updateRound(roundId, {
+        dispatchState: 'uncertain',
+        lastError: error.message || String(error),
+      }, 'round_dispatch_uncertain');
+    }
+    throw error.code ? error : cbError('DISPATCH_UNCERTAIN', `Prompt dispatch may have committed: ${error.message || error}`, { expectedSessionId, roundId });
+  }
+
+  const ref = turnRef(acceptedUserTurn);
+  if (roundId) {
+    updateRound(roundId, {
+      dispatchState: 'accepted',
+      dispatchAcceptedAt: nowIso(),
+      acceptedUserTurn: ref,
+    }, 'round_dispatch_accepted');
+  }
+
+  return acceptedUserTurn;
 }
 
 function responseAfterMessage(turns, message, baselineLastTurnId) {
@@ -1709,6 +1972,16 @@ function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
 
 function normalizeTurnText(text) {
   return (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isErrorOnlyResponseText(text) {
+  const value = normalizeTurnText(text);
+  if (!value || value.length > 1000) return false;
+  return (/^something went wrong\b/i.test(value) && (/\bretry\b/i.test(value) || /help\.openai\.com/i.test(value)))
+    || /^internal server error\b/i.test(value)
+    || /^there was an error generating (?:a )?response\b/i.test(value)
+    || /^error generating (?:a )?response\b/i.test(value)
+    || /^message stream error\b/i.test(value);
 }
 
 function isProgressOnlyText(text) {
@@ -2322,9 +2595,14 @@ async function getTargetAppState(page) {
         const text = role === 'assistant'
           ? assistantTextOf(roleTexts, turnText)
           : (roleTexts[0] || turnText);
+        const messageId = turn.getAttribute('data-message-id')
+          || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
+          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+          || '';
         return {
           index,
           testid: turn.getAttribute('data-testid') || '',
+          messageId,
           role,
           text,
           roleNodeCount: roleTexts.length,
@@ -2483,11 +2761,18 @@ async function getTargetAppState(page) {
       .filter((item) => /\b(reasoning|think|thinking|extended|fast|auto)\b/i.test([item.testid, item.aria, item.title, item.text].join(' ')))
       .slice(0, 20);
 
+    const latestAssistantAlerts = latestAssistantTurn
+      ? [...latestAssistantTurn.querySelectorAll('.text-token-text-error, [role="alert"], [data-testid*="error"]')].filter(isVisible)
+      : [];
+
     const maxLengthBanner = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *, .text-token-text-error, div, p')]
       .find((el) => isVisible(el) && textOf(el).length < 300 && /maximum length for this conversation/i.test(textOf(el)));
 
-    const connectionInterruptedBanner = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *, .text-token-text-error, div, p')]
-      .find((el) => isVisible(el) && textOf(el).length < 300 && /connection interrupted.*waiting for the complete answer|waiting for the complete answer/i.test(textOf(el)));
+    const connectionInterruptedBanner = latestAssistantAlerts
+      .find((el) => textOf(el).length < 300 && /connection interrupted.*waiting for the complete answer|waiting for the complete answer/i.test(textOf(el)));
+
+    const terminalErrorBanner = latestAssistantAlerts
+      .find((el) => textOf(el).length < 500 && /something went wrong|internal server error|error generating (?:a )?response|message stream error/i.test(textOf(el)));
 
     const maxLengthReached = Boolean(maxLengthBanner);
     const connectionInterrupted = Boolean(connectionInterruptedBanner);
@@ -2499,6 +2784,8 @@ async function getTargetAppState(page) {
       maxLengthBanner: maxLengthBanner ? textOf(maxLengthBanner) : '',
       connectionInterrupted,
       connectionInterruptedBanner: connectionInterruptedBanner ? textOf(connectionInterruptedBanner) : '',
+      terminalError: Boolean(terminalErrorBanner),
+      terminalErrorText: terminalErrorBanner ? textOf(terminalErrorBanner) : '',
       model: modelButton ? (modelButton.text || modelButton.aria || modelButton.testid) : '',
       blockingModal,
       reasoningControls,
@@ -2525,8 +2812,12 @@ async function getTargetAppState(page) {
         preview: turn.text.slice(0, 240),
       })),
       latestAssistant: {
+        testid: latestAssistantTurn?.getAttribute('data-testid') || '',
+        messageId: latestAssistantTurn?.getAttribute('data-message-id') || '',
         chars: latestAssistantText.length,
         preview: latestAssistantText.slice(0, 400),
+        errorText: terminalErrorBanner ? textOf(terminalErrorBanner) : '',
+        connectionInterrupted: Boolean(connectionInterruptedBanner),
       },
       artifacts: {
         links,
@@ -5103,7 +5394,7 @@ async function openNewConversation(page) {
 }
 
 async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERSATION_HYDRATION_TIMEOUT_MS) {
-  if (!SESSION_ID_RE.test(sessionId || '')) {
+  if (!STABLE_SESSION_ID_RE.test(sessionId || '')) {
     return { hydrated: false, sessionId: '', turnCount: 0, roleNodeCount: 0 };
   }
 
@@ -5119,12 +5410,14 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
       };
       const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].filter(isVisible);
       const roleNodes = [...document.querySelectorAll('[data-message-author-role]')].filter(isVisible);
-      const sessionId = sessionIdFromLocation();
+      const composer = [...document.querySelectorAll('#prompt-textarea, [data-testid="composer-input"], div[contenteditable="true"]')].find(isVisible);
+      const currentSessionId = sessionIdFromLocation();
       return {
-        hydrated: sessionId === expectedSessionId && (turns.length > 0 || roleNodes.length > 0),
-        sessionId,
+        hydrated: currentSessionId === expectedSessionId && (turns.length > 0 || roleNodes.length > 0) && Boolean(composer),
+        sessionId: currentSessionId,
         turnCount: turns.length,
         roleNodeCount: roleNodes.length,
+        composerVisible: Boolean(composer),
       };
     }, sessionId).catch(() => last);
 
@@ -5137,15 +5430,23 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
 }
 
 async function openConversationBySessionId(page, sessionId) {
-  if (!SESSION_ID_RE.test(sessionId || '')) throw new Error(`Invalid target app session id: ${sessionId}`);
-  if (sessionIdFromUrl(page.url()) === sessionId) {
-    await settlePage(page);
-    await waitForConversationHydration(page, sessionId);
-    return;
+  if (!STABLE_SESSION_ID_RE.test(sessionId || '')) {
+    throw cbError('INVALID_TARGET_SESSION', `Invalid target app session id: ${sessionId}`, { sessionId });
   }
-  await page.goto(targetConversationUrl(sessionId), { waitUntil: 'domcontentloaded', timeout: 45000 });
+  if (sessionIdFromUrl(page.url()) !== sessionId) {
+    await page.goto(targetConversationUrl(sessionId), { waitUntil: 'domcontentloaded', timeout: 45000 });
+  }
   await settlePage(page);
-  await waitForConversationHydration(page, sessionId);
+  const hydration = await waitForConversationHydration(page, sessionId);
+  if (!hydration.hydrated) {
+    throw cbError(
+      'CONVERSATION_NOT_HYDRATED',
+      `Conversation ${sessionId} did not hydrate before access`,
+      { sessionId, hydration, url: page.url() }
+    );
+  }
+  await assertThreadIdentity(page, sessionId, 'after hydration');
+  return hydration;
 }
 
 async function prepareConversationForPrompt(page, args) {
@@ -5342,6 +5643,10 @@ function expectedSessionIdForJob(job, index) {
 }
 
 function findRoundForJob(rounds, job, index = null) {
+  if (job?.id) {
+    const explicit = [...rounds].reverse().find((round) => round.jobId && round.jobId === job.id);
+    if (explicit) return explicit;
+  }
   const candidates = [...rounds].reverse().filter((round) => jobMatchesRound(job, round));
   if (!candidates.length) return null;
 
@@ -5366,7 +5671,19 @@ function scheduledJobNeedsReconciliation(status) {
   return scheduledJobIsRecoverable(status) || status === 'done';
 }
 
-function queueHoldStatusForError(message) {
+function queueHoldStatusForError(error) {
+  switch (error?.code) {
+    case 'DISPATCH_UNCERTAIN':
+    case 'CONVERSATION_NOT_HYDRATED':
+    case 'CONVERSATION_LEASE_BUSY':
+      return 'needs_recovery';
+    case 'THREAD_IDENTITY_DRIFT':
+    case 'CONCURRENT_CONVERSATION_MUTATION':
+    case 'ASSISTANT_TERMINAL_ERROR':
+    case 'CONVERSATION_BUSY':
+      return 'failed';
+  }
+  const message = error?.message || String(error || '');
   if (/Timed out after \d+ms while target app was still generating/i.test(message)) return 'waiting';
   if (/target app UI blocker|modal-conversation-history-rate-limit|conversation_history_rate_limit|modal-subscription-failure|subscription_modal|intercepts pointer events|Prompt was not submitted|Prompt was submitted but target app did not assign a session id|send button stayed disabled|not submitted/i.test(message)) return 'needs_recovery';
   return 'failed';
@@ -5639,6 +5956,8 @@ async function runScheduledJob(page, job, runnerArgs) {
       : 0;
   const jobArgs = {
     ...runnerArgs,
+    jobId: job.id,
+    expectedSessionId: target.action === 'open' ? target.sessionId : '',
     transcript: null,
     transcriptOverride: false,
     attachments: job.attachments || [],
@@ -5762,7 +6081,8 @@ function createStreamPrinter(args, baseline = null) {
   };
 }
 
-async function waitForAssistantResponse(page, message, baselineLastTurnId, timeout, onUpdate = null) {
+async function waitForAssistantResponse(page, message, baselineLastTurnId, timeout, onUpdate = null, options = {}) {
+  const { expectedSessionId = '', acceptedUserTurnRef = null } = options;
   const start = Date.now();
   const noTimeout = timeout === 0 || timeout === Infinity;
   let lastText = '';
@@ -5771,20 +6091,49 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   let reloadedForMissingResponse = false;
 
   while (noTimeout || Date.now() - start < timeout) {
+    if (expectedSessionId) {
+      await assertThreadIdentity(page, expectedSessionId, 'while awaiting assistant response');
+    }
+
     const turns = await getConversationTurns(page).catch(() => []);
-    const text = responseAfterMessage(turns, message, baselineLastTurnId);
+    let text = '';
+    let outcome = null;
+
+    if (acceptedUserTurnRef) {
+      outcome = responseAfterAcceptedTurn(turns, acceptedUserTurnRef);
+      if (outcome.concurrentUserTurn) {
+        throw cbError('CONCURRENT_CONVERSATION_MUTATION', 'Another user turn appeared before the awaited assistant response', {
+          expectedSessionId,
+          concurrentUserTurn: outcome.concurrentUserTurn,
+        });
+      }
+      text = outcome.text;
+    } else {
+      text = responseAfterMessage(turns, message, baselineLastTurnId);
+    }
+
     const placeholder = !text || isProgressOnlyText(text);
     const pageState = await getTargetAppState(page).catch(() => null);
 
+    // Passive connection interrupted notice (never click stop, never blind-resend!)
     if (pageState?.connectionInterrupted) {
-      info('[recovery] Connection interrupted / stalled generation detected; stopping generation and reloading session URL...');
-      await stopGeneration(page);
-      await page.waitForTimeout(1000);
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      await settlePage(page);
-      info('[recovery] Reload complete. Resending prompt in the same conversation thread...');
-      await sendMessage(page, message, baselineLastTurnId);
-      continue;
+      info('[state] Current assistant turn reports connection interruption; observing passively.');
+    }
+
+    // Structural error / terminal error detection (never mark done or exit 0 on error banners!)
+    if (pageState?.latestAssistant?.errorText) {
+      const error = cbError('ASSISTANT_TERMINAL_ERROR', pageState.latestAssistant.errorText, {
+        expectedSessionId,
+        partialText: lastText,
+      });
+      throw error;
+    }
+    if (text && isErrorOnlyResponseText(text)) {
+      const error = cbError('ASSISTANT_TERMINAL_ERROR', text, {
+        expectedSessionId,
+        partialText: text,
+      });
+      throw error;
     }
 
     if (!placeholder) {
@@ -5799,10 +6148,22 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
       const state = await getCombinedGenerationState(page, pageState);
       if (!state.isGenerating) {
         await page.waitForTimeout(500);
-        const finalText = responseAfterMessage(await getConversationTurns(page).catch(() => []), message, baselineLastTurnId);
+        const finalTurns = await getConversationTurns(page).catch(() => []);
+        let finalText = '';
+        if (acceptedUserTurnRef) {
+          finalText = responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef).text;
+        } else {
+          finalText = responseAfterMessage(finalTurns, message, baselineLastTurnId);
+        }
         const finalState = await getTargetAppState(page).catch(() => null);
         const finalGeneration = await getCombinedGenerationState(page, finalState);
         if (!finalGeneration.isGenerating) {
+          if (finalState?.latestAssistant?.errorText) {
+            throw cbError('ASSISTANT_TERMINAL_ERROR', finalState.latestAssistant.errorText, { expectedSessionId });
+          }
+          if (finalText && isErrorOnlyResponseText(finalText)) {
+            throw cbError('ASSISTANT_TERMINAL_ERROR', finalText, { expectedSessionId });
+          }
           if (onUpdate) onUpdate({ text: finalText || lastText, state: finalState });
           return finalText || lastText;
         }
@@ -5815,16 +6176,18 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
       onUpdate({ text: '', state: pageState });
     }
 
+    // Passive exact-thread reconciliation reload
     if (!sawResponse
       && !reloadedForMissingResponse
       && Date.now() - start >= NO_RESPONSE_RELOAD_MS
-      && hasUserTurnAfterBaseline(turns, message, baselineLastTurnId)
-      && sessionIdFromUrl(page.url())
+      && (acceptedUserTurnRef ? !outcome?.userTurnMissing : hasUserTurnAfterBaseline(turns, message, baselineLastTurnId))
+      && expectedSessionId
       && pageState
       && !(await getCombinedGenerationState(page, pageState)).isGenerating) {
       reloadedForMissingResponse = true;
-      info('[state] no assistant turn visible while UI is idle; reloading target app once');
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      info('[state] No assistant turn visible while UI is idle; reloading target app once for passive reconciliation');
+      await openConversationBySessionId(page, expectedSessionId);
+      await assertThreadIdentity(page, expectedSessionId, 'after passive response reconciliation');
       await settlePage(page);
     }
 
@@ -5832,12 +6195,19 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   }
 
   if (lastText) {
-    const finalText = responseAfterMessage(await getConversationTurns(page).catch(() => []), message, baselineLastTurnId);
-    const finalState = await getTargetAppState(page).catch(() => null)
+    const finalTurns = await getConversationTurns(page).catch(() => []);
+    let finalText = '';
+    if (acceptedUserTurnRef) {
+      finalText = responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef).text;
+    } else {
+      finalText = responseAfterMessage(finalTurns, message, baselineLastTurnId);
+    }
+    const finalState = await getTargetAppState(page).catch(() => null);
     const finalGeneration = await getCombinedGenerationState(page, finalState);
     if (finalText && !finalGeneration.isGenerating) return finalText;
     throw new Error(`Timed out after ${timeout}ms while target app was still generating. Partial assistant text was not appended; run CB --sync-transcript after the browser finishes.`);
   }
+
   throw new Error(`Timed out after ${timeout}ms waiting for assistant response`);
 }
 
@@ -5889,59 +6259,97 @@ async function ask(page, message, args) {
       info(`[attach] composer attachments: ${state.composer.attachments.map((item) => item.text || item.aria || item.testid).join(' | ')}`);
     }
   }
+
+  const expectedSessionId = args.expectedSessionId
+    || (!args.newConversation ? sessionIdFromUrl(page.url()) : '');
+
+  if (expectedSessionId) {
+    await assertThreadIdentity(page, expectedSessionId, 'before send transaction');
+  }
+
+  const generationBefore = await getCombinedGenerationState(page, await getTargetAppState(page).catch(() => null));
+  if (generationBefore.isGenerating) {
+    throw cbError(
+      'CONVERSATION_BUSY',
+      `Refusing to send while ${expectedSessionId || 'conversation'} is generating`
+    );
+  }
+
   const baselineState = await getTargetAppState(page).catch(() => null);
   const watchBaseline = baselineState ? stateBaseline(baselineState) : null;
   const turnsBefore = await getConversationTurns(page);
   const baselineLastTurnId = turnsBefore.length ? turnsBefore[turnsBefore.length - 1].testid : '';
-  await sendMessage(page, message, baselineLastTurnId);
-  await confirmNewConversationAccepted(page, message, baselineLastTurnId);
-  refreshSessionTranscript(page, args);
-  await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
-  const round = registerPendingRound(args, page, message, baselineLastTurnId);
-  appendTranscript(args.transcript, 'user', message);
-  const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
-  let response = '';
+
+  // Pre-Send WAL round registration
+  const round = registerPendingRound(args, page, message, baselineLastTurnId, {
+    expectedSessionId,
+    jobId: args.jobId || '',
+    dispatchState: 'prepared',
+  });
+
+  const leasePath = acquireConversationLease(expectedSessionId, round.id);
+
   try {
-    response = await waitForAssistantResponse(
-      page,
-      message,
-      baselineLastTurnId,
-      args.timeout,
-      streamer ? (event) => streamer.update(event) : null,
-    );
-  } catch (error) {
+    const acceptedUserTurn = await sendMessage(page, message, baselineLastTurnId, {
+      expectedSessionId,
+      roundId: round.id,
+    });
+    const acceptedUserTurnRef = turnRef(acceptedUserTurn);
+
+    if (args.newConversation) {
+      await confirmNewConversationAccepted(page, message, baselineLastTurnId);
+    }
+    refreshSessionTranscript(page, args);
+    await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
+    appendTranscript(args.transcript, 'user', message);
+
+    const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
+    let response = '';
+    try {
+      response = await waitForAssistantResponse(
+        page,
+        message,
+        baselineLastTurnId,
+        args.timeout,
+        streamer ? (event) => streamer.update(event) : null,
+        {
+          expectedSessionId: expectedSessionId || sessionIdFromUrl(page.url()),
+          acceptedUserTurnRef,
+        }
+      );
+    } catch (error) {
+      const sessionId = sessionIdFromUrl(page.url());
+      updateRound(round.id, {
+        status: 'pending',
+        sessionId,
+        lastError: error.message || String(error),
+        url: page.url(),
+        transcript: args.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
+      }, 'round_waiting_for_recovery');
+      throw error;
+    }
+    if (streamer) streamer.finish();
+    refreshSessionTranscript(page, args);
+    appendTranscript(args.transcript, 'assistant', response);
     const sessionId = sessionIdFromUrl(page.url());
     updateRound(round.id, {
-      status: 'pending',
+      status: 'done',
       sessionId,
-      lastError: error.message || String(error),
+      responseChars: response.length,
+      lastError: '',
       url: page.url(),
       transcript: args.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
-    }, 'round_waiting_for_recovery');
-    throw error;
+    }, 'round_completed');
+    await indexCurrentConversation(page, args, 'conversation_turn_completed').catch(() => {});
+    if (args.downloadArtifacts) {
+      const saved = await downloadLatestArtifacts(page, args);
+      info(`[artifacts] saved ${saved.length} item(s): ${saved.map(formatSavedArtifact).join(', ')}`);
+      if (args.showArtifacts) printSavedArtifacts(saved);
+    }
+    return response;
+  } finally {
+    releaseConversationLease(leasePath);
   }
-  if (streamer) streamer.finish();
-  refreshSessionTranscript(page, args);
-  appendTranscript(args.transcript, 'assistant', response);
-  const sessionId = sessionIdFromUrl(page.url());
-  updateRound(round.id, {
-    status: 'done',
-    sessionId,
-    responseChars: response.length,
-    completedAt: nowIso(),
-    url: page.url(),
-    transcript: args.transcript,
-    lastError: '',
-  }, 'round_completed');
-  await indexCurrentConversation(page, args, 'conversation_round_completed', {
-    lastResponseChars: response.length,
-  }).catch(() => {});
-  if (args.downloadArtifacts) {
-    const saved = await downloadLatestArtifacts(page, args);
-    info(`[artifacts] saved ${saved.length} item(s): ${saved.map(formatSavedArtifact).join(', ')}`);
-    if (args.showArtifacts) printSavedArtifacts(saved);
-  }
-  return response;
 }
 
 async function inspectStatusModelConfig(page) {
@@ -6444,26 +6852,36 @@ async function recoverInterruptedConnection(page, args = {}) {
   const currentUrl = page.url();
   const sessionId = sessionIdFromUrl(currentUrl);
   if (!sessionId) {
-    info('[recovery] No active conversation session id in URL; cannot reload specific conversation');
+    info('[recovery] No active stable conversation session id in URL; cannot reload specific conversation');
     return { recovered: false, error: 'No active conversation URL' };
   }
 
-  info(`[recovery] Stopping stalled generation on ${sessionId}...`);
-  await stopGeneration(page);
-  await page.waitForTimeout(1000);
+  const before = await getTargetAppState(page);
+  const generation = await getCombinedGenerationState(page, before);
 
-  info(`[recovery] Reloading exact conversation ${currentUrl}...`);
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  await settlePage(page);
+  if (generation.isGenerating) {
+    info(`[recovery] Generation on ${sessionId} is still active; refusing destructive stop.`);
+    return {
+      recovered: false,
+      active: true,
+      sessionId,
+      url: currentUrl,
+      error: 'Generation is still active; refusing destructive recovery',
+    };
+  }
+
+  info(`[recovery] Reopening and hydrating exact conversation ${sessionId}...`);
+  await openConversationBySessionId(page, sessionId);
+  await assertThreadIdentity(page, sessionId, 'after interrupted recovery');
 
   const state = await getTargetAppState(page);
   const composerReady = Boolean(state.composer?.visible && !state.isGenerating);
-  info(`[recovery] Reload complete. Composer ready: ${composerReady}`);
+  info(`[recovery] Rehydration complete. Composer ready: ${composerReady}`);
 
   return {
     recovered: composerReady,
     sessionId,
-    url: currentUrl,
+    url: page.url(),
     composerReady,
   };
 }
@@ -6878,7 +7296,29 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.stack || error.message || String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error.stack || error.message || String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  STABLE_SESSION_ID_RE,
+  ROUTE_SESSION_ID_RE,
+  routeSessionIdFromUrl,
+  sessionIdFromUrl,
+  isEphemeralRouteId,
+  assertThreadIdentity,
+  turnRef,
+  turnMatchesRef,
+  responseAfterAcceptedTurn,
+  responseAfterRound,
+  isErrorOnlyResponseText,
+  isProgressOnlyText,
+  queueHoldStatusForError,
+  findRoundForJob,
+  formatTranscriptEntry,
+  parseTranscriptEntries,
+  cbError,
+};
