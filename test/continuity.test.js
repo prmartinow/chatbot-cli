@@ -1,5 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   STABLE_SESSION_ID_RE,
   ROUTE_SESSION_ID_RE,
@@ -15,11 +17,16 @@ const {
   queueHoldStatusForError,
   findRoundForJob,
   formatTranscriptEntry,
+  acquireConversationLease,
+  releaseConversationLease,
+  reconcilePendingRoundsFromTranscript,
+  messageHash,
+  cbError,
 } = require('../CB.js');
 
-test('ID Model: STABLE vs ROUTE Session ID separation', () => {
-  const stableUuid = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
-  const webUuid = 'WEB:0bd28d17-35cc-447a-a589-1cbd8a6fec12';
+test('ID Model: STABLE vs ROUTE Session ID separation with synthetic IDs', () => {
+  const stableUuid = '11111111-1111-1111-1111-111111111111';
+  const webUuid = 'WEB:22222222-2222-2222-2222-222222222222';
 
   assert.equal(STABLE_SESSION_ID_RE.test(stableUuid), true);
   assert.equal(STABLE_SESSION_ID_RE.test(webUuid), false);
@@ -30,34 +37,34 @@ test('ID Model: STABLE vs ROUTE Session ID separation', () => {
   assert.equal(isEphemeralRouteId(webUuid), true);
   assert.equal(isEphemeralRouteId(stableUuid), false);
 
-  assert.equal(routeSessionIdFromUrl(`https://chatgpt.com/c/${webUuid}`), webUuid);
-  assert.equal(sessionIdFromUrl(`https://chatgpt.com/c/${webUuid}`), '');
+  assert.equal(routeSessionIdFromUrl(`https://chat.example.com/c/${webUuid}`), webUuid);
+  assert.equal(sessionIdFromUrl(`https://chat.example.com/c/${webUuid}`), '');
 
-  assert.equal(routeSessionIdFromUrl(`https://chatgpt.com/c/${stableUuid}`), stableUuid);
-  assert.equal(sessionIdFromUrl(`https://chatgpt.com/c/${stableUuid}`), stableUuid);
+  assert.equal(routeSessionIdFromUrl(`https://chat.example.com/c/${stableUuid}`), stableUuid);
+  assert.equal(sessionIdFromUrl(`https://chat.example.com/c/${stableUuid}`), stableUuid);
 
-  assert.equal(routeSessionIdFromUrl('https://chatgpt.com/'), '');
-  assert.equal(sessionIdFromUrl('https://chatgpt.com/'), '');
+  assert.equal(routeSessionIdFromUrl('https://chat.example.com/'), '');
+  assert.equal(sessionIdFromUrl('https://chat.example.com/'), '');
 });
 
 test('assertThreadIdentity: Throws on drift to root or provisional route', async () => {
-  const expectedId = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  const expectedId = '11111111-1111-1111-1111-111111111111';
 
   // Matching URL: passes
-  await assertThreadIdentity({ url: () => `https://chatgpt.com/c/${expectedId}` }, expectedId, 'test_phase');
+  await assertThreadIdentity({ url: () => `https://chat.example.com/c/${expectedId}` }, expectedId, 'test_phase');
 
   // Root URL: drifts
   await assert.rejects(
     async () => {
-      await assertThreadIdentity({ url: () => 'https://chatgpt.com/' }, expectedId, 'test_phase');
+      await assertThreadIdentity({ url: () => 'https://chat.example.com/' }, expectedId, 'test_phase');
     },
     (err) => err.code === 'THREAD_IDENTITY_DRIFT'
   );
 
-  // Provisional WEB route: drifts (never considered stable expected session)
+  // Provisional WEB route: drifts
   await assert.rejects(
     async () => {
-      await assertThreadIdentity({ url: () => 'https://chatgpt.com/c/WEB:0bd28d17-35cc-447a-a589-1cbd8a6fec12' }, expectedId, 'test_phase');
+      await assertThreadIdentity({ url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222' }, expectedId, 'test_phase');
     },
     (err) => err.code === 'THREAD_IDENTITY_DRIFT'
   );
@@ -73,7 +80,6 @@ test('isErrorOnlyResponseText: Classifies UI error banners and ignores normal as
   const streamError = 'There was an error generating a response';
   assert.equal(isErrorOnlyResponseText(streamError), true);
 
-  // Normal prose containing 'retry' or 'something went wrong'
   const normalProse = 'When implementing an exponential backoff policy, if something went wrong you should retry after 2 seconds.';
   assert.equal(isErrorOnlyResponseText(normalProse), false);
 });
@@ -83,7 +89,7 @@ test('responseAfterAcceptedTurn: Bounded turn lineage lookup', () => {
     messageId: 'msg-u1',
     testid: 'turn-u1',
     role: 'user',
-    textHash: 'hash-u1',
+    textHash: messageHash('Analyze this code'),
   };
 
   const turns = [
@@ -98,7 +104,6 @@ test('responseAfterAcceptedTurn: Bounded turn lineage lookup', () => {
   assert.equal(outcome.userTurnMissing, false);
   assert.equal(outcome.concurrentUserTurn, null);
 
-  // Detects concurrent user turn if another user turn appears before assistant response
   const pendingTurns = [
     { messageId: 'msg-u1', testid: 'turn-u1', role: 'user', text: 'Analyze this code' },
     { messageId: 'msg-u2', testid: 'turn-u2', role: 'user', text: 'Unexpected second prompt' },
@@ -108,10 +113,15 @@ test('responseAfterAcceptedTurn: Bounded turn lineage lookup', () => {
   assert.equal(pendingOutcome.text, '');
 });
 
-test('responseAfterRound: Window bounds do not cross later user turns', () => {
+test('responseAfterRound: Window bounds do not cross later user turns and honor acceptedUserTurn ref', () => {
+  const prompt = 'First prompt';
+  const promptHash = messageHash(prompt);
   const round = {
-    messageHash: 'hash1',
-    messageHead: 'First prompt',
+    messageHash: promptHash,
+    messageHead: prompt,
+    acceptedUserTurn: {
+      textHash: promptHash,
+    },
   };
 
   const entries = [
@@ -121,10 +131,8 @@ test('responseAfterRound: Window bounds do not cross later user turns', () => {
     { role: 'assistant', text: 'Second answer' },
   ];
 
-  // Must only return 'First answer', never 'Second answer'
   assert.equal(responseAfterRound(entries, round), 'First answer');
 
-  // Error banners are filtered out
   const entriesWithError = [
     { role: 'user', text: 'First prompt' },
     { role: 'assistant', text: 'Something went wrong. If this issue persists... Retry' },
@@ -151,8 +159,27 @@ test('formatTranscriptEntry: Preserves ancestral timestamp', () => {
 test('queueHoldStatusForError: Maps invariant error codes to state machine', () => {
   assert.equal(queueHoldStatusForError({ code: 'DISPATCH_UNCERTAIN' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_NOT_HYDRATED' }), 'needs_recovery');
+  assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_LEASE_BUSY' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'THREAD_IDENTITY_DRIFT' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'CONCURRENT_CONVERSATION_MUTATION' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'ASSISTANT_TERMINAL_ERROR' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_BUSY' }), 'failed');
+});
+
+test('ConversationLease: Atomic acquisition with token and verified release', () => {
+  const syntheticSession = '33333333-3333-3333-3333-333333333333';
+  const handle = acquireConversationLease(syntheticSession, 'round-test-1');
+  assert.notEqual(handle, null);
+  assert.equal(typeof handle.token, 'string');
+  assert.equal(fs.existsSync(handle.leasePath), true);
+
+  // Second acquisition while active process owns it must fail
+  assert.throws(
+    () => acquireConversationLease(syntheticSession, 'round-test-2'),
+    (err) => err.code === 'CONVERSATION_LEASE_BUSY'
+  );
+
+  // Release with matching token succeeds
+  releaseConversationLease(handle);
+  assert.equal(fs.existsSync(handle.leasePath), false);
 });
