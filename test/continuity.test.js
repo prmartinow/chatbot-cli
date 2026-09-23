@@ -20,6 +20,7 @@ const {
   acquireConversationLease,
   releaseConversationLease,
   reconcilePendingRoundsFromTranscript,
+  waitForSessionIdInUrl,
   terminalErrorForAwaitedTurn,
   messageHash,
   cbError,
@@ -231,4 +232,27 @@ test('ConversationLease: Atomic acquisition with token and refusal of mismatched
   // Release with matching token succeeds
   releaseConversationLease(handle);
   assert.equal(fs.existsSync(handle.leasePath), false);
+});
+
+test('waitForSessionIdInUrl: Ignores provisional WEB route and waits for stable UUID', async () => {
+  let step = 0;
+  const mockPage = {
+    url: () => {
+      step++;
+      if (step < 3) return 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222';
+      return 'https://chat.example.com/c/11111111-1111-1111-1111-111111111111';
+    },
+    waitForTimeout: async (ms) => new Promise((resolve) => setTimeout(resolve, 10)),
+  };
+
+  const id = await waitForSessionIdInUrl(mockPage, 1000);
+  assert.equal(id, '11111111-1111-1111-1111-111111111111');
+
+  // Timeout with only provisional route returns empty string
+  const mockPageTimeout = {
+    url: () => 'https://chat.example.com/c/WEB:22222222-2222-2222-2222-222222222222',
+    waitForTimeout: async (ms) => new Promise((resolve) => setTimeout(resolve, 10)),
+  };
+  const timedOutId = await waitForSessionIdInUrl(mockPageTimeout, 50);
+  assert.equal(timedOutId, '');
 });

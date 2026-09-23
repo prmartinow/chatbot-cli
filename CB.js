@@ -1914,9 +1914,13 @@ async function waitForPromptAccepted(page, message, baselineLastTurnId, timeout 
 }
 
 async function waitForSessionIdInUrl(page, timeout) {
-  if (sessionIdFromUrl(page.url())) return sessionIdFromUrl(page.url());
-  await page.waitForFunction(() => /\/c\/[^/]+/.test(location.pathname), null, { timeout }).catch(() => {});
-  return sessionIdFromUrl(page.url());
+  const deadline = Date.now() + timeout;
+  while (Date.now() <= deadline) {
+    const id = sessionIdFromUrl(page.url());
+    if (id) return id;
+    await page.waitForTimeout(250);
+  }
+  return '';
 }
 
 async function confirmNewConversationAccepted(page, message, baselineLastTurnId) {
@@ -5814,6 +5818,10 @@ function recoverQueueStateFromRounds(page, args, context) {
       const sessionId = sessionIdFromSchedulerRecord(round) || sessionIdFromSchedulerRecord(job.result) || '';
       if (!round && !sessionId) continue;
 
+      if (round && (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared')) {
+        continue;
+      }
+
       const activeRound = context.activeSessionId && sessionIdFromSchedulerRecord(round) === context.activeSessionId;
       if (activeRound && context.isGenerating) {
         const message = `target app is still generating for session ${context.activeSessionId}; run CB --recover-queue after it finishes.`;
@@ -6341,7 +6349,7 @@ async function watchTargetAppState(page, args) {
 }
 
 async function ask(page, message, args) {
-  const expectedSessionId = args.expectedSessionId
+  let expectedSessionId = args.expectedSessionId
     || (!args.newConversation ? sessionIdFromUrl(page.url()) : '');
 
   if (expectedSessionId) {
@@ -6416,6 +6424,13 @@ async function ask(page, message, args) {
       if (confirmation?.sessionId) {
         expectedSessionId = confirmation.sessionId;
         args.expectedSessionId = confirmation.sessionId;
+        args.transcript = transcriptPathForSession(expectedSessionId);
+        updateRound(round.id, {
+          sessionId: expectedSessionId,
+          expectedSessionId,
+          url: targetConversationUrl(expectedSessionId),
+          transcript: args.transcript,
+        }, 'round_session_bound');
         leaseHandle = acquireConversationLease(expectedSessionId, round.id);
       }
     }
@@ -7424,6 +7439,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  waitForSessionIdInUrl,
   terminalErrorForAwaitedTurn,
   messageHash,
   acquireConversationLease,
