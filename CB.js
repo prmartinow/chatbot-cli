@@ -644,13 +644,9 @@ async function getBranchInfo(page, index = null) {
     }
   }
 
-  // forkTurn is nullable: only authorized when parent was resolved through strong DOM divider
-  const forkTurn = hasDivider
-    && parentResolution === 'dom_divider'
-    && typeof domInfo.dividerData?.precedingTurnCount === 'number'
-    && domInfo.dividerData.precedingTurnCount > 0
-    ? domInfo.dividerData.precedingTurnCount
-    : null;
+  // DOM virtualization means precedingTurnCount from live DOM cannot be trusted as absolute ancestor count.
+  // Unless proven by non-virtualized metadata, forkTurn must fail-closed as null so copy-on-fork does not truncate history.
+  const forkTurn = null;
 
   return {
     isFork,
@@ -1231,29 +1227,37 @@ function updateRound(roundId, patch, eventType = 'round_updated') {
 
 function transcriptUserEntryMatchesRound(entry, round) {
   if (!entry || entry.role !== 'user') return false;
+  if (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared') {
+    return false;
+  }
   if (round.acceptedUserTurn?.textHash) {
     return messageHash(normalizeTurnText(entry.text)) === round.acceptedUserTurn.textHash;
   }
-  if (round.dispatchState === 'uncertain') {
-    return messageHash(entry.text) === round.messageHash;
+  if (round.dispatchState === 'uncertain' || round.dispatchState === 'dispatching') {
+    return messageHash(normalizeTurnText(entry.text)) === round.messageHash;
   }
-  if (messageHash(entry.text) === round.messageHash) return true;
-  const text = normalizeTurnText(entry.text);
-  const head = normalizeTurnText(round.messageHead || '');
-  const tail = normalizeTurnText(round.messageTail || '');
-  if (head && tail && text.includes(head) && text.includes(tail)) return true;
-  return head && head.length < 240 && text.includes(head);
+  return messageHash(normalizeTurnText(entry.text)) === round.messageHash;
 }
 
 function responseAfterRound(entries, round) {
-  let userIndex = -1;
-  for (let i = entries.length - 1; i >= 0; i--) {
+  if (!round) return '';
+  if (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared') {
+    return '';
+  }
+
+  const matchingIndices = [];
+  for (let i = 0; i < entries.length; i++) {
     if (transcriptUserEntryMatchesRound(entries[i], round)) {
-      userIndex = i;
-      break;
+      matchingIndices.push(i);
     }
   }
-  if (userIndex === -1) return '';
+
+  if (matchingIndices.length === 0) return '';
+  // Fail closed on ambiguous identical prompts
+  if (matchingIndices.length > 1) {
+    return '';
+  }
+  const userIndex = matchingIndices[0];
 
   const after = entries.slice(userIndex + 1);
   const nextUserIndex = after.findIndex((entry) => entry.role === 'user');
@@ -1265,18 +1269,20 @@ function responseAfterRound(entries, round) {
 }
 
 function reconcilePendingRoundsFromTranscript(args, options = {}) {
-  if (!args.transcript || !fs.existsSync(args.transcript)) return [];
-  const sessionId = sessionIdFromTranscriptPath(args.transcript);
   const skipSessionIds = new Set(options.skipSessionIds || []);
-  const entries = parseTranscriptEntries(fs.readFileSync(args.transcript, 'utf8'));
-  if (!entries.length) return [];
+  const transcriptExists = Boolean(args.transcript && fs.existsSync(args.transcript));
+  const sessionId = transcriptExists ? sessionIdFromTranscriptPath(args.transcript) : '';
+  const entries = transcriptExists ? parseTranscriptEntries(fs.readFileSync(args.transcript, 'utf8')) : [];
 
   return withSchedulerLock(() => {
     const state = loadRoundState();
     const completed = [];
     let changed = false;
+
+    // Pass 1: Monotonic terminalization of dead/aborted processes independent of transcript existence
     for (const round of state.rounds) {
       if (round.status !== 'pending') continue;
+
       if (round.dispatchState === 'prepared') {
         if (!processExists(round.pid)) {
           Object.assign(round, {
@@ -1287,6 +1293,30 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
           });
           changed = true;
         }
+        continue;
+      }
+
+      if (round.dispatchState === 'dispatching') {
+        if (!processExists(round.pid)) {
+          Object.assign(round, {
+            dispatchState: 'uncertain',
+            lastError: 'Process terminated while prompt was dispatching',
+            updatedAt: nowIso(),
+          });
+          changed = true;
+        }
+      }
+    }
+
+    if (!entries.length) {
+      if (changed) saveRoundState(state);
+      return completed;
+    }
+
+    // Pass 2: Reconcile accepted / uncertain rounds against transcript
+    for (const round of state.rounds) {
+      if (round.status !== 'pending') continue;
+      if (round.dispatchState === 'prepared' || round.dispatchState === 'aborted_precommit') {
         continue;
       }
       const roundSessionId = sessionIdFromSchedulerRecord(round) || sessionId;
@@ -1898,20 +1928,15 @@ async function confirmNewConversationAccepted(page, message, baselineLastTurnId)
   const sessionId = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_TIMEOUT_MS);
   if (sessionId) return { sessionId, reloaded: false };
 
-  info(`[state] no session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms; reloading target app once to verify prompt acceptance`);
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  await settlePage(page);
-
-  const sessionIdAfterReload = await waitForSessionIdInUrl(page, NEW_SESSION_ACCEPTANCE_RELOAD_TIMEOUT_MS);
-  if (sessionIdAfterReload) return { sessionId: sessionIdAfterReload, reloaded: true };
-
+  // Fail closed without reload or resend to prevent stream detachment
   const turns = await getConversationTurns(page).catch(() => []);
   const userTurn = findUserTurnAfterBaseline(turns, message, baselineLastTurnId);
   const state = await getTargetAppState(page).catch(() => null);
   const generation = await getCombinedGenerationState(page, state).catch(() => ({ isGenerating: false }));
-  const latest = turns.length ? turns[turns.length - 1] : null;
-  const latestSummary = latest ? `${latest.role || 'unknown'}:${latest.testid || latest.index}:${(latest.text || '').slice(0, 240)}` : 'none';
-  throw new Error(`Prompt was submitted but target app did not assign a session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms; reloaded once and still no session id. User turn after reload: ${userTurn ? 'yes' : 'no'}. Generating: ${generation.isGenerating ? 'yes' : 'no'}. Latest turn: ${latestSummary}. No transcript entry was recorded; retry or recover manually.`);
+  throw cbError(
+    'NEW_SESSION_ID_UNCERTAIN',
+    `Prompt was accepted into new conversation, but target app did not assign a stable session id after ${NEW_SESSION_ACCEPTANCE_TIMEOUT_MS}ms. User turn visible: ${userTurn ? 'yes' : 'no'}. Generating: ${generation.isGenerating ? 'yes' : 'no'}. Retaining without reload to prevent stream detachment.`
+  );
 }
 
 async function sendMessage(page, message, baselineLastTurnId = '', options = {}) {
@@ -2017,6 +2042,15 @@ function hasUserTurnAfterBaseline(turns, message, baselineLastTurnId) {
 
 function normalizeTurnText(text) {
   return (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function terminalErrorForAwaitedTurn(pageState, outcome, acceptedUserTurnRef) {
+  if (!pageState?.latestAssistant?.errorText) return null;
+  if (!acceptedUserTurnRef) return pageState.latestAssistant.errorText;
+  if (outcome?.assistantTurn && pageState.latestAssistant.testid === outcome.assistantTurn.testid) {
+    return pageState.latestAssistant.errorText;
+  }
+  return null;
 }
 
 function isErrorOnlyResponseText(text) {
@@ -5430,7 +5464,9 @@ async function settlePage(page) {
 }
 
 async function openNewConversation(page) {
-  if (isTargetAppUrl(page.url()) && !sessionIdFromUrl(page.url())) {
+  const currentRouteId = routeSessionIdFromUrl(page.url());
+  const isCanonicalRoot = isTargetAppUrl(page.url()) && !currentRouteId;
+  if (isCanonicalRoot) {
     await settlePage(page);
     return;
   }
@@ -5723,6 +5759,7 @@ function queueHoldStatusForError(error) {
     case 'DISPATCH_UNCERTAIN':
     case 'CONVERSATION_NOT_HYDRATED':
     case 'CONVERSATION_LEASE_BUSY':
+    case 'NEW_SESSION_ID_UNCERTAIN':
       return 'needs_recovery';
     case 'THREAD_IDENTITY_DRIFT':
     case 'CONCURRENT_CONVERSATION_MUTATION':
@@ -5809,6 +5846,9 @@ function recoverQueueStateFromRounds(page, args, context) {
         continue;
       }
 
+      if (round && (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared')) {
+        continue;
+      }
       const finalResponse = round ? finalResponseForRound(round) : '';
       if (round && finalResponse && finalResponse.length > (round.responseChars || 0)) {
         Object.assign(round, {
@@ -6168,15 +6208,9 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     }
 
     // Structural error / terminal error detection (scoped to the awaited assistant descendant)
-    const isTargetAssistantError = Boolean(
-      pageState?.latestAssistant?.errorText && (
-        !acceptedUserTurnRef
-        || (outcome?.assistantTurn && pageState.latestAssistant.testid === outcome.assistantTurn.testid)
-      )
-    );
-
-    if (isTargetAssistantError) {
-      const error = cbError('ASSISTANT_TERMINAL_ERROR', pageState.latestAssistant.errorText, {
+    const targetAssistantError = terminalErrorForAwaitedTurn(pageState, outcome, acceptedUserTurnRef);
+    if (targetAssistantError) {
+      const error = cbError('ASSISTANT_TERMINAL_ERROR', targetAssistantError, {
         expectedSessionId,
         partialText: lastText,
       });
@@ -6212,8 +6246,10 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
         const finalState = await getTargetAppState(page).catch(() => null);
         const finalGeneration = await getCombinedGenerationState(page, finalState);
         if (!finalGeneration.isGenerating) {
-          if (finalState?.latestAssistant?.errorText) {
-            throw cbError('ASSISTANT_TERMINAL_ERROR', finalState.latestAssistant.errorText, { expectedSessionId });
+          const finalOutcome = acceptedUserTurnRef ? responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef) : null;
+          const targetError = terminalErrorForAwaitedTurn(finalState, finalOutcome, acceptedUserTurnRef);
+          if (targetError) {
+            throw cbError('ASSISTANT_TERMINAL_ERROR', targetError, { expectedSessionId });
           }
           if (finalText && isErrorOnlyResponseText(finalText)) {
             throw cbError('ASSISTANT_TERMINAL_ERROR', finalText, { expectedSessionId });
@@ -6261,8 +6297,9 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     const finalState = await getTargetAppState(page).catch(() => null);
     const finalGeneration = await getCombinedGenerationState(page, finalState);
     if (finalText && !finalGeneration.isGenerating) {
-      if (finalState?.latestAssistant?.errorText && (!finalOutcome?.assistantTurn || finalState.latestAssistant.testid === finalOutcome.assistantTurn.testid)) {
-        throw cbError('ASSISTANT_TERMINAL_ERROR', finalState.latestAssistant.errorText, { expectedSessionId });
+      const targetError = terminalErrorForAwaitedTurn(finalState, finalOutcome, acceptedUserTurnRef);
+      if (targetError) {
+        throw cbError('ASSISTANT_TERMINAL_ERROR', targetError, { expectedSessionId });
       }
       if (isErrorOnlyResponseText(finalText)) {
         throw cbError('ASSISTANT_TERMINAL_ERROR', finalText, { expectedSessionId });
@@ -6375,7 +6412,12 @@ async function ask(page, message, args) {
     const acceptedUserTurnRef = turnRef(acceptedUserTurn);
 
     if (args.newConversation) {
-      await confirmNewConversationAccepted(page, message, baselineLastTurnId);
+      const confirmation = await confirmNewConversationAccepted(page, message, baselineLastTurnId);
+      if (confirmation?.sessionId) {
+        expectedSessionId = confirmation.sessionId;
+        args.expectedSessionId = confirmation.sessionId;
+        leaseHandle = acquireConversationLease(expectedSessionId, round.id);
+      }
     }
     refreshSessionTranscript(page, args);
     await indexCurrentConversation(page, args, 'conversation_prompt_accepted').catch(() => {});
@@ -7382,6 +7424,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  terminalErrorForAwaitedTurn,
   messageHash,
   acquireConversationLease,
   releaseConversationLease,

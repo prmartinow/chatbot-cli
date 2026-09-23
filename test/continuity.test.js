@@ -20,6 +20,7 @@ const {
   acquireConversationLease,
   releaseConversationLease,
   reconcilePendingRoundsFromTranscript,
+  terminalErrorForAwaitedTurn,
   messageHash,
   cbError,
 } = require('../CB.js');
@@ -84,6 +85,40 @@ test('isErrorOnlyResponseText: Classifies UI error banners and ignores normal as
   assert.equal(isErrorOnlyResponseText(normalProse), false);
 });
 
+test('terminalErrorForAwaitedTurn: Scopes error evaluation strictly to target assistant turn', () => {
+  const pageStateWithError = {
+    latestAssistant: {
+      testid: 'turn-historical-assistant',
+      errorText: 'Something went wrong. Retry',
+    },
+  };
+
+  const outcomeMatching = {
+    assistantTurn: { testid: 'turn-historical-assistant' },
+  };
+  const outcomeDifferent = {
+    assistantTurn: { testid: 'turn-current-assistant' },
+  };
+
+  // When outcome assistant matches latestAssistant testid: reports error
+  assert.equal(
+    terminalErrorForAwaitedTurn(pageStateWithError, outcomeMatching, { testid: 'turn-user-1' }),
+    'Something went wrong. Retry'
+  );
+
+  // When outcome assistant is different: ignores historical error
+  assert.equal(
+    terminalErrorForAwaitedTurn(pageStateWithError, outcomeDifferent, { testid: 'turn-user-1' }),
+    null
+  );
+
+  // When no accepted ref: reports latest error
+  assert.equal(
+    terminalErrorForAwaitedTurn(pageStateWithError, null, null),
+    'Something went wrong. Retry'
+  );
+});
+
 test('responseAfterAcceptedTurn: Bounded turn lineage lookup', () => {
   const ref = {
     messageId: 'msg-u1',
@@ -113,31 +148,40 @@ test('responseAfterAcceptedTurn: Bounded turn lineage lookup', () => {
   assert.equal(pendingOutcome.text, '');
 });
 
-test('responseAfterRound: Window bounds do not cross later user turns and honor acceptedUserTurn ref', () => {
-  const prompt = 'First prompt';
+test('responseAfterRound: Fails closed on ambiguous repeated identical prompts and abort states', () => {
+  const prompt = 'continue';
   const promptHash = messageHash(prompt);
   const round = {
     messageHash: promptHash,
     messageHead: prompt,
+    dispatchState: 'accepted',
     acceptedUserTurn: {
       textHash: promptHash,
     },
   };
 
-  const entries = [
-    { role: 'user', text: 'First prompt' },
-    { role: 'assistant', text: 'First answer' },
-    { role: 'user', text: 'Second prompt' },
-    { role: 'assistant', text: 'Second answer' },
+  // Single occurrence: resolves cleanly
+  const singleMatchEntries = [
+    { role: 'user', text: 'continue' },
+    { role: 'assistant', text: 'Continuing with part 1...' },
   ];
+  assert.equal(responseAfterRound(singleMatchEntries, round), 'Continuing with part 1...');
 
-  assert.equal(responseAfterRound(entries, round), 'First answer');
-
-  const entriesWithError = [
-    { role: 'user', text: 'First prompt' },
-    { role: 'assistant', text: 'Something went wrong. If this issue persists... Retry' },
+  // Multiple identical prompts: fails closed as ambiguous
+  const multiMatchEntries = [
+    { role: 'user', text: 'continue' },
+    { role: 'assistant', text: 'Continuing with part 1...' },
+    { role: 'user', text: 'continue' },
+    { role: 'assistant', text: 'Continuing with part 2...' },
   ];
-  assert.equal(responseAfterRound(entriesWithError, round), '');
+  assert.equal(responseAfterRound(multiMatchEntries, round), '');
+
+  // Aborted precommit round: can never match transcript
+  const abortedRound = {
+    ...round,
+    dispatchState: 'aborted_precommit',
+  };
+  assert.equal(responseAfterRound(singleMatchEntries, abortedRound), '');
 });
 
 test('findRoundForJob: Matches explicit jobId over hash', () => {
@@ -160,13 +204,14 @@ test('queueHoldStatusForError: Maps invariant error codes to state machine', () 
   assert.equal(queueHoldStatusForError({ code: 'DISPATCH_UNCERTAIN' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_NOT_HYDRATED' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_LEASE_BUSY' }), 'needs_recovery');
+  assert.equal(queueHoldStatusForError({ code: 'NEW_SESSION_ID_UNCERTAIN' }), 'needs_recovery');
   assert.equal(queueHoldStatusForError({ code: 'THREAD_IDENTITY_DRIFT' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'CONCURRENT_CONVERSATION_MUTATION' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'ASSISTANT_TERMINAL_ERROR' }), 'failed');
   assert.equal(queueHoldStatusForError({ code: 'CONVERSATION_BUSY' }), 'failed');
 });
 
-test('ConversationLease: Atomic acquisition with token and verified release', () => {
+test('ConversationLease: Atomic acquisition with token and refusal of mismatched token release', () => {
   const syntheticSession = '33333333-3333-3333-3333-333333333333';
   const handle = acquireConversationLease(syntheticSession, 'round-test-1');
   assert.notEqual(handle, null);
@@ -178,6 +223,10 @@ test('ConversationLease: Atomic acquisition with token and verified release', ()
     () => acquireConversationLease(syntheticSession, 'round-test-2'),
     (err) => err.code === 'CONVERSATION_LEASE_BUSY'
   );
+
+  // Release with WRONG token must be ignored (lease remains on disk)
+  releaseConversationLease({ ...handle, token: 'wrong-token' });
+  assert.equal(fs.existsSync(handle.leasePath), true);
 
   // Release with matching token succeeds
   releaseConversationLease(handle);
