@@ -6701,7 +6701,7 @@ async function ask(page, message, args) {
       await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
     }
 
-    await reconcileCurrentConversation(page, args, { suppressAlias: args.newConversation }).catch(() => {});
+    await reconcileCurrentConversation(page, args, { suppressAlias: isNewChat }).catch(() => {});
     refreshSessionTranscript(page, args);
     if (args.model) {
       info(`[model] selecting ${args.model}`);
@@ -6721,7 +6721,7 @@ async function ask(page, message, args) {
       }
     }
 
-    if (args.newConversation) {
+    if (isNewChat) {
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
       await assertThreadIdentity(page, expectedSessionId, 'before send transaction');
@@ -6745,10 +6745,10 @@ async function ask(page, message, args) {
       expectedSessionId,
       jobId: args.jobId || '',
       dispatchState: 'prepared',
-      sessionBindingState: args.newConversation ? 'unbound' : 'not_applicable',
+      sessionBindingState: isNewChat ? 'unbound' : 'not_applicable',
     });
 
-    if (!args.newConversation && expectedSessionId) {
+    if (!isNewChat && expectedSessionId) {
       try {
         leaseHandle = acquireConversationLease(expectedSessionId, round.id);
       } catch (leaseError) {
@@ -6839,27 +6839,33 @@ async function ask(page, message, args) {
         }
       );
     } catch (error) {
-      const sessionId = sessionIdFromUrl(page.url());
+      const observedSessionId = sessionIdFromUrl(page.url());
       updateRound(round.id, {
         status: 'pending',
-        sessionId,
         lastError: error.message || String(error),
-        url: page.url(),
-        transcript: args.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
+        observedSessionId,
+        observedUrl: page.url(),
       }, 'round_waiting_for_recovery');
       throw error;
     }
     if (streamer) streamer.finish();
-    refreshSessionTranscript(page, args);
-    appendTranscript(args.transcript, 'assistant', response);
-    const sessionId = sessionIdFromUrl(page.url());
+
+    const finalSessionId = expectedSessionId || round.sessionId;
+    if (finalSessionId) {
+      await assertThreadIdentity(page, finalSessionId, 'before persisting completed response');
+    }
+    const finalTranscript = args.transcript || (finalSessionId ? transcriptPathForSession(finalSessionId) : '');
+    if (finalTranscript) {
+      appendTranscript(finalTranscript, 'assistant', response);
+    }
+
     updateRound(round.id, {
       status: 'done',
-      sessionId,
+      sessionId: finalSessionId,
       responseChars: response.length,
       lastError: '',
-      url: page.url(),
-      transcript: args.transcript || (sessionId ? transcriptPathForSession(sessionId) : ''),
+      url: finalSessionId ? targetConversationUrl(finalSessionId) : page.url(),
+      transcript: finalTranscript,
     }, 'round_completed');
     await indexCurrentConversation(page, args, 'conversation_turn_completed').catch(() => {});
     if (args.downloadArtifacts) {

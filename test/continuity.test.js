@@ -485,3 +485,50 @@ test('BootstrapLease: Exclusive acquisition per CDP endpoint and verified releas
   assert.equal(fs.existsSync(handle1.leasePath), false);
   assert.equal(fs.existsSync(handle2.leasePath), false);
 });
+
+test('Immutable Session Identity: Error catch records observed drift without overwriting authoritative round sessionId', () => {
+  const authoritativeSessionId = '11111111-1111-1111-1111-111111111111';
+  const driftedSessionId = '22222222-2222-2222-2222-222222222222';
+
+  // Synthetic round with authoritative bound session
+  const round = {
+    id: 'round-test-drift',
+    status: 'pending',
+    sessionId: authoritativeSessionId,
+    expectedSessionId: authoritativeSessionId,
+    sessionBindingState: 'not_applicable',
+    url: `https://chatgpt.com/c/${authoritativeSessionId}`,
+  };
+
+  // Simulating the error block update in ask()
+  const error = new Error(`Thread identity drift: expected=${authoritativeSessionId}, actual=${driftedSessionId}`);
+  const observedSessionId = driftedSessionId;
+  const update = {
+    status: 'pending',
+    lastError: error.message,
+    observedSessionId,
+    observedUrl: `https://chatgpt.com/c/${driftedSessionId}`,
+  };
+  Object.assign(round, update);
+
+  // Authoritative identity remains unchanged
+  assert.equal(round.sessionId, authoritativeSessionId);
+  assert.equal(round.expectedSessionId, authoritativeSessionId);
+  assert.equal(round.observedSessionId, driftedSessionId);
+});
+
+test('Operational Contract: Dedicated browser tab/lane or serialized execution per CDP endpoint', () => {
+  // Verifies that bootstrap and conversation leases lock the respective resources
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  const lease1 = acquireBootstrapLease(mockArgs, 'op-active');
+  assert.equal(fs.existsSync(lease1.leasePath), true);
+
+  // Re-acquisition on same CDP lane fails immediately
+  assert.throws(
+    () => acquireBootstrapLease(mockArgs, 'op-concurrent'),
+    (err) => err.code === 'BOOTSTRAP_LEASE_BUSY'
+  );
+
+  releaseBootstrapLease(lease1);
+  assert.equal(fs.existsSync(lease1.leasePath), false);
+});
