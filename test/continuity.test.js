@@ -32,6 +32,7 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  sameTurnRevision,
   validateStage1Mode,
   resolveEditableUserTurn,
   openUserTurnEditor,
@@ -1330,4 +1331,52 @@ test('waitForEditedTurnAccepted: rejects ambiguous multiple structural matches',
     async () => waitForEditedTurnAccepted(mockPage, { id: 'msg-target', testid: 'turn-target' }, editedHash, targetId, 500),
     (err) => err.code === 'EDIT_ATTRIBUTION_UNVERIFIED'
   );
+});
+
+test('sameTurnRevision: matches only when turn identity and text hash both match', () => {
+  const ref = {
+    messageId: 'msg-a1',
+    testid: 'turn-2',
+    role: 'assistant',
+    textHash: messageHash(normalizeTurnText('Original stopped answer')),
+  };
+
+  // Identical messageId and text -> true
+  assert.equal(sameTurnRevision({ messageId: 'msg-a1', testid: 'turn-2', text: 'Original stopped answer' }, ref), true);
+
+  // Reused messageId but new/different content -> false (not the same revision!)
+  assert.equal(sameTurnRevision({ messageId: 'msg-a1', testid: 'turn-2', text: 'Regenerated new answer' }, ref), false);
+
+  // Different messageId with identical text -> false
+  assert.equal(sameTurnRevision({ messageId: 'msg-a2', testid: 'turn-4', text: 'Original stopped answer' }, ref), false);
+});
+
+test('populateAndVerifyEditor: appends suffix in place while preserving initial editor markdown content', async () => {
+  const initialMarkdown = '# Header\n\n```python\nprint("hello")\n```';
+  let insertedText = '';
+  let evaluated = false;
+
+  const mockPage = {
+    keyboard: {
+      insertText: async (t) => { insertedText = t; },
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const mockEditor = {
+    textContent: async () => (insertedText ? `${initialMarkdown}${insertedText}` : initialMarkdown),
+    focus: async () => {},
+    evaluate: async (fn) => {
+      evaluated = true;
+    },
+    locator: () => ({
+      first: () => ({
+        isVisible: async () => false,
+      })
+    })
+  };
+
+  await populateAndVerifyEditor(mockPage, mockEditor, { messageId: 'msg-1' }, initialMarkdown, '.', `${initialMarkdown}.`);
+  assert.equal(evaluated, true);
+  assert.equal(insertedText, '.');
 });
