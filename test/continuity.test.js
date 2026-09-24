@@ -42,6 +42,7 @@ const {
   releaseTopologyLease,
   withTopologyLease,
   getPageTargetId,
+  openAndResolveVersionViewer,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
   takeBrowserLaneLease,
@@ -4227,4 +4228,65 @@ test('findTargetAppPage: binds args.pageTargetId from page CDP target ID', async
   const page = await findTargetAppPage(mockBrowser, args);
   assert.ok(page);
   assert.equal(args.pageTargetId, 'TARGET-BOUND-1');
+});
+
+test('findTargetAppPage: fails closed with PAGE_TARGET_ID_UNVERIFIED when page target ID cannot be derived', async () => {
+  const mockBrowser = {
+    contexts: () => [{
+      newCDPSession: async () => { throw new Error('CDP target error'); },
+      pages: () => [{
+        url: () => 'https://chatgpt.com/c/33333333-3333-4333-8333-333333333333',
+        context: () => ({ newCDPSession: async () => { throw new Error('CDP target error'); } }),
+      }],
+    }],
+  };
+
+  const args = {
+    conversation: '33333333-3333-4333-8333-333333333333',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    () => findTargetAppPage(mockBrowser, args),
+    (err) => err.code === 'PAGE_TARGET_ID_UNVERIFIED'
+  );
+});
+
+test('openAndResolveVersionViewer: fails closed with EDIT_VERSION_VIEWER_UNVERIFIED when structural ancestor is missing in production', async () => {
+  const mockTurnRoot = {
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            scrollIntoViewIfNeeded: async () => {},
+            click: async () => {},
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const mockPage = {
+    context: () => ({}), // Context function exists -> production browser context
+    locator: (sel) => {
+      if (sel.includes('Previous version')) {
+        return {
+          first: () => ({
+            waitFor: async () => {},
+            locator: () => ({ count: async () => 0 }),
+          }),
+        };
+      }
+      return { last: () => ({ count: async () => 0 }) };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    () => openAndResolveVersionViewer(mockPage, mockTurnRoot),
+    (err) => err.code === 'EDIT_VERSION_VIEWER_UNVERIFIED'
+  );
 });

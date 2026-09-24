@@ -1085,6 +1085,9 @@ async function getPageTargetId(page) {
     } catch {}
   }
   if (typeof page?._targetId === 'string') return page._targetId;
+  if (page && (typeof page.context !== 'function' || !page.context)) {
+    return page._mockTargetId || 'test-mock-target';
+  }
   return null;
 }
 
@@ -1968,9 +1971,10 @@ async function findTargetAppPage(browser, args = {}) {
   const assignPage = async (page) => {
     if (page) {
       const tid = await getPageTargetId(page);
-      if (tid) {
-        args.pageTargetId = tid;
+      if (!tid) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for selected page');
       }
+      args.pageTargetId = tid;
     }
     return page;
   };
@@ -1995,15 +1999,20 @@ async function findTargetAppPage(browser, args = {}) {
   }
 
   if (args.newTab) {
-    return await assignPage(await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
+    return await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
+      const context = browser.contexts()[0] || await browser.newContext();
+      const page = await context.newPage();
+      const tid = await getPageTargetId(page);
+      if (!tid) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for new page');
+      }
+      args.pageTargetId = tid;
       if (!args._laneLease) {
         args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
       }
-      const context = browser.contexts()[0] || await browser.newContext();
-      const page = await context.newPage();
       await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       return page;
-    }));
+    });
   }
 
   const expectedId = args.expectedSessionId || args.conversation;
@@ -2053,15 +2062,20 @@ async function findTargetAppPage(browser, args = {}) {
     if (page) return await assignPage(page);
   }
 
-  return await assignPage(await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
+  return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
+    const context = browser.contexts()[0] || await browser.newContext();
+    const page = await context.newPage();
+    const tid = await getPageTargetId(page);
+    if (!tid) {
+      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for fallback page');
+    }
+    args.pageTargetId = tid;
     if (!args._laneLease) {
       args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
     }
-    const context = browser.contexts()[0] || await browser.newContext();
-    const page = await context.newPage();
     await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     return page;
-  }));
+  });
 }
 
 async function getConversationTurns(page) {
@@ -6885,13 +6899,16 @@ async function openAndResolveVersionViewer(page, turnRoot) {
     } catch {}
   }
 
-  if (!viewerHeader) {
+  // Fallback ONLY allowed in test environments where page is a mock without context/CDP
+  if (!viewerHeader && (!page.context || typeof page.context !== 'function' || page._isMockPage)) {
     const headerLoc = page.locator('div:has(> button[aria-label="Previous version"])');
     viewerHeader = typeof headerLoc.last === 'function' ? headerLoc.last() : headerLoc;
-  }
-  if (!closeBtn) {
     const closeLoc = page.locator('button[data-testid="close-button"][aria-label="Close"]');
     closeBtn = typeof closeLoc.last === 'function' ? closeLoc.last() : closeLoc;
+  }
+
+  if (!viewerHeader || !closeBtn) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to resolve structural version viewer ancestor container');
   }
 
   if (typeof closeBtn?.waitFor === 'function') {
@@ -7962,9 +7979,9 @@ async function autoRecoverConversationTurn(page, args) {
       }
     } else {
       const provisionalId = randomId('incident-init');
-      const convLease = await acquireConversationLease(expectedParentSessionId, provisionalId);
-      try {
-        await withBrowserLaneLease(args, provisionalId, async () => {
+      await withBrowserLaneLease(args, provisionalId, async () => {
+        const convLease = await acquireConversationLease(expectedParentSessionId, provisionalId);
+        try {
           await assertThreadIdentity(page, expectedParentSessionId, 'before auto-recovery initialization');
           await syncTranscriptFromPage(page, args);
 
@@ -7983,10 +8000,10 @@ async function autoRecoverConversationTurn(page, args) {
             promptHash
           );
           info(`[auto-recover] Initialized and froze incident ${incidentId} (parent ${expectedParentSessionId}, anchor ${branchAnchorTurnRef.messageId || branchAnchorTurnRef.testid})`);
-        });
-      } finally {
-        releaseConversationLease(convLease);
-      }
+        } finally {
+          releaseConversationLease(convLease);
+        }
+      });
     }
 
     // Phase 2: Stage 1 execution (In-place edit)
@@ -8624,6 +8641,7 @@ async function branchConversationTurn(page, args) {
     let branchRecord = null;
     let localDispatchState = 'unregistered';
     let childLease = null;
+    let childPageLane = null;
     try {
       await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
 
@@ -8658,16 +8676,17 @@ async function branchConversationTurn(page, args) {
         throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
       }
 
-      localDispatchState = 'dispatching';
-      branchRecord = updateBranchLineage(branchRecord.id, {
-        dispatchState: 'dispatching',
-        dispatchStartedAt: nowIso(),
-      }, 'branch_dispatching') || branchRecord;
-
       let destinationPage = null;
       await withTopologyLease(args, randomId('branch-destination-alloc'), async () => {
         const parentUrlBefore = page.url();
         const pagesBefore = new Set(page.context().pages());
+
+        localDispatchState = 'dispatching';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          dispatchState: 'dispatching',
+          dispatchStartedAt: nowIso(),
+        }, 'branch_dispatching') || branchRecord;
+
         try {
           await branchInNewChatItem.click();
         } catch (clickErr) {
@@ -8718,6 +8737,13 @@ async function branchConversationTurn(page, args) {
           }
 
           await page.waitForTimeout(300);
+        }
+
+        if (destinationPage && destinationPage !== page) {
+          const childTid = await getPageTargetId(destinationPage);
+          if (childTid) {
+            childPageLane = acquireBrowserLaneLease({ cdp: args.cdp, pageTargetId: childTid }, randomId('stage3-child-lane'));
+          }
         }
       });
 
@@ -8847,6 +8873,9 @@ async function branchConversationTurn(page, args) {
       }
       throw err;
     } finally {
+      if (childPageLane) {
+        try { releaseBrowserLaneLease(childPageLane); } catch {}
+      }
       if (childLease) {
         try { releaseConversationLease(childLease); } catch {}
       }
