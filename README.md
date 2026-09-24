@@ -116,11 +116,15 @@ performing destructive reloads or clicking Stop.
 `--retry-edit [latest]` executes Stage 1 of the in-session recovery hierarchy. It performs
 a mandatory exact-thread clean reload (`reloadExactConversation`), locates the latest
 rendered user turn, verifies that appending `--edit-suffix` (default: `.`) produces a distinct
-turn hash (`EDIT_MUTATION_NOT_DISTINCT` check), opens the turn-scoped inline editor, asserts
+turn hash (`EDIT_MUTATION_NOT_DISTINCT` check), captures pre-edit prompt version baseline ($K$)
+via the "See versions" frontend UI (`button[data-testid="variants-turn-action-button"]`) while
+safely preserving active version branch state, opens the turn-scoped inline editor, asserts
 initial content matches the source prompt (`EDIT_EDITOR_MISMATCH`), populates the editor with
-the edited text, registers a pre-send WAL round (`operationKind: 'edit_retry'`), clicks the scoped
-Send button, attests the revised user turn, and passively monitors the regenerated assistant
-descendant until completion. Stage 1 is a one-shot operation requiring `--recovery-incident <id>`.
+the edited text, registers a pre-send WAL round (`operationKind: 'edit_retry'`) recording the
+version baseline, clicks the scoped Send button, attests the revised user turn, performs dual-vector
+version attestation verifying monotonic increment ($K \to K+1$) and rendered content hash match on
+Version $K+1$, and passively monitors the regenerated assistant descendant until completion.
+Stage 1 is a one-shot operation requiring `--recovery-incident <id>`.
 
 `--recovery-resend` executes Stage 2 of the in-session recovery hierarchy. It performs
 a mandatory exact-thread clean reload (`reloadExactConversation`) and asserts thread

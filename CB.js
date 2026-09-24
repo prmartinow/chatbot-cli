@@ -6425,6 +6425,169 @@ async function waitForEditedTurnAccepted(page, sourceUserTurn, editedHash, expec
   throw cbError('EDIT_ATTRIBUTION_UNVERIFIED', 'Timed out waiting for edited user turn to be accepted in DOM');
 }
 
+
+async function captureUserTurnVersionBaseline(page, sourceUserTurn) {
+  let turnRoot = null;
+  if (sourceUserTurn.id) {
+    turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    if (sourceUserTurn.testid) {
+      turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
+    }
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    throw cbError('EDIT_VERSION_BASELINE_UNVERIFIED', 'Could not locate target user turn container for version baseline capture');
+  }
+
+  await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
+  await turnRoot.hover().catch(() => {});
+  await page.waitForTimeout(300);
+
+  const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
+  const hasVariantsBtn = (await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false));
+
+  if (!hasVariantsBtn) {
+    return {
+      count: 1,
+      activeIndex: 1,
+      activeRenderedHash: sourceUserTurn.textHash || messageHash(normalizeTurnText(sourceUserTurn.text)),
+      method: 'variants_ui_implicit_v1',
+      capturedAt: nowIso(),
+    };
+  }
+
+  try {
+    await variantsBtn.click({ timeout: 2000 });
+  } catch {
+    await variantsBtn.click({ force: true });
+  }
+  await page.waitForTimeout(400);
+
+  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
+  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header');
+  }
+
+  const initialLabelText = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
+  const initialMatch = initialLabelText.match(/Version\s*(\d+)/i);
+  const initialIndex = initialMatch ? parseInt(initialMatch[1], 10) : 1;
+
+  const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+  let currentIndex = initialIndex;
+  while (true) {
+    const isNextDisabled = await nextBtn.isDisabled().catch(() => true);
+    if (isNextDisabled) break;
+    await nextBtn.click();
+    await page.waitForTimeout(250);
+    const label = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
+    const m = label.match(/Version\s*(\d+)/i);
+    if (m) currentIndex = parseInt(m[1], 10);
+  }
+  const totalCount = currentIndex;
+
+  const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
+  while (currentIndex > initialIndex) {
+    const isPrevDisabled = await prevBtn.isDisabled().catch(() => true);
+    if (isPrevDisabled) break;
+    await prevBtn.click();
+    await page.waitForTimeout(250);
+    const label = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
+    const m = label.match(/Version\s*(\d+)/i);
+    if (m) currentIndex = parseInt(m[1], 10);
+  }
+
+  if (currentIndex !== initialIndex) {
+    await closeBtn.click().catch(() => {});
+    throw cbError('EDIT_VERSION_RESTORE_FAILED', `Failed to restore initial prompt version ${initialIndex} (ended at ${currentIndex})`);
+  }
+
+  await closeBtn.click().catch(() => {});
+  await page.waitForTimeout(300);
+
+  return {
+    count: totalCount,
+    activeIndex: initialIndex,
+    activeRenderedHash: sourceUserTurn.textHash || messageHash(normalizeTurnText(sourceUserTurn.text)),
+    method: 'variants_ui_traversal',
+    capturedAt: nowIso(),
+  };
+}
+
+async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, editedHash) {
+  let turnRoot = null;
+  if (sourceUserTurn.id) {
+    turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    if (sourceUserTurn.testid) {
+      turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
+    }
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Could not locate target user turn container for post-edit version attestation');
+  }
+
+  await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
+  await turnRoot.hover().catch(() => {});
+  await page.waitForTimeout(300);
+
+  const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
+  const hasVariantsBtn = (await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false));
+  if (!hasVariantsBtn) {
+    throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt version count ${baseline.count + 1}, but "See versions" button is absent`);
+  }
+
+  try {
+    await variantsBtn.click({ timeout: 2000 });
+  } catch {
+    await variantsBtn.click({ force: true });
+  }
+  await page.waitForTimeout(400);
+
+  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
+  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header after edit');
+  }
+
+  const labelText = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
+  const match = labelText.match(/Version\s*(\d+)/i);
+  const activeVersion = match ? parseInt(match[1], 10) : 0;
+
+  const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+  const isNextDisabled = await nextBtn.isDisabled().catch(() => false);
+
+  const expectedVersion = baseline.count + 1;
+  if (activeVersion !== expectedVersion || !isNextDisabled) {
+    await closeBtn.click().catch(() => {});
+    throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt Version ${expectedVersion} with Next disabled, got Version ${activeVersion} (nextDisabled: ${isNextDisabled})`);
+  }
+
+  const userMessageEl = turnRoot.locator('[data-message-author-role="user"]').first();
+  const displayedText = await userMessageEl.innerText().catch(() => '');
+  const displayedHash = messageHash(normalizeTurnText(displayedText));
+
+  if (displayedHash !== editedHash) {
+    await closeBtn.click().catch(() => {});
+    throw cbError('EDIT_VERSION_CONTENT_MISMATCH', `Version ${activeVersion} displayed content hash does not match editedHash`);
+  }
+
+  await closeBtn.click().catch(() => {});
+  await page.waitForTimeout(300);
+
+  return {
+    baselineCount: baseline.count,
+    acceptedCount: expectedVersion,
+    acceptedIndex: activeVersion,
+    contentHash: displayedHash,
+    nextDisabled: true,
+    method: 'variants_ui',
+    verifiedAt: nowIso(),
+  };
+}
+
 async function retryEditTurn(page, args) {
   await prepareConversationForRead(page, args);
   const expectedSessionId = args.expectedSessionId;
@@ -6457,6 +6620,8 @@ async function retryEditTurn(page, args) {
       const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
       const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
 
+      const versionBaseline = await captureUserTurnVersionBaseline(page, sourceUser);
+
       const roundExtra = {
         expectedSessionId,
         operationKind: 'edit_retry',
@@ -6467,6 +6632,8 @@ async function retryEditTurn(page, args) {
         originalMessageHash: originalHash,
         editedMessageHash: editedHash,
         editSuffix: args.editSuffix || '.',
+        versionBaseline,
+        versionAttestation: null,
         dispatchState: 'prepared',
       };
       round = registerPendingRound(args, page, editedText, sourceUser.testid, roundExtra);
@@ -6508,12 +6675,26 @@ async function retryEditTurn(page, args) {
         throw attestErr;
       }
 
+      let versionAttestation = null;
+      try {
+        versionAttestation = await attestEditedUserTurnVersion(page, sourceUser, versionBaseline, editedHash);
+      } catch (verErr) {
+        localDispatchState = 'uncertain';
+        round = updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: verErr.message || String(verErr),
+        }, 'round_dispatch_uncertain') || round;
+        throw verErr;
+      }
+
       localDispatchState = 'accepted';
       round = updateRound(round.id, {
         dispatchState: 'accepted',
         dispatchAcceptedAt: nowIso(),
         acceptedUserTurn: attestation.acceptedTurn,
         editAttestation: { method: attestation.attestationMethod },
+        versionAttestation,
       }, 'round_dispatch_accepted') || round;
 
       const authoritativeSessionId = expectedSessionId || round.sessionId;
@@ -6883,6 +7064,8 @@ async function autoRecoverConversationTurn(page, args) {
         const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 1);
         const isTerminalModelFailure = (
           round?.dispatchState === 'accepted' &&
+          round?.versionAttestation?.baselineCount + 1 === round?.versionAttestation?.acceptedCount &&
+          round?.versionAttestation?.contentHash === round?.editedMessageHash &&
           round?.status === 'failed' &&
           (err.code === 'ASSISTANT_TERMINAL_ERROR' || round.lastError?.includes('refusal') || round.lastError?.includes('blocked'))
         );
@@ -9943,6 +10126,8 @@ module.exports = {
   updateRecoveryIncident,
   acquireRecoveryIncidentLease,
   releaseRecoveryIncidentLease,
+  captureUserTurnVersionBaseline,
+  attestEditedUserTurnVersion,
   autoRecoverConversationTurn,
   branchConversationTurn,
   recoverCandidateBranchLineage,

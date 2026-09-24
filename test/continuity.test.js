@@ -54,6 +54,8 @@ const {
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
   retryEditTurn,
+  captureUserTurnVersionBaseline,
+  attestEditedUserTurnVersion,
   validateStage3Mode,
   validateRecoverBranchMode,
   resolveBranchableTurn,
@@ -2441,4 +2443,260 @@ test('acquireRecoveryIncidentLease: enforces single-runner exclusivity per incid
   const lease2 = await acquireRecoveryIncidentLease(incidentId, 'token-2');
   assert.ok(lease2);
   releaseRecoveryIncidentLease(lease2);
+});
+
+
+test('captureUserTurnVersionBaseline: returns implicit version 1 when variants button is absent', async () => {
+  const fakeLocator = (sel) => {
+    if (sel.includes('variants-turn-action-button')) {
+      return {
+        first: () => fakeLocator(sel),
+        count: async () => 0,
+        isVisible: async () => false,
+      };
+    }
+    return {
+      first: () => fakeLocator(sel),
+      count: async () => 1,
+      scrollIntoViewIfNeeded: async () => {},
+      hover: async () => {},
+      locator: (sub) => fakeLocator(sub),
+    };
+  };
+
+  const fakePage = {
+    locator: (sel) => fakeLocator(sel),
+    waitForTimeout: async () => {},
+  };
+
+  const sourceUser = {
+    id: 'msg-u1',
+    text: 'Hello world',
+    textHash: 'hash-u1',
+  };
+
+  const baseline = await captureUserTurnVersionBaseline(fakePage, sourceUser);
+  assert.equal(baseline.count, 1);
+  assert.equal(baseline.activeIndex, 1);
+  assert.equal(baseline.method, 'variants_ui_implicit_v1');
+  assert.equal(baseline.activeRenderedHash, 'hash-u1');
+});
+
+test('captureUserTurnVersionBaseline: traverses versions to find K and restores initial active index', async () => {
+  let currentIndex = 1;
+  const maxIndex = 3;
+  let closeClicked = false;
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            innerText: async () => `Version ${currentIndex}`,
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => currentIndex >= maxIndex,
+            click: async () => { currentIndex++; },
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => currentIndex <= 1,
+            click: async () => { currentIndex--; },
+          }),
+        };
+      }
+      return { first: () => ({}) };
+    },
+  };
+
+  const fakePage = {
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          last: () => fakeHeader,
+        };
+      }
+      if (sel.includes('close-button')) {
+        return {
+          last: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => { closeClicked = true; },
+          }),
+        };
+      }
+      return {
+        first: () => ({
+          count: async () => 1,
+          scrollIntoViewIfNeeded: async () => {},
+          hover: async () => {},
+          locator: (sub) => fakePage.locator(sub),
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const sourceUser = {
+    id: 'msg-u2',
+    text: 'Hello world v1',
+    textHash: 'hash-u2',
+  };
+
+  const baseline = await captureUserTurnVersionBaseline(fakePage, sourceUser);
+  assert.equal(baseline.count, 3);
+  assert.equal(baseline.activeIndex, 1);
+  assert.equal(baseline.method, 'variants_ui_traversal');
+  assert.equal(closeClicked, true);
+  assert.equal(currentIndex, 1, 'Initial active index must be strictly restored');
+});
+
+test('attestEditedUserTurnVersion: verifies K+1 version count and matching rendered content', async () => {
+  let closeClicked = false;
+  const baseline = { count: 2, activeIndex: 2 };
+  const targetHash = 'expected-edited-hash';
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            innerText: async () => 'Version 3',
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => true,
+          }),
+        };
+      }
+      return { first: () => ({}) };
+    },
+  };
+
+  const fakePage = {
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          last: () => fakeHeader,
+        };
+      }
+      if (sel.includes('close-button')) {
+        return {
+          last: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => { closeClicked = true; },
+          }),
+        };
+      }
+      return {
+        first: () => ({
+          count: async () => 1,
+          scrollIntoViewIfNeeded: async () => {},
+          hover: async () => {},
+          locator: (sub) => {
+            if (sub.includes('author-role="user"')) {
+              return {
+                first: () => ({
+                  innerText: async () => 'Rendered content for hash matching',
+                }),
+              };
+            }
+            return fakePage.locator(sub);
+          },
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const expectedHash = messageHash(normalizeTurnText('Rendered content for hash matching'));
+  const sourceUser = { id: 'msg-u3' };
+  const attestation = await attestEditedUserTurnVersion(fakePage, sourceUser, baseline, expectedHash);
+  assert.equal(attestation.baselineCount, 2);
+  assert.equal(attestation.acceptedCount, 3);
+  assert.equal(attestation.acceptedIndex, 3);
+  assert.equal(attestation.nextDisabled, true);
+  assert.equal(closeClicked, true);
+});
+
+test('attestEditedUserTurnVersion: rejects count mismatch with EDIT_VERSION_COUNT_MISMATCH', async () => {
+  const baseline = { count: 2 };
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            innerText: async () => 'Version 2', // Stale count!
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => false,
+          }),
+        };
+      }
+      return { first: () => ({}) };
+    },
+  };
+
+  const fakePage = {
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) return { last: () => fakeHeader };
+      if (sel.includes('close-button')) return { last: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      return {
+        first: () => ({
+          count: async () => 1,
+          scrollIntoViewIfNeeded: async () => {},
+          hover: async () => {},
+          locator: (sub) => fakePage.locator(sub),
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => attestEditedUserTurnVersion(fakePage, { id: 'msg-u4' }, baseline, 'dummy-hash'),
+    (err) => err.code === 'EDIT_VERSION_COUNT_MISMATCH'
+  );
 });
