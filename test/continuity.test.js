@@ -2,6 +2,18 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
+
+// Strictly isolate test ledger and outputs to temp dir before CB.js path initialization
+const testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-continuity-tests-'));
+process.env.CHATBOT_TRANSCRIPT_DIR = testIsolationDir;
+
+test.after(() => {
+  try {
+    fs.rmSync(testIsolationDir, { recursive: true, force: true });
+  } catch {}
+});
+
 const {
   STABLE_SESSION_ID_RE,
   ROUTE_SESSION_ID_RE,
@@ -43,6 +55,7 @@ const {
   waitForEditedTurnAccepted,
   retryEditTurn,
   validateStage3Mode,
+  validateRecoverBranchMode,
   resolveBranchableTurn,
   branchConversationTurn,
   loadLineageState,
@@ -1806,4 +1819,297 @@ test('reconcileIncompleteBranches: actually updates on-disk ledger and journals 
 
   assert.strictEqual(recDispatching.dispatchState, 'dispatch_uncertain');
   assert.strictEqual(recDispatching.status, 'pending');
+});
+
+test('validateRecoverBranchMode: enforces exclusivity against other primary operations', () => {
+  assert.doesNotThrow(() => {
+    validateRecoverBranchMode({ recoverBranchId: 'branch-123' });
+  });
+
+  assert.throws(() => {
+    validateRecoverBranchMode({ recoverBranchId: 'branch-123', branchTurn: 'latest' });
+  }, /--recover-branch cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateRecoverBranchMode({ recoverBranchId: 'branch-123', message: 'hello' });
+  }, /--recover-branch cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateRecoverBranchMode({ recoverBranchId: 'branch-123', schedule: true });
+  }, /--recover-branch cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateRecoverBranchMode({ recoverBranchId: 'branch-123', recoveryResend: true });
+  }, /--recover-branch cannot be combined with another primary operation/);
+});
+
+test('reconcileIncompleteBranches: auto-completes stranded lineage_attested records to bound', () => {
+  const deadPid = 99999999;
+  const mockArgs = { recoveryIncidentId: 'INC-DEAD-TEST-ATTESTED', cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc' };
+  const mockSourceTurn = { messageId: 'msg-a2', testid: 'turn-4', role: 'assistant' };
+  const childSessionId = '22222222-3333-4444-8555-666666666666';
+
+  const branch = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+  updateBranchLineage(branch.id, {
+    pid: deadPid,
+    dispatchState: 'lineage_attested',
+    childSessionId,
+    parentAttestation: {
+      parentSessionId: '12345678-1234-4234-8234-123456789abc',
+      verifiedVia: 'dom_divider',
+    }
+  });
+
+  const reconciledState = reconcileIncompleteBranches();
+  const recBranch = reconciledState.branches.find(b => b.id === branch.id);
+
+  assert.ok(recBranch);
+  assert.strictEqual(recBranch.dispatchState, 'bound');
+  assert.strictEqual(recBranch.status, 'done');
+  assert.strictEqual(recBranch.childUrl, `https://chatgpt.com/c/${childSessionId}`);
+});
+
+test('branchConversationTurn: succeeds via same-page navigation and transitions to bound', async () => {
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  const childSessionId = '66666666-7777-4888-8999-000000000000';
+  let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
+  let menuCount = 0;
+
+  const mockMenuContainer = {
+    count: async () => 1,
+    isVisible: async () => true,
+    last: () => mockMenuContainer,
+    first: () => mockMenuContainer,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        hover: async () => { menuCount = 2; },
+      })
+    })
+  };
+
+  const mockSubmenuContainer = {
+    count: async () => 1,
+    isVisible: async () => true,
+    last: () => mockSubmenuContainer,
+    first: () => mockSubmenuContainer,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => {
+          currentUrl = `https://chatgpt.com/c/${childSessionId}`;
+        },
+      })
+    })
+  };
+
+  const mockTurnEl = {
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    last: () => mockTurnEl,
+    first: () => mockTurnEl,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => { menuCount = 1; },
+      })
+    })
+  };
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => { currentUrl = url; },
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    context: () => ({
+      pages: () => [mockPage],
+    }),
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    keyboard: { press: async () => {} },
+    $$eval: async (sel, fn) => menuCount,
+    evaluate: async (fn, ...args) => {
+      if (typeof fn === 'function') {
+        const fnStr = fn.toString();
+        if (fnStr.includes('dividerData') || fnStr.includes('branchLink')) {
+          return {
+            href: currentUrl,
+            pathname: new URL(currentUrl).pathname,
+            dividerData: {
+              hasDivider: true,
+              parentSessionId: parentSessionId,
+              branchText: 'Branched from earlier conversation',
+              precedingTurnCount: 1,
+              postDividerTurnTestids: [],
+              totalTurns: 2,
+            },
+            docTitle: 'Branch · Test',
+            sidebarTitle: 'Branch · Test',
+          };
+        }
+        if (fnStr.includes('hydrated') || fnStr.includes('sessionIdFromLocation')) {
+          const currentSessionId = routeSessionIdFromUrl(currentUrl);
+          return {
+            hydrated: true,
+            sessionId: currentSessionId,
+            turnCount: 2,
+            roleNodeCount: 2,
+            composerVisible: true,
+          };
+        }
+        if (fnStr.includes('turns') || fnStr.includes('articles') || fnStr.includes('role')) {
+          return [
+            { role: 'user', text: 'hello prompt' },
+            { role: 'assistant', text: 'response turn', messageId: 'msg-1', testid: 't-1' }
+          ];
+        }
+      }
+      return {
+        role: 'ready',
+        isGenerating: false,
+      };
+    },
+    locator: (sel) => {
+      if (sel.includes('Open new branch')) return mockMenuContainer;
+      if (sel.includes('Branch in new Chat') || sel.includes('Branch in new chat')) return mockSubmenuContainer;
+      return mockTurnEl;
+    }
+  };
+
+  const mockArgs = {
+    expectedSessionId: parentSessionId,
+    branchTurn: 'latest',
+    recoveryIncidentId: 'INC-MOCK-ORCHESTRATION',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  const res = await branchConversationTurn(mockPage, mockArgs);
+  assert.equal(res.childSessionId, childSessionId);
+  assert.equal(res.branchRecord.dispatchState, 'bound');
+  assert.equal(res.branchRecord.status, 'done');
+});
+
+test('branchConversationTurn: fails closed on destination ambiguity (new page + parent navigation)', async () => {
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
+  let menuCount = 0;
+  let newTabOpened = false;
+
+  const mockNewPage = {
+    url: () => 'https://chatgpt.com/c/77777777-8888-4999-8000-111111111111',
+  };
+
+  const mockMenuContainer = {
+    count: async () => 1,
+    isVisible: async () => true,
+    last: () => mockMenuContainer,
+    first: () => mockMenuContainer,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        hover: async () => { menuCount = 2; },
+      })
+    })
+  };
+
+  const mockSubmenuContainer = {
+    count: async () => 1,
+    isVisible: async () => true,
+    last: () => mockSubmenuContainer,
+    first: () => mockSubmenuContainer,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => {
+          // BOTH: parent navigates AND new tab opens!
+          currentUrl = 'https://chatgpt.com/c/66666666-7777-4888-8999-000000000000';
+          newTabOpened = true;
+        },
+      })
+    })
+  };
+
+  const mockTurnEl = {
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    last: () => mockTurnEl,
+    first: () => mockTurnEl,
+    waitFor: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => { menuCount = 1; },
+      })
+    })
+  };
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => { currentUrl = url; },
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    context: () => ({
+      pages: () => newTabOpened ? [mockPage, mockNewPage] : [mockPage],
+    }),
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    keyboard: { press: async () => {} },
+    $$eval: async (sel, fn) => menuCount,
+    evaluate: async (fn, ...args) => {
+      if (typeof fn === 'function') {
+        const fnStr = fn.toString();
+        if (fnStr.includes('hydrated') || fnStr.includes('sessionIdFromLocation')) {
+          return {
+            hydrated: true,
+            sessionId: parentSessionId,
+            turnCount: 2,
+            roleNodeCount: 2,
+            composerVisible: true,
+          };
+        }
+        if (fnStr.includes('turns') || fnStr.includes('articles') || fnStr.includes('role')) {
+          return [
+            { role: 'user', text: 'hello prompt' },
+            { role: 'assistant', text: 'response turn', messageId: 'msg-1', testid: 't-1' }
+          ];
+        }
+      }
+      return { role: 'ready', isGenerating: false };
+    },
+    locator: (sel) => {
+      if (sel.includes('Open new branch')) return mockMenuContainer;
+      if (sel.includes('Branch in new Chat') || sel.includes('Branch in new chat')) return mockSubmenuContainer;
+      return mockTurnEl;
+    }
+  };
+
+  const mockArgs = {
+    expectedSessionId: parentSessionId,
+    branchTurn: 'latest',
+    recoveryIncidentId: 'INC-MOCK-AMBIGUITY',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    async () => branchConversationTurn(mockPage, mockArgs),
+    (err) => err.code === 'BRANCH_DESTINATION_UNVERIFIED'
+  );
 });

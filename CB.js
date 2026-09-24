@@ -6578,6 +6578,39 @@ async function retryEditTurn(page, args) {
   return await withBrowserLaneLease(args, randomId('stage1-edit-op'), action);
 }
 
+function validateRecoverBranchMode(args) {
+  if (!args.recoverBranchId) return;
+
+  const conflicting = [
+    args.message,
+    args.newConversation,
+    args.recoveryResend,
+    args.retryEdit,
+    args.branchTurn,
+    args.schedule,
+    args.runQueue,
+    args.queueStatus,
+    args.queueWatch,
+    args.recoverQueue,
+    args.stop,
+    args.status,
+    args.watchState,
+    args.waitReady,
+    args.syncTranscript,
+    args.latestAssistant,
+    args.dismissBlocker,
+    Boolean(args.searchQuery),
+    args.models,
+    args.compactConversation,
+    args.handoffNewSession,
+    args.recoverInterrupted,
+    args.downloadArtifacts,
+  ];
+  if (conflicting.some(Boolean)) {
+    throw cbError('INVALID_RECOVERY_MODE', '--recover-branch cannot be combined with another primary operation');
+  }
+}
+
 function validateStage3Mode(args) {
   if (!args.branchTurn) return;
 
@@ -6703,7 +6736,8 @@ async function openBranchMenu(page, sourceAssistant) {
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Action menu did not appear after clicking More actions');
   }
 
-  const openBranchItem = page.locator('[role="menuitem"]:has-text("Open new branch")').last();
+  const menuContainer = page.locator('[role="menu"]:has([role="menuitem"]:has-text("Open new branch"))').last();
+  const openBranchItem = menuContainer.locator('[role="menuitem"]:has-text("Open new branch")').first();
   if (!(await openBranchItem.count().catch(() => 0)) || !(await openBranchItem.isVisible().catch(() => false))) {
     await page.keyboard.press('Escape').catch(() => {});
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item');
@@ -6712,7 +6746,8 @@ async function openBranchMenu(page, sourceAssistant) {
   await openBranchItem.hover().catch(() => {});
   await page.waitForTimeout(400);
 
-  const branchInNewChatItem = page.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').last();
+  const submenuContainer = page.locator('[role="menu"]:has([role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat"))').last();
+  const branchInNewChatItem = submenuContainer.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
   if (!(await branchInNewChatItem.count().catch(() => 0)) || !(await branchInNewChatItem.isVisible().catch(() => false))) {
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(100);
@@ -6782,6 +6817,7 @@ async function branchConversationTurn(page, args) {
         dispatchStartedAt: nowIso(),
       }, 'branch_dispatching') || branchRecord;
 
+      const parentUrlBefore = page.url();
       const pagesBefore = new Set(page.context().pages());
       try {
         await branchInNewChatItem.click();
@@ -6794,8 +6830,6 @@ async function branchConversationTurn(page, args) {
         }, 'branch_dispatch_uncertain') || branchRecord;
         throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
       }
-
-      const parentUrlBefore = page.url();
 
       // Discover destination page fail-closed against destination ambiguity
       let destinationPage = null;
@@ -6965,10 +6999,10 @@ async function branchConversationTurn(page, args) {
       throw err;
     } finally {
       if (childLease) {
-        await releaseConversationLease(childLease).catch(() => {});
+        try { releaseConversationLease(childLease); } catch {}
       }
       if (parentLease) {
-        await releaseConversationLease(parentLease).catch(() => {});
+        try { releaseConversationLease(parentLease); } catch {}
       }
     }
   };
@@ -7026,6 +7060,19 @@ function reconcileIncompleteBranches() {
           modified = true;
           appendJsonl(LINEAGE_EVENTS_PATH, {
             type: 'branch_reconciled',
+            at: branch.updatedAt,
+            branch,
+          });
+        } else if (branch.dispatchState === 'lineage_attested') {
+          ensureTranscript(transcriptPathForSession(branch.childSessionId));
+          branch.status = 'done';
+          branch.dispatchState = 'bound';
+          branch.childUrl = targetConversationUrl(branch.childSessionId);
+          branch.lastError = '';
+          branch.updatedAt = nowIso();
+          modified = true;
+          appendJsonl(LINEAGE_EVENTS_PATH, {
+            type: 'branch_bound',
             at: branch.updatedAt,
             branch,
           });
@@ -8976,6 +9023,7 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  validateRecoverBranchMode(args);
   reconcileIncompleteBranches();
 
   if (args.recoverBranchId) {
@@ -9274,6 +9322,7 @@ module.exports = {
   waitForEditedTurnAccepted,
   retryEditTurn,
   validateStage3Mode,
+  validateRecoverBranchMode,
   resolveBranchableTurn,
   openBranchMenu,
   branchConversationTurn,
