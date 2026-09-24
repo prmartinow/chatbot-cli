@@ -6722,7 +6722,13 @@ async function openBranchMenu(page, sourceAssistant) {
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate More actions button on target assistant turn');
   }
 
-  const menusBefore = await page.$$eval('[role="menu"]', els => els.length).catch(() => 0);
+  // Snapshot visible menus before clicking More actions
+  await page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    window.__cbExistingMenus = new Set(
+      Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
+    );
+  }).catch(() => {});
 
   try {
     await moreBtn.click({ timeout: 2000 });
@@ -6731,31 +6737,142 @@ async function openBranchMenu(page, sourceAssistant) {
   }
   await page.waitForTimeout(400);
 
-  const menusAfter = await page.$$eval('[role="menu"]', els => els.length).catch(() => 0);
-  if (menusAfter <= menusBefore) {
-    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Action menu did not appear after clicking More actions');
+  // Identify newly visible menu
+  let newMenuEl = null;
+  if (typeof page.evaluateHandle === 'function') {
+    const menuHandle = await page.evaluateHandle(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const current = Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
+      const existing = window.__cbExistingMenus || new Set();
+      const newlyVisible = current.filter(m => !existing.has(m));
+      delete window.__cbExistingMenus;
+      return newlyVisible.length === 1 ? newlyVisible[0] : null;
+    }).catch(() => null);
+    newMenuEl = menuHandle?.asElement?.() || menuHandle;
+    if (!newMenuEl) {
+      throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened action menu after clicking More actions');
+    }
   }
 
-  const menuContainer = page.locator('[role="menu"]:has([role="menuitem"]:has-text("Open new branch"))').last();
-  const openBranchItem = menuContainer.locator('[role="menuitem"]:has-text("Open new branch")').first();
-  if (!(await openBranchItem.count().catch(() => 0)) || !(await openBranchItem.isVisible().catch(() => false))) {
-    await page.keyboard.press('Escape').catch(() => {});
-    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item');
+  const menuContainer = newMenuEl || page.locator('[role="menu"]:has([role="menuitem"]:has-text("Open new branch"))').last();
+  let openBranchItem = null;
+  if (newMenuEl?.$) {
+    openBranchItem = await newMenuEl.$('[role="menuitem"]:has-text("Open new branch")');
+  } else {
+    openBranchItem = menuContainer.locator('[role="menuitem"]:has-text("Open new branch")').first();
   }
+
+  if (!openBranchItem) {
+    await page.keyboard.press('Escape').catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item inside opened menu');
+  }
+
+  // Snapshot visible menus before hovering "Open new branch"
+  await page.evaluate(() => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    window.__cbExistingSubmenus = new Set(
+      Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
+    );
+  }).catch(() => {});
 
   await openBranchItem.hover().catch(() => {});
   await page.waitForTimeout(400);
 
-  const submenuContainer = page.locator('[role="menu"]:has([role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat"))').last();
-  const branchInNewChatItem = submenuContainer.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
-  if (!(await branchInNewChatItem.count().catch(() => 0)) || !(await branchInNewChatItem.isVisible().catch(() => false))) {
+  // Identify newly visible submenu
+  let newSubmenuEl = null;
+  if (typeof page.evaluateHandle === 'function') {
+    const submenuHandle = await page.evaluateHandle(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const current = Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
+      const existing = window.__cbExistingSubmenus || new Set();
+      const newlyVisible = current.filter(m => !existing.has(m));
+      delete window.__cbExistingSubmenus;
+      return newlyVisible.length === 1 ? newlyVisible[0] : null;
+    }).catch(() => null);
+    newSubmenuEl = submenuHandle?.asElement?.() || submenuHandle;
+    if (!newSubmenuEl) {
+      await page.keyboard.press('Escape').catch(() => {});
+      throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened branch submenu after hovering Open new branch');
+    }
+  }
+
+  const submenuContainer = newSubmenuEl || page.locator('[role="menu"]:has([role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat"))').last();
+  let branchInNewChatItem = null;
+  if (newSubmenuEl?.$) {
+    branchInNewChatItem = await newSubmenuEl.$('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")');
+  } else {
+    branchInNewChatItem = submenuContainer.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
+  }
+
+  if (!branchInNewChatItem) {
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(100);
     await page.keyboard.press('Escape').catch(() => {});
-    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Branch in new Chat" submenu item');
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Branch in new Chat" menu item inside branch submenu');
   }
 
-  return { moreBtn, openBranchItem, branchInNewChatItem };
+  return {
+    moreBtn,
+    openBranchItem,
+    branchInNewChatItem,
+  };
+}
+
+async function recoverCandidateBranchLineage(page, args, branch) {
+  const childSessionId = branch.candidateChildSessionId || branch.childSessionId;
+  const parentSessionId = branch.parentSessionId;
+  if (!childSessionId || !parentSessionId || !STABLE_SESSION_ID_RE.test(childSessionId)) return branch;
+
+  const action = async () => {
+    let parentLease = null;
+    let childLease = null;
+    try {
+      parentLease = await acquireConversationLease(parentSessionId, randomId('recover-branch-p'));
+      childLease = await acquireConversationLease(childSessionId, randomId('recover-branch-c'));
+
+      await openConversationBySessionId(page, childSessionId);
+      await settlePage(page, 5000).catch(() => {});
+
+      const branchInfo = await getBranchInfo(page).catch(() => null);
+      if (branchInfo?.isFork && branchInfo.parentResolution === 'dom_divider' && branchInfo.parentSessionId === parentSessionId) {
+        updateBranchLineage(branch.id, {
+          dispatchState: 'lineage_attested',
+          childSessionId,
+          parentAttestation: {
+            parentSessionId,
+            verifiedVia: 'dom_divider',
+          },
+          lineageAttestation: {
+            parentSessionId: branchInfo.parentSessionId,
+            parentResolution: branchInfo.parentResolution,
+            detectionVectors: branchInfo.detectionVectors,
+            branchText: branchInfo.branchText,
+          },
+        }, 'branch_lineage_attested');
+
+        ensureTranscript(transcriptPathForSession(childSessionId));
+
+        const updated = updateBranchLineage(branch.id, {
+          status: 'done',
+          dispatchState: 'bound',
+          childSessionId,
+          childUrl: targetConversationUrl(childSessionId),
+          lastError: '',
+        }, 'branch_bound');
+
+        info(`[stage3-recover] Successfully attested and bound stranded branch ${branch.id} -> ${childSessionId}`);
+        return updated || branch;
+      } else {
+        info(`[stage3-recover] Candidate child ${childSessionId} divider could not be verified against parent ${parentSessionId}`);
+        return branch;
+      }
+    } finally {
+      if (childLease) try { releaseConversationLease(childLease); } catch {}
+      if (parentLease) try { releaseConversationLease(parentLease); } catch {}
+    }
+  };
+
+  return await withBrowserLaneLease(args, randomId('stage3-recover-branch'), action);
 }
 
 async function branchConversationTurn(page, args) {
@@ -7064,6 +7181,24 @@ function reconcileIncompleteBranches() {
             branch,
           });
         } else if (branch.dispatchState === 'lineage_attested') {
+          const validChild = STABLE_SESSION_ID_RE.test(branch.childSessionId || '');
+          const validAttestation = branch.parentAttestation?.verifiedVia === 'dom_divider' &&
+            branch.parentAttestation?.parentSessionId === branch.parentSessionId &&
+            (!branch.lineageAttestation?.parentSessionId || branch.lineageAttestation.parentSessionId === branch.parentSessionId);
+          if (!validChild || !validAttestation) {
+            branch.status = 'failed';
+            branch.dispatchState = 'lineage_unverified';
+            branch.lastError = 'Stranded lineage_attested record failed schema/parent attestation validation';
+            branch.updatedAt = nowIso();
+            modified = true;
+            appendJsonl(LINEAGE_EVENTS_PATH, {
+              type: 'branch_reconciled',
+              at: branch.updatedAt,
+              branch,
+            });
+            continue;
+          }
+
           ensureTranscript(transcriptPathForSession(branch.childSessionId));
           branch.status = 'done';
           branch.dispatchState = 'bound';
@@ -9028,10 +9163,29 @@ async function main() {
 
   if (args.recoverBranchId) {
     const state = loadLineageState();
-    const branch = state.branches.find(b => b.id === args.recoverBranchId || b.recoveryIncidentId === args.recoverBranchId);
+    let branch = state.branches.find(b => b.id === args.recoverBranchId || b.recoveryIncidentId === args.recoverBranchId);
     if (!branch) {
       throw cbError('BRANCH_NOT_FOUND', `Branch operation "${args.recoverBranchId}" not found in lineage ledger`);
     }
+
+    const candidateSessionId = branch.candidateChildSessionId || (branch.dispatchState === 'stable_candidate' ? branch.childSessionId : '');
+    const canRecoverReadOnly = Boolean(
+      candidateSessionId &&
+      STABLE_SESSION_ID_RE.test(candidateSessionId) &&
+      (branch.dispatchState === 'stable_candidate' || branch.dispatchState === 'destination_unverified') &&
+      args.cdp
+    );
+
+    if (canRecoverReadOnly) {
+      const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
+      try {
+        const page = await findTargetAppPage(browser, args);
+        branch = await recoverCandidateBranchLineage(page, args, branch);
+      } finally {
+        await browser.close().catch(() => {});
+      }
+    }
+
     console.log(JSON.stringify(branch, null, 2));
     return;
   }
@@ -9326,6 +9480,7 @@ module.exports = {
   resolveBranchableTurn,
   openBranchMenu,
   branchConversationTurn,
+  recoverCandidateBranchLineage,
   loadLineageState,
   registerPendingBranch,
   updateBranchLineage,

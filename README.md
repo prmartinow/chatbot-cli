@@ -142,9 +142,16 @@ navigates to `Open new branch` -> `Branch in new Chat`, executes the single comm
 identifies the destination page (navigated tab or newly opened tab), handles ephemeral `/c/WEB:*`
 routes until a stable child UUID is observed, and attests parent lineage via the live DOM divider
 (`a[href*="/c/<parentSessionId>"]` starting with "Branched from"). It briefly holds overlapping
-conversation leases on both parent and child during ledger persistence and transcript seeding,
+conversation leases on both parent and child during ledger persistence, establishes an empty child transcript
+without fabricating ancestry (leaving ancestral turns cleanly linked in backend lineage and beginning child transcript with post-branch turns),
 and guarantees that no user prompt is automatically sent as part of the branch transaction.
 Stage 3 is a one-shot operation requiring `--conversation <parent-uuid>` and `--recovery-incident <id>`.
+
+`--recover-branch <branch-id>`:
+Inspects or safely completes a stranded Stage 3 branch transaction from the lineage ledger. If the record is in `stable_candidate`
+or `destination_unverified` with an identified candidate child UUID, and `--cdp` is provided, performs read-only browser-backed
+attestation verifying the child tab's live DOM parent divider against the parent session before promoting the record to `lineage_attested`
+and `bound`, strictly without ever clicking branch again.
 
 `--export-context-summary` (alias: `--compact-conversation`) parses the active or
 specified conversation transcript, extracts high-signal architecture details

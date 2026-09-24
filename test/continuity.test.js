@@ -58,6 +58,8 @@ const {
   validateRecoverBranchMode,
   resolveBranchableTurn,
   branchConversationTurn,
+  recoverCandidateBranchLineage,
+  openBranchMenu,
   loadLineageState,
   registerPendingBranch,
   updateBranchLineage,
@@ -2111,5 +2113,152 @@ test('branchConversationTurn: fails closed on destination ambiguity (new page + 
   await assert.rejects(
     async () => branchConversationTurn(mockPage, mockArgs),
     (err) => err.code === 'BRANCH_DESTINATION_UNVERIFIED'
+  );
+});
+
+test('reconcileIncompleteBranches: rejects stranded lineage_attested records with invalid attestation or child ID', () => {
+  const deadPid = 99999999;
+  const mockArgs = { recoveryIncidentId: 'INC-DEAD-TEST-INVALID-ATTESTED', cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc' };
+  const mockSourceTurn = { messageId: 'msg-a3', testid: 'turn-5', role: 'assistant' };
+
+  // Case 1: invalid child session ID
+  const branch1 = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+  updateBranchLineage(branch1.id, {
+    pid: deadPid,
+    dispatchState: 'lineage_attested',
+    childSessionId: 'not-a-valid-uuid',
+    parentAttestation: {
+      parentSessionId: '12345678-1234-4234-8234-123456789abc',
+      verifiedVia: 'dom_divider',
+    }
+  });
+
+  const reconciled1 = reconcileIncompleteBranches();
+  const recBranch1 = reconciled1.branches.find(b => b.id === branch1.id);
+  assert.ok(recBranch1);
+  assert.strictEqual(recBranch1.dispatchState, 'lineage_unverified');
+  assert.strictEqual(recBranch1.status, 'failed');
+
+  // Case 2: mismatched parent session ID
+  const branch2 = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+  updateBranchLineage(branch2.id, {
+    pid: deadPid,
+    dispatchState: 'lineage_attested',
+    childSessionId: '22222222-3333-4444-8555-666666666666',
+    parentAttestation: {
+      parentSessionId: '99999999-9999-9999-9999-999999999999', // Mismatched!
+      verifiedVia: 'dom_divider',
+    }
+  });
+
+  const reconciled2 = reconcileIncompleteBranches();
+  const recBranch2 = reconciled2.branches.find(b => b.id === branch2.id);
+  assert.ok(recBranch2);
+  assert.strictEqual(recBranch2.dispatchState, 'lineage_unverified');
+  assert.strictEqual(recBranch2.status, 'failed');
+});
+
+test('recoverCandidateBranchLineage: attests candidate child and transitions stranded branch to bound', async () => {
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  const childSessionId = '66666666-7777-4888-8999-000000000000';
+  let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => { currentUrl = url; },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: (sel) => ({
+      last: () => ({
+        waitFor: async () => {},
+      })
+    }),
+    evaluate: async (fn, ...args) => {
+      if (typeof fn === 'function') {
+        const fnStr = fn.toString();
+        if (fnStr.includes('dividerData') || fnStr.includes('branchLink')) {
+          return {
+            href: currentUrl,
+            pathname: new URL(currentUrl).pathname,
+            dividerData: {
+              hasDivider: true,
+              parentSessionId: parentSessionId,
+              branchText: 'Branched from earlier conversation',
+              precedingTurnCount: 1,
+              postDividerTurnTestids: [],
+              totalTurns: 2,
+            },
+            docTitle: 'Branch · Test',
+            sidebarTitle: 'Branch · Test',
+          };
+        }
+        if (fnStr.includes('hydrated') || fnStr.includes('sessionIdFromLocation')) {
+          return {
+            hydrated: true,
+            sessionId: childSessionId,
+            turnCount: 2,
+            roleNodeCount: 2,
+            composerVisible: true,
+          };
+        }
+      }
+      return { hydrated: true };
+    }
+  };
+
+  const mockArgs = {
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  // Seed stranded branch record
+  const mockSourceTurn = { messageId: 'msg-rec-1', testid: 'turn-r1', role: 'assistant' };
+  const branch = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId,
+  });
+  const updatedRecord = updateBranchLineage(branch.id, {
+    dispatchState: 'stable_candidate',
+    candidateChildSessionId: childSessionId,
+  });
+
+  const updated = await recoverCandidateBranchLineage(mockPage, mockArgs, updatedRecord);
+  assert.ok(updated);
+  assert.strictEqual(updated.dispatchState, 'bound');
+  assert.strictEqual(updated.status, 'done');
+  assert.strictEqual(updated.childSessionId, childSessionId);
+  assert.strictEqual(updated.childUrl, `https://chatgpt.com/c/${childSessionId}`);
+});
+
+test('openBranchMenu: fails closed when no newly visible menu or duplicate menus appear', async () => {
+  const mockTurnEl = {
+    first: () => mockTurnEl,
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => {},
+      })
+    })
+  };
+
+  // Case 1: evaluateHandle returns null (no unique newly visible menu)
+  const mockPageNoMenu = {
+    locator: () => mockTurnEl,
+    waitForTimeout: async () => {},
+    evaluate: async () => {},
+    evaluateHandle: async () => null,
+  };
+
+  await assert.rejects(
+    async () => openBranchMenu(mockPageNoMenu, { messageId: 'm1' }),
+    (err) => err.code === 'BRANCH_ACTION_UNVERIFIED'
   );
 });
