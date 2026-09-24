@@ -6194,7 +6194,22 @@ async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = 
     throw cbError('EDIT_SOURCE_UNVERIFIED', 'No user turns found on active conversation page');
   }
 
-  const sourceUser = userTurns[userTurns.length - 1];
+  let sourceUser = null;
+  if (selection && selection !== 'latest') {
+    sourceUser = userTurns.find(t =>
+      (t.id && t.id === selection) ||
+      (t.testid && t.testid === selection)
+    );
+    if (!sourceUser) {
+      throw cbError('EDIT_SOURCE_NOT_FOUND', `Could not find source user turn matching ${selection}`);
+    }
+  } else {
+    sourceUser = userTurns[userTurns.length - 1];
+  }
+
+  if (sourceUser !== userTurns[userTurns.length - 1]) {
+    throw cbError('CONCURRENT_CONVERSATION_MUTATION', 'Selected user turn is no longer the latest user turn in thread');
+  }
   const originalText = sourceUser.text;
   const originalHash = messageHash(normalizeTurnText(originalText));
 
@@ -6812,8 +6827,6 @@ async function retryEditTurn(page, args) {
       const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
       const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
 
-      const versionBaseline = await captureUserTurnVersionBaseline(page, sourceUser, sourceAssistant);
-
       const roundExtra = {
         expectedSessionId,
         operationKind: 'edit_retry',
@@ -6824,12 +6837,31 @@ async function retryEditTurn(page, args) {
         originalMessageHash: originalHash,
         editedMessageHash: editedHash,
         editSuffix: args.editSuffix || '.',
-        versionBaseline,
+        versionBaseline: null,
         versionAttestation: null,
-        dispatchState: 'prepared',
+        dispatchState: 'preparing',
       };
       round = registerPendingRound(args, page, editedText, sourceUser.testid, roundExtra);
+      localDispatchState = 'preparing';
+
+      let versionBaseline = null;
+      try {
+        versionBaseline = await captureUserTurnVersionBaseline(page, sourceUser, sourceAssistant);
+      } catch (baseErr) {
+        localDispatchState = 'aborted_precommit';
+        round = updateRound(round.id, {
+          status: 'failed',
+          dispatchState: 'aborted_precommit',
+          lastError: baseErr.message || String(baseErr),
+        }, 'round_aborted') || round;
+        throw baseErr;
+      }
+
       localDispatchState = 'prepared';
+      round = updateRound(round.id, {
+        versionBaseline,
+        dispatchState: 'prepared',
+      }, 'round_prepared') || round;
 
       const { editor } = await openUserTurnEditor(page, sourceUser);
       await populateAndVerifyEditor(page, editor, sourceUser, originalText, args.editSuffix || '.', editedText);
@@ -6869,7 +6901,7 @@ async function retryEditTurn(page, args) {
 
       let versionAttestation = null;
       try {
-        versionAttestation = await attestEditedUserTurnVersion(page, sourceUser, versionBaseline, editedHash);
+        versionAttestation = await attestEditedUserTurnVersion(page, attestation.acceptedTurn || sourceUser, versionBaseline, editedHash);
       } catch (verErr) {
         localDispatchState = 'uncertain';
         round = updateRound(round.id, {
@@ -7212,8 +7244,12 @@ async function autoRecoverConversationTurn(page, args) {
     let state = loadRecoveryIncidentsState();
     let incident = state.incidents.find(i => i.id === incidentId);
 
-    // Phase 1: Initialize and freeze incident inputs if not yet registered
-    if (!incident) {
+    // Phase 1: Validate or initialize incident
+    if (incident) {
+      if (incident.parentSessionId !== expectedParentSessionId) {
+        throw cbError('INCIDENT_TARGET_MISMATCH', `Incident ${incidentId} is bound to parent ${incident.parentSessionId}, but targeting ${expectedParentSessionId}`);
+      }
+    } else {
       await assertThreadIdentity(page, expectedParentSessionId, 'before auto-recovery initialization');
       await syncTranscriptFromPage(page, args);
 
@@ -7322,94 +7358,189 @@ async function autoRecoverConversationTurn(page, args) {
 
     // Phase 3: Stage 2 execution (Same-session resend with auto-discriminator)
     if (incident.state === 'stage1_terminal_failed' || incident.state === 'stage2_running') {
-      incident = updateRecoveryIncident(incidentId, { state: 'stage2_running' }) || incident;
+      const roundState = loadRoundState();
+      const existingStage2Round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
 
-      const rawPrompt = fs.readFileSync(incident.sourcePromptPath, 'utf8');
-      const stage2Args = {
-        ...args,
-        recoveryResend: true,
-        message: rawPrompt,
-        recoveryIncidentId: incidentId,
-      };
-      validateRecoveryMode(stage2Args);
-      const stage2Message = stage2Args.message;
+      if (incident.state === 'stage2_running' && existingStage2Round) {
+        // Reconcile existing Stage 2 round rather than resending!
+        if (existingStage2Round.dispatchState === 'prepared' || existingStage2Round.dispatchState === 'aborted_precommit') {
+          info(`[auto-recover] Prior Stage 2 attempt ${existingStage2Round.id} aborted precommit; re-attempting Stage 2 preparation`);
+        } else if (existingStage2Round.dispatchState === 'accepted') {
+          if (existingStage2Round.assistantOutcome === 'succeeded') {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'completed_stage2',
+              stage2RoundId: existingStage2Round.id,
+              finalSessionId: incident.parentSessionId,
+              finalOutcome: 'stage2_succeeded',
+            }) || incident;
+            info(`[auto-recover] Reconciled Stage 2 round ${existingStage2Round.id} as completed`);
+            return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId };
+          } else if (existingStage2Round.assistantOutcome === 'terminal_error') {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage2_terminal_failed',
+              stage2RoundId: existingStage2Round.id,
+              lastError: existingStage2Round.lastError,
+            }) || incident;
+            info(`[auto-recover] Reconciled Stage 2 round was terminal failure; escalating to Stage 3`);
+          } else {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage2_needs_reconciliation',
+              stage2RoundId: existingStage2Round.id,
+              lastError: 'Stage 2 round accepted; awaiting assistant completion',
+            }) || incident;
+            return { incident, state: 'stage2_needs_reconciliation', round: existingStage2Round };
+          }
+        } else {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage2_needs_reconciliation',
+            stage2RoundId: existingStage2Round.id,
+            lastError: `Stage 2 round ${existingStage2Round.id} in uncertain dispatch state (${existingStage2Round.dispatchState}); human intervention required`,
+          }) || incident;
+          return { incident, state: 'stage2_needs_reconciliation', error: incident.lastError };
+        }
+      }
 
-      try {
-        await prepareConversationForRead(page, stage2Args);
-        const action = async () => {
+      if (incident.state === 'stage1_terminal_failed' || (incident.state === 'stage2_running' && (!existingStage2Round || existingStage2Round.dispatchState === 'aborted_precommit'))) {
+        incident = updateRecoveryIncident(incidentId, { state: 'stage2_running' }) || incident;
+
+        const rawPrompt = fs.readFileSync(incident.sourcePromptPath, 'utf8');
+        const actualHash = crypto.createHash('sha256').update(rawPrompt).digest('hex');
+        if (actualHash !== incident.sourcePromptHash) {
+          throw cbError('INCIDENT_PROMPT_INTEGRITY_MISMATCH', `Source prompt artifact hash mismatch for incident ${incidentId}`);
+        }
+
+        const stage2Args = {
+          ...args,
+          recoveryResend: true,
+          message: rawPrompt,
+          recoveryIncidentId: incidentId,
+        };
+        validateRecoveryMode(stage2Args);
+        const stage2Message = stage2Args.message;
+
+        try {
+          await prepareConversationForRead(page, stage2Args);
           if (stage2Args.expectedSessionId && sessionIdFromUrl(page.url()) !== stage2Args.expectedSessionId) {
             await openConversationBySessionId(page, stage2Args.expectedSessionId);
           }
           await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
           await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
           await syncTranscriptFromPage(page, stage2Args);
-          return await ask(page, stage2Message, stage2Args);
-        };
-        const responseText = await withBrowserLaneLease(stage2Args, randomId('stage2-resend-op'), action);
 
-        const roundState = loadRoundState();
-        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
+          // DO NOT wrap in withBrowserLaneLease! ask() acquires and owns the browser lane lease internally!
+          const responseText = await ask(page, stage2Message, stage2Args);
 
-        incident = updateRecoveryIncident(incidentId, {
-          state: 'completed_stage2',
-          stage2RoundId: round?.id || '',
-          finalSessionId: incident.parentSessionId,
-          finalOutcome: 'stage2_succeeded',
-        }) || incident;
-        info(`[auto-recover] Stage 2 succeeded for incident ${incidentId}`);
-        return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId, responseText };
-      } catch (err) {
-        const roundState = loadRoundState();
-        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
-        const isTerminalModelFailure = (
-          round?.dispatchState === 'accepted' &&
-          round?.assistantOutcome === 'terminal_error'
-        );
+          const postState = loadRoundState();
+          const round = postState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
 
-        if (isTerminalModelFailure) {
           incident = updateRecoveryIncident(incidentId, {
-            state: 'stage2_terminal_failed',
+            state: 'completed_stage2',
             stage2RoundId: round?.id || '',
-            lastError: err.message || String(err),
+            finalSessionId: incident.parentSessionId,
+            finalOutcome: 'stage2_succeeded',
           }) || incident;
-          info(`[auto-recover] Stage 2 proven terminal model failure; escalating to Stage 3`);
-        } else {
-          incident = updateRecoveryIncident(incidentId, {
-            state: 'stage2_needs_reconciliation',
-            stage2RoundId: round?.id || '',
-            lastError: err.message || String(err),
-          }) || incident;
-          throw err;
+          info(`[auto-recover] Stage 2 succeeded for incident ${incidentId}`);
+          return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId, responseText };
+        } catch (err) {
+          const postState = loadRoundState();
+          const round = postState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
+          const isTerminalModelFailure = (
+            round?.dispatchState === 'accepted' &&
+            round?.assistantOutcome === 'terminal_error'
+          );
+
+          if (isTerminalModelFailure) {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage2_terminal_failed',
+              stage2RoundId: round?.id || '',
+              lastError: err.message || String(err),
+            }) || incident;
+            info(`[auto-recover] Stage 2 proven terminal model failure; escalating to Stage 3`);
+          } else {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage2_needs_reconciliation',
+              stage2RoundId: round?.id || '',
+              lastError: err.message || String(err),
+            }) || incident;
+            throw err;
+          }
         }
       }
     }
 
     // Phase 4: Stage 3 execution (Native backend branching at frozen anchor)
     if (incident.state === 'stage2_terminal_failed' || incident.state === 'stage3_running') {
-      incident = updateRecoveryIncident(incidentId, { state: 'stage3_running' }) || incident;
+      const lineageState = loadLineageState();
+      const existingBranch = lineageState.branches.find(b => b.recoveryIncidentId === incidentId);
 
-      const stage3Args = {
-        ...args,
-        branchTurn: incident.branchAnchorTurnRef.messageId || incident.branchAnchorTurnRef.testid,
-        recoveryIncidentId: incidentId,
-      };
+      if (incident.state === 'stage3_running' && existingBranch) {
+        // Reconcile existing branch rather than branching again!
+        if (existingBranch.status === 'bound' || existingBranch.status === 'lineage_attested') {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'completed_stage3_bound',
+            stage3BranchId: existingBranch.id,
+            finalSessionId: existingBranch.childSessionId,
+            finalOutcome: 'stage3_bound',
+          }) || incident;
+          info(`[auto-recover] Reconciled Stage 3 branch ${existingBranch.id} as bound`);
+          return { incident, state: 'completed_stage3_bound', childSessionId: existingBranch.childSessionId, childUrl: existingBranch.childUrl };
+        } else if (existingBranch.status === 'stable_candidate' || existingBranch.status === 'destination_unverified') {
+          info(`[auto-recover] In-flight Stage 3 branch ${existingBranch.id} requires candidate recovery`);
+          const rec = await recoverCandidateBranchLineage(page, args, existingBranch);
+          if (rec.status === 'bound') {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'completed_stage3_bound',
+              stage3BranchId: existingBranch.id,
+              finalSessionId: rec.childSessionId,
+              finalOutcome: 'stage3_bound',
+            }) || incident;
+            return { incident, state: 'completed_stage3_bound', childSessionId: rec.childSessionId, childUrl: rec.childUrl };
+          } else {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage3_needs_reconciliation',
+              stage3BranchId: existingBranch.id,
+              lastError: `Stage 3 candidate recovery outcome: ${rec.status}`,
+            }) || incident;
+            return { incident, state: 'stage3_needs_reconciliation', error: incident.lastError };
+          }
+        } else if (existingBranch.status === 'prepared' || existingBranch.status === 'aborted_precommit') {
+          info(`[auto-recover] Prior Stage 3 branch ${existingBranch.id} aborted precommit; re-attempting Stage 3`);
+        } else {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage3_needs_reconciliation',
+            stage3BranchId: existingBranch.id,
+            lastError: `Stage 3 branch ${existingBranch.id} in uncertain state (${existingBranch.status}); human intervention required`,
+          }) || incident;
+          return { incident, state: 'stage3_needs_reconciliation', error: incident.lastError };
+        }
+      }
 
-      try {
-        const res = await branchConversationTurn(page, stage3Args);
-        incident = updateRecoveryIncident(incidentId, {
-          state: 'completed_stage3_bound',
-          stage3BranchId: res.branchRecord?.id || '',
-          finalSessionId: res.childSessionId,
-          finalOutcome: 'stage3_bound',
-        }) || incident;
-        info(`[auto-recover] Stage 3 succeeded (bound to child ${res.childSessionId}) for incident ${incidentId}`);
-        return { incident, state: 'completed_stage3_bound', childSessionId: res.childSessionId, childUrl: res.childUrl };
-      } catch (err) {
-        incident = updateRecoveryIncident(incidentId, {
-          state: 'stage3_needs_reconciliation',
-          lastError: err.message || String(err),
-        }) || incident;
-        throw err;
+      if (incident.state === 'stage2_terminal_failed' || (incident.state === 'stage3_running' && (!existingBranch || existingBranch.status === 'aborted_precommit'))) {
+        incident = updateRecoveryIncident(incidentId, { state: 'stage3_running' }) || incident;
+
+        const stage3Args = {
+          ...args,
+          branchTurn: incident.branchAnchorTurnRef.messageId || incident.branchAnchorTurnRef.testid,
+          recoveryIncidentId: incidentId,
+        };
+
+        try {
+          const res = await branchConversationTurn(page, stage3Args);
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'completed_stage3_bound',
+            stage3BranchId: res.branchRecord?.id || '',
+            finalSessionId: res.childSessionId,
+            finalOutcome: 'stage3_bound',
+          }) || incident;
+          info(`[auto-recover] Stage 3 succeeded (bound to child ${res.childSessionId}) for incident ${incidentId}`);
+          return { incident, state: 'completed_stage3_bound', childSessionId: res.childSessionId, childUrl: res.childUrl };
+        } catch (err) {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage3_needs_reconciliation',
+            lastError: err.message || String(err),
+          }) || incident;
+          throw err;
+        }
       }
     }
 
@@ -10372,6 +10503,7 @@ module.exports = {
   branchConversationTurn,
   recoverCandidateBranchLineage,
   loadLineageState,
+  saveLineageState,
   registerPendingBranch,
   updateBranchLineage,
   reconcileIncompleteBranches,

@@ -74,6 +74,7 @@ const {
   releaseRecoveryIncidentLease,
   autoRecoverConversationTurn,
   loadLineageState,
+  saveLineageState,
   registerPendingBranch,
   updateBranchLineage,
   reconcileIncompleteBranches,
@@ -3136,4 +3137,162 @@ test('autoRecoverConversationTurn: stage1_running restart reconciles existing ro
   const incidentsState = loadRecoveryIncidentsState();
   const incident = incidentsState.incidents.find(i => i.id === incidentId);
   assert.equal(incident.state, 'stage1_needs_reconciliation');
+});
+
+
+test('autoRecoverConversationTurn: rejects incident parent mismatch with INCIDENT_TARGET_MISMATCH', async () => {
+  const incidentId = 'INC-MISMATCH-TEST';
+  registerRecoveryIncident(
+    incidentId,
+    '11111111-1111-1111-1111-111111111111',
+    { id: 'u1' },
+    { messageId: 'a1' },
+    '/tmp/p1.txt',
+    'hash1'
+  );
+
+  const fakePage = {};
+  const args = {
+    expectedSessionId: '22222222-2222-2222-2222-222222222222', // Mismatch!
+    recoveryIncidentId: incidentId,
+  };
+
+  await assert.rejects(
+    async () => autoRecoverConversationTurn(fakePage, args),
+    (err) => err.code === 'INCIDENT_TARGET_MISMATCH'
+  );
+});
+
+test('autoRecoverConversationTurn: rejects modified prompt artifact with INCIDENT_PROMPT_INTEGRITY_MISMATCH', async () => {
+  const incidentId = 'INC-HASH-TEST';
+  const parentId = '33333333-3333-3333-3333-333333333333';
+  const pPath = path.join(testIsolationDir, 'prompt-hash-test.txt');
+  fs.writeFileSync(pPath, 'Original prompt content');
+  const originalHash = require('crypto').createHash('sha256').update('Original prompt content').digest('hex');
+
+  registerRecoveryIncident(
+    incidentId,
+    parentId,
+    { id: 'u1', testid: 't1' },
+    { messageId: 'a1', testid: 't2' },
+    pPath,
+    originalHash
+  );
+  updateRecoveryIncident(incidentId, { state: 'stage1_terminal_failed' });
+
+  // Tamper with prompt file on disk
+  fs.writeFileSync(pPath, 'Tampered prompt content');
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${parentId}`,
+  };
+  const args = {
+    expectedSessionId: parentId,
+    recoveryIncidentId: incidentId,
+  };
+
+  await assert.rejects(
+    async () => autoRecoverConversationTurn(fakePage, args),
+    (err) => err.code === 'INCIDENT_PROMPT_INTEGRITY_MISMATCH'
+  );
+});
+
+test('autoRecoverConversationTurn: stage2_running restart reconciles existing round and does not resend', async () => {
+  const incidentId = 'INC-S2-RESUME-TEST';
+  const parentId = '44444444-4444-4444-4444-444444444444';
+  const pPath = path.join(testIsolationDir, 'prompt-s2.txt');
+  fs.writeFileSync(pPath, 'S2 prompt text');
+  const h = require('crypto').createHash('sha256').update('S2 prompt text').digest('hex');
+
+  registerRecoveryIncident(
+    incidentId,
+    parentId,
+    { id: 'u1', testid: 't1' },
+    { messageId: 'a1', testid: 't2' },
+    pPath,
+    h
+  );
+  updateRecoveryIncident(incidentId, { state: 'stage2_running' });
+
+  // Seed existing completed Stage 2 round
+  const roundState = loadRoundState();
+  roundState.rounds.push({
+    id: 'round-s2-test',
+    recoveryIncidentId: incidentId,
+    recoveryStage: 2,
+    dispatchState: 'accepted',
+    assistantOutcome: 'succeeded',
+    expectedSessionId: parentId,
+  });
+  saveRoundState(roundState);
+
+  const fakePage = { url: () => `https://chatgpt.com/c/${parentId}` };
+  const args = { expectedSessionId: parentId, recoveryIncidentId: incidentId };
+
+  const res = await autoRecoverConversationTurn(fakePage, args);
+  assert.equal(res.state, 'completed_stage2');
+
+  const incState = loadRecoveryIncidentsState();
+  const inc = incState.incidents.find(i => i.id === incidentId);
+  assert.equal(inc.state, 'completed_stage2');
+});
+
+test('autoRecoverConversationTurn: stage3_running restart reconciles existing branch and does not branch again', async () => {
+  const incidentId = 'INC-S3-RESUME-TEST';
+  const parentId = '55555555-5555-5555-5555-555555555555';
+  const childId = '66666666-6666-6666-6666-666666666666';
+  const pPath = path.join(testIsolationDir, 'prompt-s3.txt');
+  fs.writeFileSync(pPath, 'S3 prompt text');
+  const h = require('crypto').createHash('sha256').update('S3 prompt text').digest('hex');
+
+  registerRecoveryIncident(
+    incidentId,
+    parentId,
+    { id: 'u1', testid: 't1' },
+    { messageId: 'a1', testid: 't2' },
+    pPath,
+    h
+  );
+  updateRecoveryIncident(incidentId, { state: 'stage3_running' });
+
+  // Seed existing bound Stage 3 branch
+  const lineageState = loadLineageState();
+  lineageState.branches.push({
+    id: 'branch-s3-test',
+    recoveryIncidentId: incidentId,
+    status: 'bound',
+    parentSessionId: parentId,
+    childSessionId: childId,
+    childUrl: `https://chatgpt.com/c/${childId}`,
+  });
+  saveLineageState(lineageState);
+
+  const fakePage = { url: () => `https://chatgpt.com/c/${parentId}` };
+  const args = { expectedSessionId: parentId, recoveryIncidentId: incidentId };
+
+  const res = await autoRecoverConversationTurn(fakePage, args);
+  assert.equal(res.state, 'completed_stage3_bound');
+  assert.equal(res.childSessionId, childId);
+
+  const incState = loadRecoveryIncidentsState();
+  const inc = incState.incidents.find(i => i.id === incidentId);
+  assert.equal(inc.state, 'completed_stage3_bound');
+});
+
+
+test('resolveEditableUserTurn: rejects mutation if selected turn is not the latest with CONCURRENT_CONVERSATION_MUTATION', async () => {
+  const fakePage = {
+    $$eval: async () => [
+      { role: 'user', id: 'u1', testid: 'turn-1', text: 'Prompt 1' },
+      { role: 'assistant', id: 'a1', testid: 'turn-2', text: 'Answer 1' },
+      { role: 'user', id: 'u2', testid: 'turn-3', text: 'Prompt 2' },
+      { role: 'assistant', id: 'a2', testid: 'turn-4', text: 'Answer 2' },
+    ],
+  };
+
+  // Attempting to edit u1 when u2 is now the latest user turn
+  await assert.rejects(
+    async () => resolveEditableUserTurn(fakePage, 'u1', '.'),
+    (err) => err.code === 'CONCURRENT_CONVERSATION_MUTATION'
+  );
 });
