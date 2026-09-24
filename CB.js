@@ -1863,6 +1863,20 @@ function turnMatchesRef(turn, ref) {
   return Boolean(ref.textHash && messageHash(normalizeTurnText(turn.text)) === ref.textHash);
 }
 
+function responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef) {
+  const outcome = responseAfterAcceptedTurn(turns, acceptedUserTurnRef);
+  if (priorAssistantTurnRef && outcome.assistantTurn) {
+    if (sameTurnRevision(outcome.assistantTurn, priorAssistantTurnRef)) {
+      return {
+        ...outcome,
+        text: '',
+        assistantTurn: null,
+      };
+    }
+  }
+  return outcome;
+}
+
 function responseAfterAcceptedTurn(turns, acceptedUserTurnRef) {
   if (!acceptedUserTurnRef) {
     return { text: '', assistantTurn: null, userTurnMissing: false, concurrentUserTurn: null };
@@ -6018,12 +6032,43 @@ async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = 
     throw cbError('EDIT_MUTATION_NOT_DISTINCT', `Suffix "${editSuffix}" does not produce a distinct turn hash after text normalization`);
   }
 
-  const sourceUserIdx = turns.findIndex(t => (sourceUser.id && t.id === sourceUser.id) || (sourceUser.testid && t.testid === sourceUser.testid));
+  const canonicalTurns = await getConversationTurns(page).catch(() => []);
   let sourceAssistant = null;
-  if (sourceUserIdx !== -1 && sourceUserIdx + 1 < turns.length) {
-    const nextTurn = turns[sourceUserIdx + 1];
-    if (nextTurn.role === 'assistant') {
-      sourceAssistant = nextTurn;
+  if (canonicalTurns.length) {
+    const sourceUserIdx = canonicalTurns.findIndex(t =>
+      (sourceUser.id && t.messageId === sourceUser.id) ||
+      (sourceUser.testid && t.testid === sourceUser.testid)
+    );
+    if (sourceUserIdx !== -1 && sourceUserIdx + 1 < canonicalTurns.length) {
+      const nextTurn = canonicalTurns[sourceUserIdx + 1];
+      if (nextTurn.role === 'assistant') {
+        sourceAssistant = {
+          messageId: nextTurn.messageId || nextTurn.id || '',
+          id: nextTurn.messageId || nextTurn.id || '',
+          testid: nextTurn.testid || '',
+          role: 'assistant',
+          text: nextTurn.text,
+          textHash: messageHash(normalizeTurnText(nextTurn.text)),
+        };
+      }
+    }
+  } else {
+    const sourceUserIdx = turns.findIndex(t =>
+      (sourceUser.id && t.id === sourceUser.id) ||
+      (sourceUser.testid && t.testid === sourceUser.testid)
+    );
+    if (sourceUserIdx !== -1 && sourceUserIdx + 1 < turns.length) {
+      const nextTurn = turns[sourceUserIdx + 1];
+      if (nextTurn.role === 'assistant') {
+        sourceAssistant = {
+          messageId: nextTurn.id || '',
+          id: nextTurn.id || '',
+          testid: nextTurn.testid || '',
+          role: 'assistant',
+          text: nextTurn.text,
+          textHash: messageHash(normalizeTurnText(nextTurn.text)),
+        };
+      }
     }
   }
 
@@ -6036,13 +6081,7 @@ async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = 
       text: originalText,
       textHash: originalHash,
     },
-    sourceAssistant: sourceAssistant ? {
-      messageId: sourceAssistant.id,
-      id: sourceAssistant.id,
-      testid: sourceAssistant.testid,
-      role: 'assistant',
-      textHash: messageHash(normalizeTurnText(sourceAssistant.text)),
-    } : null,
+    sourceAssistant,
     originalText,
     editedText,
     originalHash,
@@ -6101,6 +6140,8 @@ async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalTex
     throw cbError('EDIT_EDITOR_MISMATCH', 'Initial inline editor text does not match captured source message');
   }
 
+  const expectedEditorText = `${initialText}${editSuffix}`;
+
   await editor.focus();
   await editor.evaluate((el) => {
     const range = document.createRange();
@@ -6114,7 +6155,7 @@ async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalTex
   await page.waitForTimeout(300);
 
   const populatedText = await editor.textContent().catch(() => '');
-  if (normalizeTurnText(populatedText) !== normalizeTurnText(editedText)) {
+  if (normalizeTurnText(populatedText) !== normalizeTurnText(expectedEditorText)) {
     const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
     const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
     if (await cancelBtn.isVisible().catch(() => false)) {
@@ -6136,7 +6177,16 @@ async function submitEditedUserTurn(page, editor, expectedSessionId) {
   }
 
   await assertThreadIdentity(page, expectedSessionId, 'immediately before edit submission');
-  const generation = await getCombinedGenerationState(page);
+  let generation;
+  try {
+    generation = await getCombinedGenerationState(page);
+  } catch (genErr) {
+    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw genErr;
+  }
   if (generation.isGenerating) {
     const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
     if (await cancelBtn.isVisible().catch(() => false)) {
@@ -7130,18 +7180,12 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     let outcome = null;
 
     if (acceptedUserTurnRef) {
-      outcome = responseAfterAcceptedTurn(turns, acceptedUserTurnRef);
+      outcome = responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef);
       if (outcome.concurrentUserTurn) {
         throw cbError('CONCURRENT_CONVERSATION_MUTATION', 'Another user turn appeared before the awaited assistant response', {
           expectedSessionId,
           concurrentUserTurn: outcome.concurrentUserTurn,
         });
-      }
-      if (priorAssistantTurnRef && outcome.assistantTurn) {
-        if (sameTurnRevision(outcome.assistantTurn, priorAssistantTurnRef)) {
-          outcome.assistantTurn = null;
-          outcome.text = '';
-        }
       }
       text = outcome.text;
     } else {
@@ -7188,14 +7232,14 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
         const finalTurns = await getConversationTurns(page).catch(() => []);
         let finalText = '';
         if (acceptedUserTurnRef) {
-          finalText = responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef).text;
+          finalText = responseAfterAcceptedTurnExcludingRevision(finalTurns, acceptedUserTurnRef, priorAssistantTurnRef).text;
         } else {
           finalText = responseAfterMessage(finalTurns, message, baselineLastTurnId);
         }
         const finalState = await getTargetAppState(page).catch(() => null);
         const finalGeneration = await getCombinedGenerationState(page, finalState);
         if (!finalGeneration.isGenerating) {
-          const finalOutcome = acceptedUserTurnRef ? responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef) : null;
+          const finalOutcome = acceptedUserTurnRef ? responseAfterAcceptedTurnExcludingRevision(finalTurns, acceptedUserTurnRef, priorAssistantTurnRef) : null;
           const targetError = terminalErrorForAwaitedTurn(finalState, finalOutcome, acceptedUserTurnRef);
           if (targetError) {
             throw cbError('ASSISTANT_TERMINAL_ERROR', targetError, { expectedSessionId });
@@ -7238,7 +7282,7 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
     let finalText = '';
     let finalOutcome = null;
     if (acceptedUserTurnRef) {
-      finalOutcome = responseAfterAcceptedTurn(finalTurns, acceptedUserTurnRef);
+      finalOutcome = responseAfterAcceptedTurnExcludingRevision(finalTurns, acceptedUserTurnRef, priorAssistantTurnRef);
       finalText = finalOutcome.text;
     } else {
       finalText = responseAfterMessage(finalTurns, message, baselineLastTurnId);
@@ -8589,6 +8633,7 @@ if (require.main === module) {
 
 module.exports = {
   parseArgs,
+  responseAfterAcceptedTurnExcludingRevision,
   sameTurnRevision,
   validateStage1Mode,
   resolveEditableUserTurn,

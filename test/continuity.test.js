@@ -32,6 +32,7 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  responseAfterAcceptedTurnExcludingRevision,
   sameTurnRevision,
   validateStage1Mode,
   resolveEditableUserTurn,
@@ -1379,4 +1380,62 @@ test('populateAndVerifyEditor: appends suffix in place while preserving initial 
   await populateAndVerifyEditor(mockPage, mockEditor, { messageId: 'msg-1' }, initialMarkdown, '.', `${initialMarkdown}.`);
   assert.equal(evaluated, true);
   assert.equal(insertedText, '.');
+});
+
+test('responseAfterAcceptedTurnExcludingRevision: excludes prior stopped assistant revision consistently across reads', () => {
+  const userRef = { messageId: 'msg-u1', testid: 'turn-1', role: 'user', textHash: 'h_u1' };
+  const priorAssistantRef = {
+    messageId: 'msg-a1',
+    testid: 'turn-2',
+    role: 'assistant',
+    textHash: messageHash(normalizeTurnText('Stopped response text')),
+  };
+
+  const priorTurns = [
+    { messageId: 'msg-u1', testid: 'turn-1', role: 'user', text: 'Prompt' },
+    { messageId: 'msg-a1', testid: 'turn-2', role: 'assistant', text: 'Stopped response text' },
+  ];
+
+  // Prior assistant matches -> excluded (empty response)
+  const excludedOutcome = responseAfterAcceptedTurnExcludingRevision(priorTurns, userRef, priorAssistantRef);
+  assert.equal(excludedOutcome.text, '');
+  assert.equal(excludedOutcome.assistantTurn, null);
+
+  // Regenerated assistant has same messageId but new text -> accepted!
+  const regeneratedTurns = [
+    { messageId: 'msg-u1', testid: 'turn-1', role: 'user', text: 'Prompt.' },
+    { messageId: 'msg-a1', testid: 'turn-2', role: 'assistant', text: 'Completely regenerated response text!' },
+  ];
+  const acceptedOutcome = responseAfterAcceptedTurnExcludingRevision(regeneratedTurns, userRef, priorAssistantRef);
+  assert.equal(acceptedOutcome.text, 'Completely regenerated response text!');
+  assert.equal(acceptedOutcome.assistantTurn.messageId, 'msg-a1');
+});
+
+test('populateAndVerifyEditor: verifies markdown editor against initial editor text, preserving complex code/markdown formatting', async () => {
+  const rawEditorMarkdown = '# Section Title\n\n```python\ndef solve():\n    return 42\n```';
+  const renderedText = 'Section Title python def solve(): return 42'; // stripped of markdown
+  let insertedSuffix = '';
+
+  const mockPage = {
+    keyboard: {
+      insertText: async (t) => { insertedSuffix = t; },
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const mockEditor = {
+    textContent: async () => (insertedSuffix ? `${rawEditorMarkdown}${insertedSuffix}` : rawEditorMarkdown),
+    focus: async () => {},
+    evaluate: async (fn) => {},
+    locator: () => ({
+      locator: () => ({
+        first: () => ({ isVisible: async () => false }),
+      }),
+    }),
+  };
+
+  // initialText (markdown) matches renderedText (plain text) under normalizePromptForRenderedComparison
+  // and post-insertion verifies against expectedEditorText (markdown + suffix)
+  await populateAndVerifyEditor(mockPage, mockEditor, { messageId: 'msg-1' }, renderedText, '.', `${rawEditorMarkdown}.`);
+  assert.equal(insertedSuffix, '.');
 });
