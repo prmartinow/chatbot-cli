@@ -5945,8 +5945,7 @@ function validateRecoveryMode(args) {
     args.compactConversation,
     args.handoffNewSession,
     args.recoverInterrupted,
-    args.downloadCanvas,
-    args.downloadCode,
+    args.downloadArtifacts,
   ];
   if (conflictingRecoveryActions.some(Boolean)) {
     throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with another primary operation');
