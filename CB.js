@@ -6062,11 +6062,23 @@ function validateStage1Mode(args) {
 
 function sameTurnRevision(turn, ref) {
   if (!turn || !ref) return false;
+  const hashMatches = messageHash(normalizeTurnText(turn.text)) === ref.textHash;
+  if (!hashMatches) return false;
+
   const turnId = turn.messageId || turn.id || '';
   const refId = ref.messageId || ref.id || '';
-  const idMatches = (turnId && refId && turnId === refId) || (turn.testid && ref.testid && turn.testid === ref.testid);
-  const hashMatches = messageHash(normalizeTurnText(turn.text)) === ref.textHash;
-  return Boolean(idMatches && hashMatches);
+
+  // Strong message identity wins when both sides expose it
+  if (turnId && refId) {
+    return turnId === refId;
+  }
+
+  // Only fall back to positional/testid identity when message ID is unavailable
+  if (turn.testid && ref.testid) {
+    return turn.testid === ref.testid;
+  }
+
+  return false;
 }
 
 async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = '.') {
