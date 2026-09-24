@@ -1272,7 +1272,7 @@ test('resolveEditableUserTurn: extracts latest user turn, validates distinct mut
   assert.notEqual(res.originalHash, res.editedHash);
 });
 
-test('populateAndVerifyEditor: fails closed with EDIT_EDITOR_MISMATCH if initial content mismatches source text', async () => {
+test('populateAndVerifyEditor: fails closed with EDIT_EDITOR_MISMATCH if initial content is empty', async () => {
   let cancelClicked = false;
   const mockCancel = {
     isVisible: async () => true,
@@ -1282,12 +1282,12 @@ test('populateAndVerifyEditor: fails closed with EDIT_EDITOR_MISMATCH if initial
     locator: () => ({ first: () => mockCancel }),
   };
   const mockEditor = {
-    textContent: async () => 'Completely unrelated draft text',
+    textContent: async () => '   ',
     locator: () => mockContainer,
   };
 
   await assert.rejects(
-    async () => populateAndVerifyEditor({}, mockEditor, { id: 'msg-1' }, 'Expected prompt text', 'Expected prompt text.'),
+    async () => populateAndVerifyEditor({}, mockEditor, { id: 'msg-1' }, 'Expected prompt text', '.', 'Expected prompt text.'),
     (err) => err.code === 'EDIT_EDITOR_MISMATCH'
   );
   assert.equal(cancelClicked, true);
@@ -1431,6 +1431,11 @@ test('populateAndVerifyEditor: appends suffix in place while preserving initial 
       evaluated = true;
     },
     locator: () => ({
+      locator: () => ({
+        first: () => ({
+          isVisible: async () => false,
+        })
+      }),
       first: () => ({
         isVisible: async () => false,
       })

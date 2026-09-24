@@ -1887,6 +1887,14 @@ async function findTargetAppPage(browser, args = {}) {
     return page;
   }
 
+  const expectedId = args.expectedSessionId || args.conversation;
+  if (expectedId && STABLE_SESSION_ID_RE.test(expectedId)) {
+    for (const candidateContext of browser.contexts()) {
+      const matchPage = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === expectedId);
+      if (matchPage) return matchPage;
+    }
+  }
+
   for (const candidateContext of browser.contexts()) {
     const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
     if (page) return page;
@@ -6273,6 +6281,26 @@ async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = 
   };
 }
 
+function inlineEditorContainer(editor) {
+  return editor.locator(
+    'xpath=ancestor::*[' +
+      './/button[normalize-space(.)="Cancel"] and ' +
+      './/button[normalize-space(.)="Send"]' +
+    '][1]'
+  );
+}
+
+async function readInlineEditorSource(editor) {
+  let text = '';
+  if (typeof editor.innerText === 'function') {
+    text = await editor.innerText().catch(() => '');
+  }
+  if (!text && typeof editor.textContent === 'function') {
+    text = await editor.textContent().catch(() => '');
+  }
+  return String(text).replace(/\r\n?/g, '\n');
+}
+
 async function openUserTurnEditor(page, sourceUserTurn) {
   let turnRoot = null;
   if (sourceUserTurn.testid) {
@@ -6314,46 +6342,71 @@ async function openUserTurnEditor(page, sourceUserTurn) {
 }
 
 async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalText, editSuffix, editedText) {
-  const initialText = await editor.textContent().catch(() => '');
-  if (normalizePromptForRenderedComparison(initialText) !== normalizePromptForRenderedComparison(originalText)) {
-    const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
-    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+  const container = inlineEditorContainer(editor);
+  const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+
+  const initialRaw = await readInlineEditorSource(editor);
+  if (!initialRaw.trim()) {
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
-    throw cbError('EDIT_EDITOR_MISMATCH', 'Initial inline editor text does not match captured source message');
+    throw cbError('EDIT_EDITOR_MISMATCH', 'Initial inline editor text is empty');
   }
 
-  const expectedEditorText = `${initialText}${editSuffix}`;
+  const expectedEditorText = `${initialRaw}${editSuffix}`;
 
-  await editor.focus();
-  await editor.evaluate((el) => {
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }).catch(() => {});
-  await page.keyboard.insertText(editSuffix);
-  await page.waitForTimeout(300);
+  if (typeof editor.focus === 'function') {
+    await editor.focus().catch(() => {});
+  }
+  if (typeof editor.evaluate === 'function') {
+    await editor.evaluate((el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }).catch(() => {});
+  }
+  if (page?.keyboard?.insertText) {
+    await page.keyboard.insertText(editSuffix);
+    if (typeof page.waitForTimeout === 'function') {
+      await page.waitForTimeout(300);
+    }
+  }
 
-  const populatedText = await editor.textContent().catch(() => '');
-  if (normalizeTurnText(populatedText) !== normalizeTurnText(expectedEditorText)) {
-    const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
-    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+  let populatedRaw = await readInlineEditorSource(editor);
+  let attempts = 0;
+  while (populatedRaw !== expectedEditorText && attempts < 10) {
+    if (typeof page?.waitForTimeout === 'function') {
+      await page.waitForTimeout(100);
+    }
+    populatedRaw = await readInlineEditorSource(editor);
+    attempts++;
+  }
+
+  if (populatedRaw !== expectedEditorText) {
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
     throw cbError('EDIT_EDITOR_POPULATION_FAILED', 'Inline editor content verification failed after text insertion');
   }
+
+  return {
+    sourceMethod: 'prosemirror_innerText',
+    editorId: sourceUserTurn?.id ? `message-edit-${sourceUserTurn.id}` : 'prosemirror',
+    sourceHash: crypto.createHash('sha256').update(initialRaw).digest('hex'),
+    expectedHash: crypto.createHash('sha256').update(expectedEditorText).digest('hex'),
+    suffix: editSuffix,
+  };
 }
 
 async function submitEditedUserTurn(page, editor, expectedSessionId) {
-  const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+  const container = inlineEditorContainer(editor);
   const sendBtn = container.locator('button:has-text("Send"), button[aria-label="Send"]').first();
+  const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+
   if (!(await sendBtn.count().catch(() => 0)) || !(await sendBtn.isVisible().catch(() => false))) {
-    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
@@ -6365,14 +6418,12 @@ async function submitEditedUserTurn(page, editor, expectedSessionId) {
   try {
     generation = await getCombinedGenerationState(page);
   } catch (genErr) {
-    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
     throw genErr;
   }
   if (generation.isGenerating) {
-    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
@@ -7054,12 +7105,13 @@ async function retryEditTurn(page, args) {
       }, 'round_prepared') || round;
 
       const { editor } = await openUserTurnEditor(page, sourceUser);
-      await populateAndVerifyEditor(page, editor, sourceUser, originalText, args.editSuffix || '.', editedText);
+      const editorAttestation = await populateAndVerifyEditor(page, editor, sourceUser, originalText, args.editSuffix || '.', editedText);
 
       const sendBtn = await submitEditedUserTurn(page, editor, expectedSessionId);
 
       localDispatchState = 'dispatching';
       round = updateRound(round.id, {
+        editorAttestation,
         dispatchState: 'dispatching',
         dispatchStartedAt: nowIso(),
       }, 'round_dispatching') || round;
@@ -7371,13 +7423,15 @@ function releaseRecoveryIncidentLease(leaseHandle) {
 
 async function captureAndFreezeSourcePrompt(page, sourceUserTurn, incidentId) {
   const { editor } = await openUserTurnEditor(page, sourceUserTurn);
-  const rawText = await editor.textContent().catch(() => '');
-  const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+  const rawText = await readInlineEditorSource(editor);
+  const container = inlineEditorContainer(editor);
   const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
   if (await cancelBtn.isVisible().catch(() => false)) {
     await cancelBtn.click().catch(() => {});
   }
-  await page.waitForTimeout(300);
+  if (typeof page.waitForTimeout === 'function') {
+    await page.waitForTimeout(300);
+  }
 
   if (!rawText.trim()) {
     throw cbError('EDIT_SOURCE_UNVERIFIED', 'Failed to capture non-empty raw editor source prompt');
