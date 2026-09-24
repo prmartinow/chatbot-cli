@@ -7054,6 +7054,12 @@ async function reconcileStage1EditTurn(page, args, round) {
     round = updateRound(round.id, {
       dispatchState: 'commit_verifying',
     }, 'round_commit_verifying') || round;
+  } else if (round.dispatchState === 'dispatching' || round.dispatchState === 'uncertain') {
+    // For dispatching or uncertain states, verify generation is not active before reload
+    const gen = await getCombinedGenerationState(page).catch(() => ({ isGenerating: false }));
+    if (gen.isGenerating) {
+      return { outcome: 'uncertain', round };
+    }
   }
 
   await reloadExactConversation(page, sessionId, 'stage1-reconcile-reload');
@@ -7178,6 +7184,7 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
   const start = Date.now();
   let generationObserved = false;
   let idleCountAfterActive = 0;
+  let completedDescendantSamples = 0;
 
   while (true) {
     if (timeoutMs > 0 && Date.now() - start > timeoutMs) {
@@ -7190,6 +7197,7 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
     if (gen.isGenerating) {
       generationObserved = true;
       idleCountAfterActive = 0;
+      completedDescendantSamples = 0;
     } else if (generationObserved) {
       idleCountAfterActive++;
       if (idleCountAfterActive >= 2) {
@@ -7199,7 +7207,12 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
       const turns = await getConversationTurns(page).catch(() => []);
       const outcome = responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef);
       if (outcome && outcome.text && outcome.text.trim()) {
-        return { quiescent: true, generationObserved: false, reason: 'assistant_descendant_completed', outcome };
+        completedDescendantSamples++;
+        if (completedDescendantSamples >= 2) {
+          return { quiescent: true, generationObserved: false, reason: 'assistant_descendant_completed', outcome };
+        }
+      } else {
+        completedDescendantSamples = 0;
       }
     }
 
@@ -7339,7 +7352,7 @@ async function retryEditTurn(page, args) {
       }, 'round_client_accepted') || round;
 
       // 2. Passive Quiescence Observation (never reload or click Stop during this phase)
-      const quiescenceTimeout = args.timeout > 0 ? args.timeout * 1000 : 0;
+      const quiescenceTimeout = args.timeout > 0 ? args.timeout : 0;
       const q = await waitForStage1PostSendQuiescence(page, expectedSessionId, {
         acceptedUserTurnRef: clientAttestation.acceptedTurn,
         priorAssistantTurnRef: sourceAssistant,
