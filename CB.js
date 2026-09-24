@@ -7042,6 +7042,10 @@ async function reconcileStage1EditTurn(page, args, round) {
     return { outcome: 'uncertain', round };
   }
 
+  if (round.dispatchState === 'dispatching') {
+    return { outcome: 'uncertain', round };
+  }
+
   if (round.dispatchState === 'client_accepted') {
     const q = await waitForStage1PostSendQuiescence(page, sessionId, {
       acceptedUserTurnRef: round.clientAcceptedUserTurn || round.sourceUserTurn,
@@ -7053,13 +7057,16 @@ async function reconcileStage1EditTurn(page, args, round) {
     }
     round = updateRound(round.id, {
       dispatchState: 'commit_verifying',
+      quiescenceAttestation: q,
     }, 'round_commit_verifying') || round;
-  } else if (round.dispatchState === 'dispatching' || round.dispatchState === 'uncertain') {
-    // For dispatching or uncertain states, verify generation is not active before reload
-    const gen = await getCombinedGenerationState(page).catch(() => ({ isGenerating: false }));
-    if (gen.isGenerating) {
-      return { outcome: 'uncertain', round };
-    }
+  }
+
+  if (round.dispatchState === 'uncertain' && !round.quiescenceAttestation) {
+    return { outcome: 'uncertain', round };
+  }
+
+  if (round.dispatchState !== 'commit_verifying' && !round.quiescenceAttestation) {
+    return { outcome: 'uncertain', round };
   }
 
   await reloadExactConversation(page, sessionId, 'stage1-reconcile-reload');
@@ -7184,6 +7191,7 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
   const start = Date.now();
   let generationObserved = false;
   let idleCountAfterActive = 0;
+  let lastDescendantKey = null;
   let completedDescendantSamples = 0;
 
   while (true) {
@@ -7197,6 +7205,7 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
     if (gen.isGenerating) {
       generationObserved = true;
       idleCountAfterActive = 0;
+      lastDescendantKey = null;
       completedDescendantSamples = 0;
     } else if (generationObserved) {
       idleCountAfterActive++;
@@ -7207,11 +7216,23 @@ async function waitForStage1PostSendQuiescence(page, expectedSessionId, options 
       const turns = await getConversationTurns(page).catch(() => []);
       const outcome = responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef);
       if (outcome && outcome.text && outcome.text.trim()) {
-        completedDescendantSamples++;
-        if (completedDescendantSamples >= 2) {
-          return { quiescent: true, generationObserved: false, reason: 'assistant_descendant_completed', outcome };
+        const descendantKey = [
+          outcome.assistantTurn?.messageId || '',
+          outcome.assistantTurn?.testid || '',
+          messageHash(normalizeTurnText(outcome.text)),
+        ].join(':');
+
+        if (descendantKey === lastDescendantKey) {
+          completedDescendantSamples++;
+          if (completedDescendantSamples >= 2) {
+            return { quiescent: true, generationObserved: false, reason: 'assistant_descendant_completed', outcome };
+          }
+        } else {
+          lastDescendantKey = descendantKey;
+          completedDescendantSamples = 1;
         }
       } else {
+        lastDescendantKey = null;
         completedDescendantSamples = 0;
       }
     }
@@ -7372,6 +7393,7 @@ async function retryEditTurn(page, args) {
       localDispatchState = 'commit_verifying';
       round = updateRound(round.id, {
         dispatchState: 'commit_verifying',
+        quiescenceAttestation: q,
       }, 'round_commit_verifying') || round;
 
       // 3. Exact Thread Reload as a Commit Barrier against frontend pretense:

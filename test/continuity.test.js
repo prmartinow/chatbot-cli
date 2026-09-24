@@ -2845,7 +2845,7 @@ test('reconcileStage1EditTurn: positively promotes uncertain round to accepted w
     id: 'round-recon-1',
     operationKind: 'edit_retry',
     recoveryStage: 1,
-    dispatchState: 'uncertain',
+    dispatchState: 'commit_verifying',
     expectedSessionId: '44444444-4444-4444-4444-444444444444',
     sourceUserTurn: { id: 'msg-rec-1', testid: 'turn-rec-1' },
     versionBaseline: { count: 1 },
@@ -2924,6 +2924,7 @@ test('reconcileStage1EditTurn: remains uncertain when version count is still K (
     operationKind: 'edit_retry',
     recoveryStage: 1,
     dispatchState: 'uncertain',
+    quiescenceAttestation: { quiescent: true },
     expectedSessionId: '55555555-5555-5555-5555-555555555555',
     sourceUserTurn: { id: 'msg-rec-2', testid: 'turn-rec-2' },
     versionBaseline: { count: 1 },
@@ -2966,7 +2967,7 @@ test('reconcileStage1EditTurn: marks conflict when observed version > expected K
     id: 'round-recon-conflict-1',
     operationKind: 'edit_retry',
     recoveryStage: 1,
-    dispatchState: 'uncertain',
+    dispatchState: 'commit_verifying',
     expectedSessionId: '66666666-6666-6666-6666-666666666666',
     sourceUserTurn: { id: 'msg-rec-c1', testid: 'turn-rec-c1' },
     versionBaseline: { count: 1 },
@@ -3025,7 +3026,7 @@ test('reconcileStage1EditTurn: marks conflict when content hash mismatches expec
     id: 'round-recon-conflict-2',
     operationKind: 'edit_retry',
     recoveryStage: 1,
-    dispatchState: 'uncertain',
+    dispatchState: 'commit_verifying',
     expectedSessionId: '77777777-7777-7777-7777-777777777777',
     sourceUserTurn: { id: 'msg-rec-c2', testid: 'turn-rec-c2' },
     versionBaseline: { count: 1 },
@@ -3810,7 +3811,7 @@ test('reconcileStage1EditTurn: proves numeric K+1 under Current version via pred
     id: 'round-recon-curr',
     operationKind: 'edit_retry',
     recoveryStage: 1,
-    dispatchState: 'uncertain',
+    dispatchState: 'commit_verifying',
     status: 'pending',
     expectedSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
     sourceUserTurn: { testid: 'turn-u-recon', text: 'Original text' },
@@ -3992,4 +3993,50 @@ test('waitForStage1PostSendQuiescence: returns quiescent=false on timeout when t
   const res = await waitForStage1PostSendQuiescence(mockPage, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', { timeoutMs: 50 });
   assert.equal(res.quiescent, false);
   assert.equal(res.timedOut, true);
+});
+
+test('reconcileStage1EditTurn: dispatching round returns uncertain without executing clean reload', async () => {
+  let reloaded = false;
+  const mockPage = {
+    url: () => 'https://chatgpt.com/c/44444444-4444-4444-4444-444444444444',
+    reload: async () => { reloaded = true; },
+  };
+  const mockRound = {
+    id: 'round-disp-1',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    expectedSessionId: '44444444-4444-4444-4444-444444444444',
+    sessionId: '44444444-4444-4444-4444-444444444444',
+    dispatchState: 'dispatching',
+    sourceUserTurn: { id: 'msg-1', testid: 'turn-1' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: 'some_hash',
+  };
+
+  const res = await reconcileStage1EditTurn(mockPage, {}, mockRound);
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(reloaded, false);
+});
+
+test('reconcileStage1EditTurn: generic uncertain round without quiescence returns uncertain without reloading', async () => {
+  let reloaded = false;
+  const mockPage = {
+    url: () => 'https://chatgpt.com/c/44444444-4444-4444-4444-444444444444',
+    reload: async () => { reloaded = true; },
+  };
+  const mockRound = {
+    id: 'round-uncert-1',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    expectedSessionId: '44444444-4444-4444-4444-444444444444',
+    sessionId: '44444444-4444-4444-4444-444444444444',
+    dispatchState: 'uncertain',
+    sourceUserTurn: { id: 'msg-1', testid: 'turn-1' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: 'some_hash',
+  };
+
+  const res = await reconcileStage1EditTurn(mockPage, {}, mockRound);
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(reloaded, false);
 });
