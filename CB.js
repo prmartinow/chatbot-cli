@@ -8743,9 +8743,10 @@ async function branchConversationTurn(page, args) {
 
         if (destinationPage && destinationPage !== page) {
           const childTid = await getPageTargetId(destinationPage);
-          if (childTid) {
-            childPageLane = acquireBrowserLaneLease({ cdp: args.cdp, pageTargetId: childTid }, randomId('stage3-child-lane'));
+          if (!childTid) {
+            throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for Stage 3 child page');
           }
+          childPageLane = acquireBrowserLaneLease({ cdp: args.cdp, pageTargetId: childTid }, randomId('stage3-child-lane'));
         }
       });
 

@@ -4290,3 +4290,92 @@ test('openAndResolveVersionViewer: fails closed with EDIT_VERSION_VIEWER_UNVERIF
     (err) => err.code === 'EDIT_VERSION_VIEWER_UNVERIFIED'
   );
 });
+
+test('branchConversationTurn: fails closed with PAGE_TARGET_ID_UNVERIFIED when child target ID cannot be established', async () => {
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  let branchClicked = false;
+  let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
+
+  const mockChildPage = {
+    url: () => 'https://chatgpt.com/c/WEB:provisional-child',
+    context: () => ({
+      newCDPSession: async () => { throw new Error('Child CDP session failed'); },
+    }),
+    waitForLoadState: async () => {},
+  };
+
+  let evalHandleCalls = 0;
+  const mockMenuEl = { $$: async (sel) => [{ hover: async () => {} }] };
+  const mockSubmenuEl = { $$: async (sel) => [{ click: async () => { branchClicked = true; } }] };
+
+  const ctx = {
+    pages: () => branchClicked ? [mockParentPage, mockChildPage] : [mockParentPage],
+    newCDPSession: async () => ({
+      send: async () => ({ targetInfo: { targetId: 'PARENT-TARGET' } }),
+      detach: async () => {},
+    }),
+  };
+
+  const item = {
+    count: async () => 1,
+    isVisible: async () => true,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    click: async () => {},
+    waitFor: async () => {},
+  };
+  item.first = () => item;
+  item.last = () => item;
+  item.locator = () => item;
+
+  const mockParentPage = {
+    url: () => currentUrl,
+    goto: async (url) => { currentUrl = url; },
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    context: () => ctx,
+    waitForTimeout: async () => {},
+    waitForSelector: async () => {},
+    keyboard: { press: async () => {} },
+    locator: (sel) => item,
+    evaluateHandle: async () => {
+      evalHandleCalls++;
+      if (evalHandleCalls === 1) return { asElement: () => mockMenuEl, dispose: async () => {} };
+      return { asElement: () => mockSubmenuEl, dispose: async () => {} };
+    },
+    evaluate: async (fn, ...args) => {
+      if (typeof fn === 'function') {
+        const fnStr = fn.toString();
+        if (fnStr.includes('hydrated') || fnStr.includes('sessionIdFromLocation')) {
+          return {
+            hydrated: true,
+            sessionId: parentSessionId,
+            turnCount: 2,
+            roleNodeCount: 2,
+            composerVisible: true,
+          };
+        }
+        if (fnStr.includes('turns') || fnStr.includes('articles') || fnStr.includes('role')) {
+          return [
+            { role: 'user', text: 'hello prompt' },
+            { role: 'assistant', text: 'response turn', messageId: 'msg-1', testid: 't-1' }
+          ];
+        }
+      }
+      return { role: 'ready', isGenerating: false };
+    },
+  };
+
+  const args = {
+    expectedSessionId: parentSessionId,
+    branchTurn: 'latest',
+    recoveryIncidentId: 'INC-TEST-125',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    () => branchConversationTurn(mockParentPage, args),
+    (err) => err.code === 'PAGE_TARGET_ID_UNVERIFIED'
+  );
+});
