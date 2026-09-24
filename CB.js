@@ -7042,6 +7042,20 @@ async function reconcileStage1EditTurn(page, args, round) {
     return { outcome: 'uncertain', round };
   }
 
+  if (round.dispatchState === 'client_accepted') {
+    const q = await waitForStage1PostSendQuiescence(page, sessionId, {
+      acceptedUserTurnRef: round.clientAcceptedUserTurn || round.sourceUserTurn,
+      priorAssistantTurnRef: round.sourceAssistantTurn,
+      timeoutMs: 0,
+    });
+    if (!q.quiescent) {
+      return { outcome: 'uncertain', round };
+    }
+    round = updateRound(round.id, {
+      dispatchState: 'commit_verifying',
+    }, 'round_commit_verifying') || round;
+  }
+
   await reloadExactConversation(page, sessionId, 'stage1-reconcile-reload');
   await assertThreadIdentity(page, sessionId, 'during stage1 crash reconciliation');
 
@@ -7156,34 +7170,45 @@ async function reconcileStage1EditTurn(page, args, round) {
 
   return { outcome: 'uncertain', round };
 }
-async function waitForStage1PostSendQuiescence(page, expectedSessionId, timeoutMs = 300000) {
+async function waitForStage1PostSendQuiescence(page, expectedSessionId, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 0;
+  const acceptedUserTurnRef = options.acceptedUserTurnRef || null;
+  const priorAssistantTurnRef = options.priorAssistantTurnRef || null;
+
   const start = Date.now();
   let generationObserved = false;
-  let idleConsecutiveCount = 0;
+  let idleCountAfterActive = 0;
 
-  while (Date.now() - start < timeoutMs) {
+  while (true) {
+    if (timeoutMs > 0 && Date.now() - start > timeoutMs) {
+      return { quiescent: false, timedOut: true, generationObserved };
+    }
+
     await assertThreadIdentity(page, expectedSessionId, 'while awaiting stage1 post-send quiescence');
     const gen = await getCombinedGenerationState(page);
+
     if (gen.isGenerating) {
       generationObserved = true;
-      idleConsecutiveCount = 0;
-    } else {
-      idleConsecutiveCount++;
-      if (generationObserved && idleConsecutiveCount >= 2) {
-        return { quiescent: true, generationObserved: true };
+      idleCountAfterActive = 0;
+    } else if (generationObserved) {
+      idleCountAfterActive++;
+      if (idleCountAfterActive >= 2) {
+        return { quiescent: true, generationObserved: true, reason: 'generation_completed' };
       }
-      if (!generationObserved && idleConsecutiveCount >= 6) {
-        return { quiescent: true, generationObserved: false };
+    } else if (acceptedUserTurnRef) {
+      const turns = await getConversationTurns(page).catch(() => []);
+      const outcome = responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef);
+      if (outcome && outcome.text && outcome.text.trim()) {
+        return { quiescent: true, generationObserved: false, reason: 'assistant_descendant_completed', outcome };
       }
     }
+
     if (typeof page.waitForTimeout === 'function') {
       await page.waitForTimeout(500);
     } else {
       await new Promise((r) => setTimeout(r, 500));
     }
   }
-
-  return { quiescent: true, timedOut: true, generationObserved };
 }
 
 async function retryEditTurn(page, args) {
@@ -7279,9 +7304,20 @@ async function retryEditTurn(page, args) {
       }
 
       // 1. Client Acceptance: editor unmounts and live DOM reflects editedHash
-      if (typeof editor.waitFor === 'function') {
-        await editor.waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
+      try {
+        if (typeof editor.waitFor === 'function') {
+          await editor.waitFor({ state: 'detached', timeout: 15000 });
+        }
+      } catch (detachErr) {
+        localDispatchState = 'uncertain';
+        round = updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: `Editor failed to detach after Send click: ${detachErr.message || detachErr}`,
+        }, 'round_dispatch_uncertain') || round;
+        throw cbError('EDIT_DISPATCH_UNCERTAIN', 'Editor failed to detach after Send click');
       }
+
       let clientAttestation;
       try {
         clientAttestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId, 15000);
@@ -7303,7 +7339,22 @@ async function retryEditTurn(page, args) {
       }, 'round_client_accepted') || round;
 
       // 2. Passive Quiescence Observation (never reload or click Stop during this phase)
-      await waitForStage1PostSendQuiescence(page, expectedSessionId);
+      const quiescenceTimeout = args.timeout > 0 ? args.timeout * 1000 : 0;
+      const q = await waitForStage1PostSendQuiescence(page, expectedSessionId, {
+        acceptedUserTurnRef: clientAttestation.acceptedTurn,
+        priorAssistantTurnRef: sourceAssistant,
+        timeoutMs: quiescenceTimeout,
+      });
+
+      if (!q.quiescent) {
+        localDispatchState = 'uncertain';
+        round = updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: 'Post-Send quiescence could not be verified within timeout window',
+        }, 'round_dispatch_uncertain') || round;
+        throw cbError('POST_SEND_QUIESCENCE_UNVERIFIED', 'Post-Send quiescence could not be verified');
+      }
 
       localDispatchState = 'commit_verifying';
       round = updateRound(round.id, {
@@ -7370,7 +7421,7 @@ async function retryEditTurn(page, args) {
           streamer ? (event) => streamer.update(event) : null,
           {
             expectedSessionId: authoritativeSessionId,
-            acceptedUserTurnRef: attestation.acceptedTurn,
+            acceptedUserTurnRef: serverAttestation.acceptedTurn,
             priorAssistantTurnRef: sourceAssistant,
           }
         );
@@ -10939,6 +10990,7 @@ module.exports = {
   getGenerationState,
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
+  waitForStage1PostSendQuiescence,
   retryEditTurn,
   validateStage3Mode,
   validateRecoverBranchMode,

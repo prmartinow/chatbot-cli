@@ -54,6 +54,7 @@ const {
   getGenerationState,
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
+  waitForStage1PostSendQuiescence,
   retryEditTurn,
   captureUserTurnVersionBaseline,
   attestEditedUserTurnVersion,
@@ -3957,4 +3958,38 @@ test('getGenerationState: ignores bare Cancel and editor Cancel button while det
 
   const res2 = await getGenerationState(pageWithBoth);
   assert.equal(res2.isGenerating, true);
+});
+
+test('waitForStage1PostSendQuiescence: completes positively when generation is active then becomes idle', async () => {
+  let calls = 0;
+  const mockPage = {
+    url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    evaluate: async () => {
+      calls++;
+      // Call 1 & 2: generating = true
+      // Call 3 & 4: generating = false (quiescent)
+      return { isGenerating: calls <= 2 };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await waitForStage1PostSendQuiescence(mockPage, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', { timeoutMs: 5000 });
+  assert.equal(res.quiescent, true);
+  assert.equal(res.generationObserved, true);
+  assert.equal(res.reason, 'generation_completed');
+});
+
+test('waitForStage1PostSendQuiescence: returns quiescent=false on timeout when timeout is set', async () => {
+  const mockPage = {
+    url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    evaluate: async () => ({ isGenerating: false }),
+    waitForTimeout: async () => {
+      // Simulate time passage
+      await new Promise((r) => setTimeout(r, 60));
+    },
+  };
+
+  const res = await waitForStage1PostSendQuiescence(mockPage, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', { timeoutMs: 50 });
+  assert.equal(res.quiescent, false);
+  assert.equal(res.timedOut, true);
 });
