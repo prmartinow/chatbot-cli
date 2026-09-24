@@ -1741,3 +1741,69 @@ test('reconcileIncompleteBranches: transitions dead owner records to aborted_pre
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test('registerPendingBranch and updateBranchLineage: actually persist records to lineage.json and journal to lineage.jsonl', () => {
+  const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'cb-lineage-test-'));
+  const oldLineageFile = path.join(tmpDir, 'lineage.json');
+  const oldLineageJsonl = path.join(tmpDir, 'lineage.jsonl');
+
+  const mockArgs = { recoveryIncidentId: 'INC-STAGE3-TEST', cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc' };
+  const mockSourceTurn = { messageId: 'msg-a1', testid: 'turn-2', role: 'assistant' };
+
+  const branch = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+
+  assert.strictEqual(branch.operationKind, 'native_branch');
+  assert.strictEqual(branch.recoveryStage, 3);
+  assert.strictEqual(branch.dispatchState, 'prepared');
+
+  // Verify that updateBranchLineage updates memory and journal
+  const updated = updateBranchLineage(branch.id, {
+    dispatchState: 'dispatching',
+    dispatchStartedAt: new Date().toISOString(),
+  }, 'branch_dispatching');
+
+  assert.strictEqual(updated.dispatchState, 'dispatching');
+
+  // Test loadLineageState schema check
+  const state = loadLineageState();
+  assert.ok(Array.isArray(state.branches));
+  const found = state.branches.find(b => b.id === branch.id);
+  assert.ok(found);
+  assert.strictEqual(found.dispatchState, 'dispatching');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('reconcileIncompleteBranches: actually updates on-disk ledger and journals branch_reconciled events', () => {
+  const deadPid = 99999999;
+  const mockArgs = { recoveryIncidentId: 'INC-DEAD-TEST', cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc' };
+  const mockSourceTurn = { messageId: 'msg-a1', testid: 'turn-2', role: 'assistant' };
+
+  const branchPrepared = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+  // Simulate dead PID
+  branchPrepared.pid = deadPid;
+  updateBranchLineage(branchPrepared.id, { pid: deadPid });
+
+  const branchDispatching = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId: '12345678-1234-4234-8234-123456789abc'
+  });
+  branchDispatching.pid = deadPid;
+  updateBranchLineage(branchDispatching.id, { pid: deadPid, dispatchState: 'dispatching' });
+
+  // Actually invoke reconcileIncompleteBranches()
+  const reconciledState = reconcileIncompleteBranches();
+  const recPrepared = reconciledState.branches.find(b => b.id === branchPrepared.id);
+  const recDispatching = reconciledState.branches.find(b => b.id === branchDispatching.id);
+
+  assert.strictEqual(recPrepared.dispatchState, 'aborted_precommit');
+  assert.strictEqual(recPrepared.status, 'failed');
+
+  assert.strictEqual(recDispatching.dispatchState, 'dispatch_uncertain');
+  assert.strictEqual(recDispatching.status, 'pending');
+});

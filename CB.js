@@ -378,6 +378,7 @@ function parseArgs(argv) {
         args.branchTurn = 'latest';
       }
     }
+    else if (arg === '--recover-branch') args.recoverBranchId = next();
     else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -1405,19 +1406,23 @@ function updateRound(roundId, patch, eventType = 'round_updated') {
 
 function loadLineageState() {
   if (!fs.existsSync(LINEAGE_STATE_PATH)) {
-    return { branches: [] };
+    return { version: 1, updatedAt: '', branches: [] };
   }
   try {
     const raw = fs.readFileSync(LINEAGE_STATE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
-    return { branches: Array.isArray(parsed.branches) ? parsed.branches : [] };
-  } catch {
-    return { branches: [] };
+    if (!parsed || !Array.isArray(parsed.branches)) {
+      throw cbError('LINEAGE_STATE_CORRUPT', 'lineage.json has invalid branch state schema');
+    }
+    return parsed;
+  } catch (err) {
+    if (err.code === 'LINEAGE_STATE_CORRUPT') throw err;
+    throw cbError('LINEAGE_STATE_CORRUPT', `Failed to parse lineage.json: ${err.message || err}`);
   }
 }
 
 function saveLineageState(state) {
-  writeJsonAtomic(LINEAGE_STATE_PATH, state);
+  atomicWriteJson(LINEAGE_STATE_PATH, state);
 }
 
 function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
@@ -6684,10 +6689,21 @@ async function openBranchMenu(page, sourceAssistant) {
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate More actions button on target assistant turn');
   }
 
-  await moreBtn.click({ force: true });
+  const menusBefore = await page.$$eval('[role="menu"]', els => els.length).catch(() => 0);
+
+  try {
+    await moreBtn.click({ timeout: 2000 });
+  } catch {
+    await moreBtn.click({ force: true });
+  }
   await page.waitForTimeout(400);
 
-  const openBranchItem = page.locator('[role="menuitem"]:has-text("Open new branch")').first();
+  const menusAfter = await page.$$eval('[role="menu"]', els => els.length).catch(() => 0);
+  if (menusAfter <= menusBefore) {
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Action menu did not appear after clicking More actions');
+  }
+
+  const openBranchItem = page.locator('[role="menuitem"]:has-text("Open new branch")').last();
   if (!(await openBranchItem.count().catch(() => 0)) || !(await openBranchItem.isVisible().catch(() => false))) {
     await page.keyboard.press('Escape').catch(() => {});
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item');
@@ -6696,7 +6712,7 @@ async function openBranchMenu(page, sourceAssistant) {
   await openBranchItem.hover().catch(() => {});
   await page.waitForTimeout(400);
 
-  const branchInNewChatItem = page.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
+  const branchInNewChatItem = page.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').last();
   if (!(await branchInNewChatItem.count().catch(() => 0)) || !(await branchInNewChatItem.isVisible().catch(() => false))) {
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(100);
@@ -6779,14 +6795,28 @@ async function branchConversationTurn(page, args) {
         throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
       }
 
-      // Discover destination page
+      const parentUrlBefore = page.url();
+
+      // Discover destination page fail-closed against destination ambiguity
       let destinationPage = null;
       const startWait = Date.now();
       while (Date.now() - startWait < 15000) {
         const currentPages = page.context().pages();
         const newPages = currentPages.filter((p) => !pagesBefore.has(p));
+        const parentNavigated = page.url() !== parentUrlBefore;
+
+        if (newPages.length > 0 && parentNavigated) {
+          localDispatchState = 'destination_unverified';
+          branchRecord = updateBranchLineage(branchRecord.id, {
+            status: 'pending',
+            dispatchState: 'destination_unverified',
+            lastError: 'Ambiguous destination: newly opened page detected and source page also navigated',
+          }, 'branch_destination_unverified') || branchRecord;
+          throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Ambiguous destination: newly opened page detected and source page also navigated');
+        }
+
         if (newPages.length > 1) {
-          localDispatchState = 'uncertain';
+          localDispatchState = 'destination_unverified';
           branchRecord = updateBranchLineage(branchRecord.id, {
             status: 'pending',
             dispatchState: 'destination_unverified',
@@ -6794,19 +6824,22 @@ async function branchConversationTurn(page, args) {
           }, 'branch_destination_unverified') || branchRecord;
           throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Multiple newly opened pages detected after branch click');
         }
-        if (newPages.length === 1) {
+
+        if (newPages.length === 1 && !parentNavigated) {
           destinationPage = newPages[0];
           break;
         }
-        if (page.url() !== branchRecord.sourceUrl) {
+
+        if (newPages.length === 0 && parentNavigated) {
           destinationPage = page;
           break;
         }
+
         await page.waitForTimeout(300);
       }
 
       if (!destinationPage) {
-        localDispatchState = 'uncertain';
+        localDispatchState = 'destination_unverified';
         branchRecord = updateBranchLineage(branchRecord.id, {
           status: 'pending',
           dispatchState: 'destination_unverified',
@@ -6817,15 +6850,14 @@ async function branchConversationTurn(page, args) {
 
       await destinationPage.waitForLoadState('domcontentloaded').catch(() => {});
 
-      // Validate destination page origin matches target base
-      const targetBase = new URL(page.url());
+      const expectedOrigin = new URL(branchRecord.sourceUrl).origin;
       const destUrl = new URL(destinationPage.url());
-      if (destUrl.origin !== targetBase.origin) {
-        localDispatchState = 'uncertain';
+      if (destUrl.origin !== expectedOrigin) {
+        localDispatchState = 'destination_unverified';
         branchRecord = updateBranchLineage(branchRecord.id, {
           status: 'pending',
           dispatchState: 'destination_unverified',
-          lastError: `Destination page origin "${destUrl.origin}" does not match target origin "${targetBase.origin}"`,
+          lastError: `Destination page origin "${destUrl.origin}" does not match target origin "${expectedOrigin}"`,
         }, 'branch_destination_unverified') || branchRecord;
         throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Destination page origin does not match ChatGPT target origin');
       }
@@ -6852,6 +6884,13 @@ async function branchConversationTurn(page, args) {
       }
 
       if (childSessionId === expectedParentSessionId) {
+        localDispatchState = 'destination_unverified';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'failed',
+          dispatchState: 'destination_unverified',
+          candidateChildSessionId: childSessionId,
+          lastError: 'Child session ID matches parent session ID',
+        }, 'branch_destination_unverified') || branchRecord;
         throw cbError('BRANCH_IDENTITY_INVALID', 'Child session ID matches parent session ID');
       }
 
@@ -6963,12 +7002,33 @@ function reconcileIncompleteBranches() {
           branch.lastError = 'Owner process died before branch dispatch';
           branch.updatedAt = nowIso();
           modified = true;
+          appendJsonl(LINEAGE_EVENTS_PATH, {
+            type: 'branch_reconciled',
+            at: branch.updatedAt,
+            branch,
+          });
         } else if (branch.dispatchState === 'dispatching') {
           branch.status = 'pending';
           branch.dispatchState = 'dispatch_uncertain';
           branch.lastError = 'Owner process died during branch dispatch';
           branch.updatedAt = nowIso();
           modified = true;
+          appendJsonl(LINEAGE_EVENTS_PATH, {
+            type: 'branch_reconciled',
+            at: branch.updatedAt,
+            branch,
+          });
+        } else if (branch.dispatchState === 'provisional' || branch.dispatchState === 'stable_candidate') {
+          branch.status = 'pending';
+          branch.dispatchState = 'destination_unverified';
+          branch.lastError = 'Owner process died before child lineage verification';
+          branch.updatedAt = nowIso();
+          modified = true;
+          appendJsonl(LINEAGE_EVENTS_PATH, {
+            type: 'branch_reconciled',
+            at: branch.updatedAt,
+            branch,
+          });
         }
       }
     }
@@ -8914,6 +8974,18 @@ async function main() {
     args.message = await readAllStdin();
   } else if (!args.message && !process.stdin.isTTY) {
     args.scriptedInput = await readAllStdin();
+  }
+
+  reconcileIncompleteBranches();
+
+  if (args.recoverBranchId) {
+    const state = loadLineageState();
+    const branch = state.branches.find(b => b.id === args.recoverBranchId || b.recoveryIncidentId === args.recoverBranchId);
+    if (!branch) {
+      throw cbError('BRANCH_NOT_FOUND', `Branch operation "${args.recoverBranchId}" not found in lineage ledger`);
+    }
+    console.log(JSON.stringify(branch, null, 2));
+    return;
   }
 
   validateStage1Mode(args);
