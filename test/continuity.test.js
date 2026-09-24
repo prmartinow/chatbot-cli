@@ -56,6 +56,9 @@ const {
   retryEditTurn,
   captureUserTurnVersionBaseline,
   attestEditedUserTurnVersion,
+  reconcileStage1EditTurn,
+  loadRoundState,
+  saveRoundState,
   validateStage3Mode,
   validateRecoverBranchMode,
   resolveBranchableTurn,
@@ -682,11 +685,19 @@ test('findTargetAppPage: Acquires and assigns browserLaneLease before creating n
     contexts: () => [{
       newPage: async () => ({
         goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
       }),
     }],
     newContext: async () => ({
       newPage: async () => ({
         goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
       }),
     }),
   };
@@ -729,12 +740,20 @@ test('findTargetAppPage: Acquires browserLaneLease for fallback page creation wh
       pages: () => [],
       newPage: async () => ({
         goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
       }),
     }],
     newContext: async () => ({
       pages: () => [],
       newPage: async () => ({
         goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
       }),
     }),
   };
@@ -2446,13 +2465,20 @@ test('acquireRecoveryIncidentLease: enforces single-runner exclusivity per incid
 });
 
 
-test('captureUserTurnVersionBaseline: returns implicit version 1 when variants button is absent', async () => {
+test('captureUserTurnVersionBaseline: returns implicit version 1 when variants button is absent and action bar is mounted', async () => {
   const fakeLocator = (sel) => {
     if (sel.includes('variants-turn-action-button')) {
       return {
         first: () => fakeLocator(sel),
         count: async () => 0,
         isVisible: async () => false,
+      };
+    }
+    if (sel.includes('Your message actions')) {
+      return {
+        first: () => fakeLocator(sel),
+        count: async () => 1,
+        isVisible: async () => true,
       };
     }
     return {
@@ -2482,6 +2508,35 @@ test('captureUserTurnVersionBaseline: returns implicit version 1 when variants b
   assert.equal(baseline.activeRenderedHash, 'hash-u1');
 });
 
+test('captureUserTurnVersionBaseline: fails closed if action bar is unhydrated (does not assume K=1)', async () => {
+  const fakeLocator = (sel) => {
+    if (sel.includes('Your message actions')) {
+      return {
+        first: () => fakeLocator(sel),
+        count: async () => 0,
+        isVisible: async () => false,
+      };
+    }
+    return {
+      first: () => fakeLocator(sel),
+      count: async () => 1,
+      scrollIntoViewIfNeeded: async () => {},
+      hover: async () => {},
+      locator: (sub) => fakeLocator(sub),
+    };
+  };
+
+  const fakePage = {
+    locator: (sel) => fakeLocator(sel),
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => captureUserTurnVersionBaseline(fakePage, { id: 'msg-u-unhydrated', text: 'hi' }),
+    (err) => err.code === 'EDIT_VERSION_BASELINE_UNVERIFIED'
+  );
+});
+
 test('captureUserTurnVersionBaseline: traverses versions to find K and restores initial active index', async () => {
   let currentIndex = 1;
   const maxIndex = 3;
@@ -2492,6 +2547,7 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
       if (sel.includes('Version ')) {
         return {
           first: () => ({
+            count: async () => 1,
             innerText: async () => `Version ${currentIndex}`,
           }),
         };
@@ -2512,12 +2568,33 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
           }),
         };
       }
-      return { first: () => ({}) };
+      return { first: () => ({ count: async () => 0 }) };
     },
   };
 
+  const sourceUser = {
+    id: 'msg-u2',
+    testid: 'turn-user-2',
+    text: 'Hello world v1',
+    textHash: messageHash(normalizeTurnText('Hello world v1')),
+  };
+
   const fakePage = {
+    evaluate: async () => [
+      {
+        index: 0,
+        testid: 'turn-user-2',
+        messageId: 'msg-u2',
+        role: 'user',
+        text: 'Hello world v1',
+      },
+    ],
     locator: (sel) => {
+      if (sel.includes('Your message actions')) {
+        return {
+          first: () => ({ count: async () => 1, isVisible: async () => true }),
+        };
+      }
       if (sel.includes('variants-turn-action-button')) {
         return {
           first: () => ({
@@ -2553,12 +2630,6 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
     waitForTimeout: async () => {},
   };
 
-  const sourceUser = {
-    id: 'msg-u2',
-    text: 'Hello world v1',
-    textHash: 'hash-u2',
-  };
-
   const baseline = await captureUserTurnVersionBaseline(fakePage, sourceUser);
   assert.equal(baseline.count, 3);
   assert.equal(baseline.activeIndex, 1);
@@ -2567,16 +2638,56 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
   assert.equal(currentIndex, 1, 'Initial active index must be strictly restored');
 });
 
+test('captureUserTurnVersionBaseline: fails closed if version label is malformed', async () => {
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => 'Invalid Label Format',
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePage = {
+    locator: (sel) => {
+      if (sel.includes('Your message actions')) return { first: () => ({ count: async () => 1, isVisible: async () => true }) };
+      if (sel.includes('variants-turn-action-button')) return { first: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      if (sel.includes('Previous version')) return { last: () => fakeHeader };
+      if (sel.includes('close-button')) return { last: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      return {
+        first: () => ({
+          count: async () => 1,
+          scrollIntoViewIfNeeded: async () => {},
+          hover: async () => {},
+          locator: (sub) => fakePage.locator(sub),
+        }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => captureUserTurnVersionBaseline(fakePage, { id: 'msg-u-malformed', text: 'hi' }),
+    (err) => err.code === 'EDIT_VERSION_VIEWER_UNVERIFIED'
+  );
+});
+
 test('attestEditedUserTurnVersion: verifies K+1 version count and matching rendered content', async () => {
   let closeClicked = false;
   const baseline = { count: 2, activeIndex: 2 };
-  const targetHash = 'expected-edited-hash';
+  const expectedHash = messageHash(normalizeTurnText('Rendered content for hash matching'));
 
   const fakeHeader = {
     locator: (sel) => {
       if (sel.includes('Version ')) {
         return {
           first: () => ({
+            count: async () => 1,
             innerText: async () => 'Version 3',
           }),
         };
@@ -2588,7 +2699,7 @@ test('attestEditedUserTurnVersion: verifies K+1 version count and matching rende
           }),
         };
       }
-      return { first: () => ({}) };
+      return { first: () => ({ count: async () => 0 }) };
     },
   };
 
@@ -2638,7 +2749,6 @@ test('attestEditedUserTurnVersion: verifies K+1 version count and matching rende
     waitForTimeout: async () => {},
   };
 
-  const expectedHash = messageHash(normalizeTurnText('Rendered content for hash matching'));
   const sourceUser = { id: 'msg-u3' };
   const attestation = await attestEditedUserTurnVersion(fakePage, sourceUser, baseline, expectedHash);
   assert.equal(attestation.baselineCount, 2);
@@ -2655,6 +2765,7 @@ test('attestEditedUserTurnVersion: rejects count mismatch with EDIT_VERSION_COUN
       if (sel.includes('Version ')) {
         return {
           first: () => ({
+            count: async () => 1,
             innerText: async () => 'Version 2', // Stale count!
           }),
         };
@@ -2666,7 +2777,7 @@ test('attestEditedUserTurnVersion: rejects count mismatch with EDIT_VERSION_COUN
           }),
         };
       }
-      return { first: () => ({}) };
+      return { first: () => ({ count: async () => 0 }) };
     },
   };
 
@@ -2699,4 +2810,330 @@ test('attestEditedUserTurnVersion: rejects count mismatch with EDIT_VERSION_COUN
     async () => attestEditedUserTurnVersion(fakePage, { id: 'msg-u4' }, baseline, 'dummy-hash'),
     (err) => err.code === 'EDIT_VERSION_COUNT_MISMATCH'
   );
+});
+
+test('registerPendingRound: preserves versionBaseline and versionAttestation in round WAL', () => {
+  const args = { cdp: 'http://127.0.0.1:9241' };
+  const fakePage = { url: () => 'https://chatgpt.com/c/33333333-3333-3333-3333-333333333333' };
+  const baseline = { count: 2, activeIndex: 2, method: 'variants_ui' };
+  const extra = {
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    versionBaseline: baseline,
+    versionAttestation: null,
+  };
+
+  const round = registerPendingRound(args, fakePage, 'hello', 'turn-1', extra);
+  assert.ok(round);
+  assert.deepEqual(round.versionBaseline, baseline);
+  assert.equal(round.versionAttestation, null);
+});
+
+test('reconcileStage1EditTurn: positively promotes uncertain round to accepted when K+1 and content match', async () => {
+  const round = {
+    id: 'round-recon-1',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'uncertain',
+    expectedSessionId: '44444444-4444-4444-4444-444444444444',
+    sourceUserTurn: { id: 'msg-rec-1', testid: 'turn-rec-1' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: messageHash(normalizeTurnText('Edited prompt text')),
+  };
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => 'Version 2',
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => true,
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/44444444-4444-4444-4444-444444444444',
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }),
+        };
+      }
+      if (sel.includes('Previous version')) return { last: () => fakeHeader };
+      if (sel.includes('close-button')) return { last: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      const node = {
+        count: async () => 1,
+        scrollIntoViewIfNeeded: async () => {},
+        hover: async () => {},
+        waitFor: async () => {},
+        locator: (sub) => {
+          if (sub.includes('author-role="user"')) {
+            return {
+              first: () => ({
+                innerText: async () => 'Edited prompt text',
+              }),
+            };
+          }
+          return fakePage.locator(sub);
+        },
+      };
+      return {
+        first: () => node,
+        last: () => node,
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, round);
+  assert.equal(res.outcome, 'promoted_to_accepted');
+  assert.equal(res.round.dispatchState, 'accepted');
+  assert.equal(res.round.versionAttestation.acceptedCount, 2);
+});
+
+test('reconcileStage1EditTurn: remains uncertain when version count is still K (does not abort precommit)', async () => {
+  const round = {
+    id: 'round-recon-2',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'uncertain',
+    expectedSessionId: '55555555-5555-5555-5555-555555555555',
+    sourceUserTurn: { id: 'msg-rec-2', testid: 'turn-rec-2' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: messageHash(normalizeTurnText('Edited prompt text')),
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/55555555-5555-5555-5555-555555555555',
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
+    locator: (sel) => {
+      // Variants button absent -> still K=1
+      const node = {
+        count: async () => 0,
+        isVisible: async () => false,
+        scrollIntoViewIfNeeded: async () => {},
+        hover: async () => {},
+        waitFor: async () => {},
+        locator: (sub) => fakePage.locator(sub),
+      };
+      return {
+        first: () => node,
+        last: () => node,
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, round);
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(res.round.dispatchState, 'uncertain');
+});
+
+
+test('reconcileStage1EditTurn: marks conflict when observed version > expected K+1', async () => {
+  const round = {
+    id: 'round-recon-conflict-1',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'uncertain',
+    expectedSessionId: '66666666-6666-6666-6666-666666666666',
+    sourceUserTurn: { id: 'msg-rec-c1', testid: 'turn-rec-c1' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: messageHash(normalizeTurnText('Edited prompt text')),
+  };
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => 'Version 3', // Expected 2, but observed 3 (concurrent mutation!)
+          }),
+        };
+      }
+      if (sel.includes('Next version')) return { first: () => ({ isDisabled: async () => true }) };
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/66666666-6666-6666-6666-666666666666',
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) return { first: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      if (sel.includes('Previous version')) return { last: () => fakeHeader };
+      if (sel.includes('close-button')) return { last: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      const node = {
+        count: async () => 1,
+        scrollIntoViewIfNeeded: async () => {},
+        hover: async () => {},
+        waitFor: async () => {},
+        locator: (sub) => {
+          if (sub.includes('author-role="user"')) return { first: () => ({ innerText: async () => 'Edited prompt text' }) };
+          return fakePage.locator(sub);
+        },
+      };
+      return { first: () => node, last: () => node };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, round);
+  assert.equal(res.outcome, 'conflict');
+  assert.equal(res.round.status, 'failed');
+  assert.match(res.round.lastError, /Concurrent mutation/);
+});
+
+test('reconcileStage1EditTurn: marks conflict when content hash mismatches expected', async () => {
+  const round = {
+    id: 'round-recon-conflict-2',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'uncertain',
+    expectedSessionId: '77777777-7777-7777-7777-777777777777',
+    sourceUserTurn: { id: 'msg-rec-c2', testid: 'turn-rec-c2' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: messageHash(normalizeTurnText('Expected text')),
+  };
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version ')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => 'Version 2',
+          }),
+        };
+      }
+      if (sel.includes('Next version')) return { first: () => ({ isDisabled: async () => true }) };
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/77777777-7777-7777-7777-777777777777',
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) return { first: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      if (sel.includes('Previous version')) return { last: () => fakeHeader };
+      if (sel.includes('close-button')) return { last: () => ({ count: async () => 1, isVisible: async () => true, click: async () => {} }) };
+      const node = {
+        count: async () => 1,
+        scrollIntoViewIfNeeded: async () => {},
+        hover: async () => {},
+        waitFor: async () => {},
+        locator: (sub) => {
+          if (sub.includes('author-role="user"')) return { first: () => ({ innerText: async () => 'Different unexpected text' }) };
+          return fakePage.locator(sub);
+        },
+      };
+      return { first: () => node, last: () => node };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, round);
+  assert.equal(res.outcome, 'conflict');
+  assert.equal(res.round.status, 'failed');
+  assert.match(res.round.lastError, /Attribution conflict/);
+});
+
+
+test('autoRecoverConversationTurn: stage1_running restart reconciles existing round and halts without editing again', async () => {
+  const incidentId = 'INC-STAGE1-RESTART-TEST';
+  const parentSessionId = '88888888-8888-8888-8888-888888888888';
+
+  // Seed incident state as stage1_running
+  registerRecoveryIncident(
+    incidentId,
+    parentSessionId,
+    { id: 'msg-u-res', testid: 'turn-u-res' },
+    { messageId: 'msg-a-res', testid: 'turn-a-res' },
+    '/tmp/test-prompt-res.txt',
+    'hash-test-res'
+  );
+  updateRecoveryIncident(incidentId, { state: 'stage1_running' });
+
+  // Seed existing round in state
+  const roundState = loadRoundState();
+  const existingRound = {
+    id: 'round-s1-existing',
+    recoveryIncidentId: incidentId,
+    recoveryStage: 1,
+    operationKind: 'edit_retry',
+    dispatchState: 'uncertain',
+    expectedSessionId: parentSessionId,
+    sourceUserTurn: { id: 'msg-u-res', testid: 'turn-u-res' },
+    versionBaseline: { count: 1 },
+    editedMessageHash: 'hash-test-res',
+  };
+  roundState.rounds.push(existingRound);
+  saveRoundState(roundState);
+
+  // Fake page where variants button is absent -> outcome remains uncertain
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${parentSessionId}`,
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    evaluate: async () => ({ hydrated: true }),
+    locator: (sel) => {
+      const node = {
+        count: async () => 0,
+        isVisible: async () => false,
+        scrollIntoViewIfNeeded: async () => {},
+        hover: async () => {},
+        waitFor: async () => {},
+        locator: (sub) => fakePage.locator(sub),
+      };
+      return { first: () => node, last: () => node };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const args = {
+    expectedSessionId: parentSessionId,
+    recoveryIncidentId: incidentId,
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  const res = await autoRecoverConversationTurn(fakePage, args);
+  assert.equal(res.state, 'stage1_needs_reconciliation');
+  assert.match(res.error, /human intervention required/);
+
+  // Verify incident state in ledger
+  const incidentsState = loadRecoveryIncidentsState();
+  const incident = incidentsState.incidents.find(i => i.id === incidentId);
+  assert.equal(incident.state, 'stage1_needs_reconciliation');
 });

@@ -1356,6 +1356,10 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     editedMessageHash: extra.editedMessageHash || '',
     editSuffix: extra.editSuffix || '',
     editAttestation: extra.editAttestation || null,
+    versionBaseline: extra.versionBaseline || null,
+    versionAttestation: extra.versionAttestation || null,
+    assistantOutcome: extra.assistantOutcome || null,
+    lastErrorCode: extra.lastErrorCode || '',
     status: 'pending',
     dispatchState: extra.dispatchState || 'prepared',
     sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
@@ -6426,23 +6430,34 @@ async function waitForEditedTurnAccepted(page, sourceUserTurn, editedHash, expec
 }
 
 
-async function captureUserTurnVersionBaseline(page, sourceUserTurn) {
+async function resolveUserTurnRoot(page, sourceUserTurn) {
   let turnRoot = null;
-  if (sourceUserTurn.id) {
-    turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
+  if (sourceUserTurn.testid) {
+    turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
   }
   if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
-    if (sourceUserTurn.testid) {
-      turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
+    if (sourceUserTurn.id) {
+      turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
     }
   }
   if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
-    throw cbError('EDIT_VERSION_BASELINE_UNVERIFIED', 'Could not locate target user turn container for version baseline capture');
+    throw cbError('EDIT_SOURCE_UNVERIFIED', `Could not locate turn root for user turn ${sourceUserTurn.id || sourceUserTurn.testid}`);
   }
+  return turnRoot;
+}
+
+async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssistantTurn = null) {
+  const turnRoot = await resolveUserTurnRoot(page, sourceUserTurn);
 
   await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
   await turnRoot.hover().catch(() => {});
   await page.waitForTimeout(300);
+
+  const actionsBar = turnRoot.locator('div[aria-label="Your message actions"]').first();
+  const hasActionsBar = (await actionsBar.count().catch(() => 0)) > 0 && (await actionsBar.isVisible().catch(() => false));
+  if (!hasActionsBar) {
+    throw cbError('EDIT_VERSION_BASELINE_UNVERIFIED', 'Message actions bar not visible after hovering user turn; hydration incomplete');
+  }
 
   const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
   const hasVariantsBtn = (await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false));
@@ -6470,32 +6485,63 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn) {
     throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header');
   }
 
-  const initialLabelText = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
-  const initialMatch = initialLabelText.match(/Version\s*(\d+)/i);
-  const initialIndex = initialMatch ? parseInt(initialMatch[1], 10) : 1;
+  async function readVersionIndex() {
+    const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+    if (!(await labelEl.count().catch(() => 0))) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
+    }
+    const text = await labelEl.innerText().catch(() => '');
+    const m = text.match(/Version\s*(\d+)/i);
+    if (!m) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
+    }
+    return parseInt(m[1], 10);
+  }
 
+  const initialIndex = await readVersionIndex();
   const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
   let currentIndex = initialIndex;
-  while (true) {
-    const isNextDisabled = await nextBtn.isDisabled().catch(() => true);
+  let traversalSteps = 0;
+  const MAX_TRAVERSAL = 50;
+
+  while (traversalSteps < MAX_TRAVERSAL) {
+    let isNextDisabled;
+    try {
+      isNextDisabled = await nextBtn.isDisabled();
+    } catch (err) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Failed to determine Next version disabled state: ${err.message || err}`);
+    }
     if (isNextDisabled) break;
+    traversalSteps++;
+    const before = currentIndex;
     await nextBtn.click();
     await page.waitForTimeout(250);
-    const label = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
-    const m = label.match(/Version\s*(\d+)/i);
-    if (m) currentIndex = parseInt(m[1], 10);
+    currentIndex = await readVersionIndex();
+    if (currentIndex !== before + 1) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Next version step failed: expected ${before + 1}, got ${currentIndex}`);
+    }
+  }
+  if (traversalSteps >= MAX_TRAVERSAL) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Exceeded maximum version traversal bound without reaching latest version');
   }
   const totalCount = currentIndex;
 
   const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
   while (currentIndex > initialIndex) {
-    const isPrevDisabled = await prevBtn.isDisabled().catch(() => true);
+    let isPrevDisabled;
+    try {
+      isPrevDisabled = await prevBtn.isDisabled();
+    } catch (err) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Failed to determine Previous version disabled state: ${err.message || err}`);
+    }
     if (isPrevDisabled) break;
+    const before = currentIndex;
     await prevBtn.click();
     await page.waitForTimeout(250);
-    const label = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
-    const m = label.match(/Version\s*(\d+)/i);
-    if (m) currentIndex = parseInt(m[1], 10);
+    currentIndex = await readVersionIndex();
+    if (currentIndex !== before - 1) {
+      throw cbError('EDIT_VERSION_RESTORE_FAILED', `Previous version step failed: expected ${before - 1}, got ${currentIndex}`);
+    }
   }
 
   if (currentIndex !== initialIndex) {
@@ -6505,6 +6551,19 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn) {
 
   await closeBtn.click().catch(() => {});
   await page.waitForTimeout(300);
+
+  // Re-attest restored user and assistant revisions
+  const turns = await getConversationTurns(page);
+  const restoredUser = turns.find(t => t.role === 'user' && sameTurnRevision(t, sourceUserTurn));
+  if (!restoredUser || !turnRevisionMatchesRef(restoredUser, sourceUserTurn)) {
+    throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Restored user turn content does not match source user revision');
+  }
+  if (sourceAssistantTurn) {
+    const restoredAssistant = turns.find(t => t.role === 'assistant' && sameTurnRevision(t, sourceAssistantTurn));
+    if (!restoredAssistant || !turnRevisionMatchesRef(restoredAssistant, sourceAssistantTurn)) {
+      throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Restored assistant turn content does not match source assistant revision');
+    }
+  }
 
   return {
     count: totalCount,
@@ -6516,18 +6575,7 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn) {
 }
 
 async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, editedHash) {
-  let turnRoot = null;
-  if (sourceUserTurn.id) {
-    turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
-  }
-  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
-    if (sourceUserTurn.testid) {
-      turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
-    }
-  }
-  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
-    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Could not locate target user turn container for post-edit version attestation');
-  }
+  const turnRoot = await resolveUserTurnRoot(page, sourceUserTurn);
 
   await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
   await turnRoot.hover().catch(() => {});
@@ -6552,12 +6600,28 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
     throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header after edit');
   }
 
-  const labelText = await viewerHeader.locator('div:has-text("Version ")').first().innerText().catch(() => '');
-  const match = labelText.match(/Version\s*(\d+)/i);
-  const activeVersion = match ? parseInt(match[1], 10) : 0;
+  async function readVersionIndex() {
+    const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+    if (!(await labelEl.count().catch(() => 0))) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
+    }
+    const text = await labelEl.innerText().catch(() => '');
+    const m = text.match(/Version\s*(\d+)/i);
+    if (!m) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
+    }
+    return parseInt(m[1], 10);
+  }
 
+  const activeVersion = await readVersionIndex();
   const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
-  const isNextDisabled = await nextBtn.isDisabled().catch(() => false);
+  let isNextDisabled;
+  try {
+    isNextDisabled = await nextBtn.isDisabled();
+  } catch (err) {
+    await closeBtn.click().catch(() => {});
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Failed to determine Next version disabled state: ${err.message || err}`);
+  }
 
   const expectedVersion = baseline.count + 1;
   if (activeVersion !== expectedVersion || !isNextDisabled) {
@@ -6588,6 +6652,134 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
   };
 }
 
+async function reconcileStage1EditTurn(page, args, round) {
+  if (!round || round.operationKind !== 'edit_retry' || round.recoveryStage !== 1) {
+    return { outcome: 'not_applicable', round };
+  }
+  if (round.dispatchState === 'prepared') {
+    const updated = updateRound(round.id, {
+      status: 'failed',
+      dispatchState: 'aborted_precommit',
+      lastError: 'Process exited before Stage 1 edit submission',
+    }, 'round_aborted_precommit');
+    return { outcome: 'aborted_precommit', round: updated || round };
+  }
+  if (round.dispatchState === 'accepted') {
+    return { outcome: 'already_accepted', round };
+  }
+  if (round.dispatchState !== 'dispatching' && round.dispatchState !== 'uncertain') {
+    return { outcome: 'unchanged', round };
+  }
+
+  const sessionId = round.expectedSessionId || round.sessionId;
+  if (!sessionId) {
+    return { outcome: 'uncertain', round };
+  }
+
+  await reloadExactConversation(page, sessionId, 'stage1-reconcile-reload');
+  await assertThreadIdentity(page, sessionId, 'during stage1 crash reconciliation');
+
+  const sourceUser = round.sourceUserTurn;
+  const baseline = round.versionBaseline;
+  const expectedHash = round.editedMessageHash;
+
+  if (!sourceUser || !baseline || !expectedHash) {
+    return { outcome: 'uncertain', round };
+  }
+
+  let turnRoot = null;
+  try {
+    turnRoot = await resolveUserTurnRoot(page, sourceUser);
+    await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
+    await turnRoot.hover().catch(() => {});
+    await page.waitForTimeout(300);
+  } catch {
+    return { outcome: 'uncertain', round };
+  }
+
+  const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
+  const hasVariantsBtn = (await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false));
+
+  if (!hasVariantsBtn) {
+    return { outcome: 'uncertain', round };
+  }
+
+  try {
+    await variantsBtn.click({ timeout: 2000 });
+  } catch {
+    try { await variantsBtn.click({ force: true }); } catch { return { outcome: 'uncertain', round }; }
+  }
+  await page.waitForTimeout(400);
+
+  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
+  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
+    return { outcome: 'uncertain', round };
+  }
+
+  const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+  const text = await labelEl.innerText().catch(() => '');
+  const m = text.match(/Version\s*(\d+)/i);
+  const activeVersion = m ? parseInt(m[1], 10) : 0;
+
+  const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+  let isNextDisabled = false;
+  try {
+    isNextDisabled = await nextBtn.isDisabled();
+  } catch {}
+
+  const userMessageEl = turnRoot.locator('[data-message-author-role="user"]').first();
+  const displayedText = await userMessageEl.innerText().catch(() => '');
+  const displayedHash = messageHash(normalizeTurnText(displayedText));
+
+  await closeBtn.click().catch(() => {});
+  await page.waitForTimeout(250);
+
+  const expectedVersion = baseline.count + 1;
+
+  if (activeVersion === expectedVersion && isNextDisabled && displayedHash === expectedHash) {
+    const versionAttestation = {
+      baselineCount: baseline.count,
+      acceptedCount: expectedVersion,
+      acceptedIndex: activeVersion,
+      contentHash: displayedHash,
+      nextDisabled: true,
+      method: 'variants_ui_reconciled',
+      verifiedAt: nowIso(),
+    };
+    const updated = updateRound(round.id, {
+      dispatchState: 'accepted',
+      dispatchAcceptedAt: nowIso(),
+      versionAttestation,
+    }, 'round_dispatch_accepted');
+    const finalRound = updated || Object.assign(round, {
+      dispatchState: 'accepted',
+      dispatchAcceptedAt: nowIso(),
+      versionAttestation,
+    });
+    return { outcome: 'promoted_to_accepted', round: finalRound };
+  }
+
+  if (activeVersion > expectedVersion) {
+    const patch = {
+      status: 'failed',
+      lastError: `Concurrent mutation detected: observed Version ${activeVersion} > expected ${expectedVersion}`,
+    };
+    const updated = updateRound(round.id, patch, 'round_conflict');
+    return { outcome: 'conflict', round: updated || Object.assign(round, patch) };
+  }
+
+  if (activeVersion === expectedVersion && displayedHash !== expectedHash) {
+    const patch = {
+      status: 'failed',
+      lastError: `Attribution conflict: Version ${activeVersion} content hash does not match expected editedHash`,
+    };
+    const updated = updateRound(round.id, patch, 'round_conflict');
+    return { outcome: 'conflict', round: updated || Object.assign(round, patch) };
+  }
+
+  return { outcome: 'uncertain', round };
+}
 async function retryEditTurn(page, args) {
   await prepareConversationForRead(page, args);
   const expectedSessionId = args.expectedSessionId;
@@ -6620,7 +6812,7 @@ async function retryEditTurn(page, args) {
       const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
       const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
 
-      const versionBaseline = await captureUserTurnVersionBaseline(page, sourceUser);
+      const versionBaseline = await captureUserTurnVersionBaseline(page, sourceUser, sourceAssistant);
 
       const roundExtra = {
         expectedSessionId,
@@ -6721,12 +6913,15 @@ async function retryEditTurn(page, args) {
         );
       } catch (error) {
         const observedSessionId = sessionIdFromUrl(page.url());
+        const isTerminal = error.code === 'ASSISTANT_TERMINAL_ERROR';
         round = updateRound(round.id, {
-          status: 'pending',
+          status: isTerminal ? 'failed' : 'pending',
+          assistantOutcome: isTerminal ? 'terminal_error' : 'uncertain',
+          lastErrorCode: error.code || '',
           lastError: error.message || String(error),
           observedSessionId,
           observedUrl: page.url(),
-        }, 'round_waiting_for_recovery') || round;
+        }, isTerminal ? 'round_failed' : 'round_waiting_for_recovery') || round;
         throw error;
       }
       if (streamer) streamer.finish();
@@ -6738,6 +6933,7 @@ async function retryEditTurn(page, args) {
       localDispatchState = 'done';
       round = updateRound(round.id, {
         status: 'done',
+        assistantOutcome: 'succeeded',
         sessionId: authoritativeSessionId,
         responseChars: response.length,
         lastError: '',
@@ -7040,50 +7236,86 @@ async function autoRecoverConversationTurn(page, args) {
 
     // Phase 2: Stage 1 execution (In-place edit)
     if (incident.state === 'prepared' || incident.state === 'stage1_running') {
-      incident = updateRecoveryIncident(incidentId, { state: 'stage1_running' }) || incident;
+      const roundState = loadRoundState();
+      const existingRound = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 1);
 
-      const stage1Args = {
-        ...args,
-        retryEdit: incident.sourceUserTurnRef.messageId || incident.sourceUserTurnRef.testid || 'latest',
-        editSuffix: args.editSuffix || '.',
-        recoveryIncidentId: incidentId,
-      };
-
-      try {
-        const res = await retryEditTurn(page, stage1Args);
-        incident = updateRecoveryIncident(incidentId, {
-          state: 'completed_stage1',
-          stage1RoundId: res?.round?.id || '',
-          finalSessionId: incident.parentSessionId,
-          finalOutcome: 'stage1_succeeded',
-        }) || incident;
-        info(`[auto-recover] Stage 1 succeeded for incident ${incidentId}`);
-        return { incident, state: 'completed_stage1', sessionId: incident.parentSessionId };
-      } catch (err) {
-        const roundState = loadRoundState();
-        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 1);
-        const isTerminalModelFailure = (
-          round?.dispatchState === 'accepted' &&
-          round?.versionAttestation?.baselineCount + 1 === round?.versionAttestation?.acceptedCount &&
-          round?.versionAttestation?.contentHash === round?.editedMessageHash &&
-          round?.status === 'failed' &&
-          (err.code === 'ASSISTANT_TERMINAL_ERROR' || round.lastError?.includes('refusal') || round.lastError?.includes('blocked'))
-        );
-
-        if (isTerminalModelFailure) {
-          incident = updateRecoveryIncident(incidentId, {
-            state: 'stage1_terminal_failed',
-            stage1RoundId: round?.id || '',
-            lastError: err.message || String(err),
-          }) || incident;
-          info(`[auto-recover] Stage 1 proven terminal model failure; escalating to Stage 2`);
+      if (incident.state === 'stage1_running' && existingRound) {
+        // Reconcile in-flight Stage 1 round rather than retrying edit!
+        const recon = await reconcileStage1EditTurn(page, args, existingRound);
+        if (recon.outcome === 'promoted_to_accepted' || recon.outcome === 'already_accepted') {
+          info(`[auto-recover] Reconciled Stage 1 round ${existingRound.id} as accepted`);
+          if (recon.round?.assistantOutcome === 'terminal_error') {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage1_terminal_failed',
+              stage1RoundId: existingRound.id,
+              lastError: existingRound.lastError,
+            }) || incident;
+            info(`[auto-recover] Reconciled Stage 1 was terminal model failure; escalating to Stage 2`);
+          } else {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage1_needs_reconciliation',
+              stage1RoundId: existingRound.id,
+              lastError: 'Stage 1 round accepted; awaiting assistant completion',
+            }) || incident;
+            return { incident, state: 'stage1_needs_reconciliation', round: recon.round };
+          }
+        } else if (recon.outcome === 'aborted_precommit') {
+          info(`[auto-recover] Stage 1 round ${existingRound.id} aborted precommit; re-attempting Stage 1 preparation`);
         } else {
           incident = updateRecoveryIncident(incidentId, {
             state: 'stage1_needs_reconciliation',
-            stage1RoundId: round?.id || '',
-            lastError: err.message || String(err),
+            stage1RoundId: existingRound.id,
+            lastError: `Stage 1 in-flight round ${existingRound.id} outcome uncertain (${recon.outcome}); human intervention required`,
           }) || incident;
-          throw err;
+          return { incident, state: 'stage1_needs_reconciliation', error: incident.lastError };
+        }
+      }
+
+      if (incident.state === 'prepared' || (incident.state === 'stage1_running' && (!existingRound || existingRound.dispatchState === 'aborted_precommit'))) {
+        incident = updateRecoveryIncident(incidentId, { state: 'stage1_running' }) || incident;
+
+        const stage1Args = {
+          ...args,
+          retryEdit: incident.sourceUserTurnRef.messageId || incident.sourceUserTurnRef.testid || 'latest',
+          editSuffix: args.editSuffix || '.',
+          recoveryIncidentId: incidentId,
+        };
+
+        try {
+          const res = await retryEditTurn(page, stage1Args);
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'completed_stage1',
+            stage1RoundId: res?.round?.id || '',
+            finalSessionId: incident.parentSessionId,
+            finalOutcome: 'stage1_succeeded',
+          }) || incident;
+          info(`[auto-recover] Stage 1 succeeded for incident ${incidentId}`);
+          return { incident, state: 'completed_stage1', sessionId: incident.parentSessionId };
+        } catch (err) {
+          const postState = loadRoundState();
+          const round = postState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 1);
+          const isTerminalModelFailure = (
+            round?.dispatchState === 'accepted' &&
+            round?.versionAttestation?.baselineCount + 1 === round?.versionAttestation?.acceptedCount &&
+            round?.versionAttestation?.contentHash === round?.editedMessageHash &&
+            round?.assistantOutcome === 'terminal_error'
+          );
+
+          if (isTerminalModelFailure) {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage1_terminal_failed',
+              stage1RoundId: round?.id || '',
+              lastError: err.message || String(err),
+            }) || incident;
+            info(`[auto-recover] Stage 1 proven terminal model failure; escalating to Stage 2`);
+          } else {
+            incident = updateRecoveryIncident(incidentId, {
+              state: 'stage1_needs_reconciliation',
+              stage1RoundId: round?.id || '',
+              lastError: err.message || String(err),
+            }) || incident;
+            throw err;
+          }
         }
       }
     }
@@ -7099,6 +7331,8 @@ async function autoRecoverConversationTurn(page, args) {
         message: rawPrompt,
         recoveryIncidentId: incidentId,
       };
+      validateRecoveryMode(stage2Args);
+      const stage2Message = stage2Args.message;
 
       try {
         await prepareConversationForRead(page, stage2Args);
@@ -7109,7 +7343,7 @@ async function autoRecoverConversationTurn(page, args) {
           await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
           await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
           await syncTranscriptFromPage(page, stage2Args);
-          return await ask(page, rawPrompt, stage2Args);
+          return await ask(page, stage2Message, stage2Args);
         };
         const responseText = await withBrowserLaneLease(stage2Args, randomId('stage2-resend-op'), action);
 
@@ -7129,8 +7363,7 @@ async function autoRecoverConversationTurn(page, args) {
         const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
         const isTerminalModelFailure = (
           round?.dispatchState === 'accepted' &&
-          round?.status === 'failed' &&
-          (err.code === 'ASSISTANT_TERMINAL_ERROR' || round.lastError?.includes('refusal') || round.lastError?.includes('blocked'))
+          round?.assistantOutcome === 'terminal_error'
         );
 
         if (isTerminalModelFailure) {
@@ -8963,12 +9196,15 @@ async function ask(page, message, args) {
       );
     } catch (error) {
       const observedSessionId = sessionIdFromUrl(page.url());
+      const isTerminal = error.code === 'ASSISTANT_TERMINAL_ERROR';
       updateRound(round.id, {
-        status: 'pending',
+        status: isTerminal ? 'failed' : 'pending',
+        assistantOutcome: isTerminal ? 'terminal_error' : 'uncertain',
+        lastErrorCode: error.code || '',
         lastError: error.message || String(error),
         observedSessionId,
         observedUrl: page.url(),
-      }, 'round_waiting_for_recovery');
+      }, isTerminal ? 'round_failed' : 'round_waiting_for_recovery');
       throw error;
     }
     if (streamer) streamer.finish();
@@ -8984,6 +9220,7 @@ async function ask(page, message, args) {
 
     updateRound(round.id, {
       status: 'done',
+      assistantOutcome: 'succeeded',
       sessionId: finalSessionId,
       responseChars: response.length,
       lastError: '',
@@ -10128,6 +10365,9 @@ module.exports = {
   releaseRecoveryIncidentLease,
   captureUserTurnVersionBaseline,
   attestEditedUserTurnVersion,
+  reconcileStage1EditTurn,
+  loadRoundState,
+  saveRoundState,
   autoRecoverConversationTurn,
   branchConversationTurn,
   recoverCandidateBranchLineage,
