@@ -33,6 +33,7 @@ const {
   compactTargetConversation,
   syncTranscriptFromPage,
   reloadExactConversation,
+  watchTargetAppState,
   executeCompactionHandoff,
   parseArgs,
   prepareConversationForRead,
@@ -831,4 +832,94 @@ test('reloadExactConversation: enforces thread identity before and after reload'
   const res = await reloadExactConversation(mockPage, targetId, 'test-phase');
   assert.equal(reloaded, true);
   assert.equal(res.hydrated, true);
+});
+
+test('Stage-2 Invalid Mode: --new-conversation cannot be combined with --recovery-resend', async () => {
+  const mockPage = { url: () => 'https://chatgpt.com/' };
+  const mockArgs = {
+    newConversation: true,
+    recoveryResend: true,
+    conversation: '11111111-1111-4111-8111-111111111111',
+  };
+  await assert.rejects(
+    async () => prepareConversationForPrompt(mockPage, mockArgs),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+});
+
+test('Stage-2 Root Rejection: root URL with --recovery-resend and no target throws RECOVERY_TARGET_REQUIRED', async () => {
+  const mockPage = { url: () => 'https://chatgpt.com/' };
+  const mockArgs = {
+    recoveryResend: true,
+    conversation: '',
+    expectedSessionId: '',
+  };
+  await assert.rejects(
+    async () => prepareConversationForPrompt(mockPage, mockArgs),
+    (err) => err.code === 'RECOVERY_TARGET_REQUIRED'
+  );
+});
+
+test('Exact Reload Post-Reload Drift: reloadExactConversation fails closed if URL drifts post-reload', async () => {
+  const targetId = '55555555-5555-4555-8555-555555555555';
+  const driftedId = '66666666-6666-4666-8666-666666666666';
+  let hasReloaded = false;
+  const mockPage = {
+    url: () => (hasReloaded ? `https://chatgpt.com/c/${driftedId}` : `https://chatgpt.com/c/${targetId}`),
+    reload: async () => { hasReloaded = true; },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: () => ({ last: () => ({ waitFor: async () => {} }) }),
+    evaluate: async () => ({
+      hydrated: true,
+      sessionId: driftedId,
+      turnCount: 2,
+      roleNodeCount: 2,
+      composerVisible: true,
+    }),
+  };
+  await assert.rejects(
+    async () => reloadExactConversation(mockPage, targetId, 'test-drift-phase'),
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT'
+  );
+});
+
+test('Target-Aware Watch Drift: watchTargetAppState fails closed if URL drifts to foreign session during polling', async () => {
+  const targetId = '77777777-7777-4777-8777-777777777777';
+  const driftedId = '88888888-8888-4888-8888-888888888888';
+  let pollCount = 0;
+  const mockPage = {
+    url: () => (pollCount > 0 ? `https://chatgpt.com/c/${driftedId}` : `https://chatgpt.com/c/${targetId}`),
+    waitForTimeout: async () => { pollCount++; },
+    evaluate: async () => ({
+      composer: { visible: true },
+      turns: { count: 1, latest: null },
+      isGenerating: false,
+    }),
+    $$eval: async () => [],
+    $eval: async () => '',
+    $: async () => null,
+  };
+  const mockArgs = {
+    stateJsonl: false,
+    stateInterval: 10,
+    timeout: 100,
+    waitReady: false,
+  };
+  await assert.rejects(
+    async () => watchTargetAppState(mockPage, mockArgs, { expectedSessionId: targetId }),
+    (err) => err.code === 'THREAD_IDENTITY_DRIFT'
+  );
+});
+
+test('Target-Aware Watch Resolution: prepareConversationForRead resolves explicit conversation target', async () => {
+  const targetId = '99999999-9999-4999-8999-999999999999';
+  const mockPage = { url: () => 'https://chatgpt.com/c/other-session' };
+  const mockArgs = {
+    conversation: targetId,
+    expectedSessionId: '',
+  };
+  await prepareConversationForRead(mockPage, mockArgs);
+  assert.equal(mockArgs.expectedSessionId, targetId);
 });

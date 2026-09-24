@@ -61,8 +61,8 @@ node CB.js --search "project name" --search-scrolls 3
 node CB.js --search "project name" --search-all
 node CB.js --search "project name" --search-open 1
 node CB.js --dismiss-blocker
-node CB.js --compact-conversation
-node CB.js --compact-handoff
+node CB.js --export-context-summary
+node CB.js --recovery-resend --conversation <id> --message "..."
 node CB.js --recover-interrupted
 ```
 
@@ -111,19 +111,23 @@ the active answer stream intact. If generation has finished and the UI has settl
 it hydrates the target conversation and verifies the composer is editable without
 performing destructive reloads or clicking Stop.
 
-`--compact-conversation` parses the active or specified conversation transcript,
-extracts high-signal architecture details (overarching mission, verified code
-references, commit SHAs, empirical findings, standing recommendations, and
-external GitHub/web URLs), and writes compaction JSON and Markdown artifacts
-under `outputs/compactions/`.
+`--recovery-resend` executes Stage 2 of the in-session recovery hierarchy. It performs
+a mandatory exact-thread clean reload (`reloadExactConversation`) and asserts thread
+identity before submitting the prompt in the same conversation thread, guaranteeing
+a fresh generation attempt without thread drift.
 
-`--compact-handoff` executes the full 3-step thread compaction handoff when a
-conversation hits ChatGPT's maximum length limit:
-1. Compacts the active conversation history into structured architectural context.
-2. Starts a fresh continuation session on ChatGPT.
-3. Submits Turn 1 containing the compaction brief along with strict instructions
-   directing the research agent to review external references/repos and ask
-   clarifying questions back to the local model/user before proposing code.
+`--export-context-summary` (alias: `--compact-conversation`) parses the active or
+specified conversation transcript, extracts high-signal architecture details
+(overarching mission, verified code references, commit SHAs, empirical findings,
+standing recommendations, and external GitHub/web URLs), and writes diagnostic
+JSON and Markdown artifacts under `outputs/compactions/`. Note: this is an offline
+diagnostic export utility only, completely excluded from the operational recovery path.
+
+Legacy `--compact-handoff` is quarantined and disabled by default (returning
+`LEGACY_COMPACTION_HANDOFF_DISABLED`), as fresh continuation chats are excluded from
+the project's 3-stage recovery hierarchy (Stage 1 in-place edit/regenerate ->
+Stage 2 same-thread resend -> Stage 3 native branch). Set
+`CB_ENABLE_LEGACY_COMPACTION=1` only for controlled offline testing.
 
 Settings and personalization dialogs are treated as blocking UI, not as safe
 auto-dismiss targets. Model-picker commands must not use account/profile or

@@ -5919,6 +5919,16 @@ async function openConversationBySessionId(page, sessionId) {
 }
 
 async function prepareConversationForPrompt(page, args) {
+  if (args.recoveryResend && args.newConversation) {
+    throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with --new-conversation');
+  }
+  if (args.recoveryResend && !args.conversation && !args.expectedSessionId) {
+    const rawUrl = page.url();
+    const currentSessionId = sessionIdFromUrl(rawUrl);
+    if (!currentSessionId) {
+      throw cbError('RECOVERY_TARGET_REQUIRED', 'Stage 2 recovery requires an existing stable conversation');
+    }
+  }
   if (args.newConversation) {
     // Leave new conversation root navigation to ask() under the bootstrap lease
     return;
@@ -5927,6 +5937,9 @@ async function prepareConversationForPrompt(page, args) {
     const rawUrl = page.url();
     const currentSessionId = sessionIdFromUrl(rawUrl);
     if (!currentSessionId) {
+      if (args.recoveryResend) {
+        throw cbError('RECOVERY_TARGET_REQUIRED', 'Stage 2 recovery requires an existing stable conversation');
+      }
       if (isCanonicalTargetRoot(rawUrl)) {
         info('[mode] Active tab is at canonical root; promoting prompt to hardened new-conversation transaction');
         args.newConversation = true;
@@ -6723,8 +6736,14 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
   throw new Error(`Timed out after ${timeout}ms waiting for assistant response`);
 }
 
-async function watchTargetAppState(page, args) {
-  refreshSessionTranscript(page, args);
+async function watchTargetAppState(page, args, options = {}) {
+  const expectedSessionId = options.expectedSessionId || args.expectedSessionId || '';
+  if (expectedSessionId) {
+    await assertThreadIdentity(page, expectedSessionId, 'before starting watch-state');
+    args.transcript = transcriptPathForSession(expectedSessionId);
+  } else {
+    refreshSessionTranscript(page, args);
+  }
   const initialState = await getTargetAppState(page);
   const baseline = stateBaseline(initialState);
   const emitter = createStateEmitter({
@@ -6745,7 +6764,12 @@ async function watchTargetAppState(page, args) {
     }
 
     await page.waitForTimeout(args.stateInterval);
-    refreshSessionTranscript(page, args);
+    if (expectedSessionId) {
+      await assertThreadIdentity(page, expectedSessionId, 'while watching target state');
+      args.transcript = transcriptPathForSession(expectedSessionId);
+    } else {
+      refreshSessionTranscript(page, args);
+    }
     const state = await getTargetAppState(page);
     event = emitter.emit(state);
   }
@@ -6778,6 +6802,9 @@ async function ask(page, message, args) {
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
       if (args.recoveryResend) {
+        if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+          await openConversationBySessionId(page, expectedSessionId);
+        }
         await reloadExactConversation(page, expectedSessionId, 'recovery-resend');
       } else if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
         await openConversationBySessionId(page, expectedSessionId);
@@ -6825,12 +6852,17 @@ async function ask(page, message, args) {
     const baselineLastTurnId = turnsBefore.length ? turnsBefore[turnsBefore.length - 1].testid : '';
 
     // Pre-Send WAL round registration
-    const round = registerPendingRound(args, page, message, baselineLastTurnId, {
+    const roundExtra = {
       expectedSessionId,
       jobId: args.jobId || '',
       dispatchState: 'prepared',
       sessionBindingState: isNewChat ? 'unbound' : 'not_applicable',
-    });
+    };
+    if (args.recoveryResend) {
+      roundExtra.operationKind = 'recovery_resend';
+      roundExtra.recoveryStage = 2;
+    }
+    const round = registerPendingRound(args, page, message, baselineLastTurnId, roundExtra);
 
     if (!isNewChat && expectedSessionId) {
       try {
@@ -7908,14 +7940,15 @@ async function main() {
     }
 
     if (args.watchState) {
+      await prepareConversationForRead(page, args);
       if (args.expectedSessionId) {
         const action = async () => {
           if (sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
             await openConversationBySessionId(page, args.expectedSessionId);
           }
           await assertThreadIdentity(page, args.expectedSessionId, 'before watch-state');
-          refreshSessionTranscript(page, args);
-          await watchTargetAppState(page, args);
+          args.transcript = transcriptPathForSession(args.expectedSessionId);
+          await watchTargetAppState(page, args, { expectedSessionId: args.expectedSessionId });
         };
         await withBrowserLaneLease(args, randomId('watch-state-op'), action);
       } else {
@@ -8023,6 +8056,7 @@ if (require.main === module) {
 
 module.exports = {
   reloadExactConversation,
+  watchTargetAppState,
   executeCompactionHandoff,
   parseArgs,
   canonicalRawPrompt,
