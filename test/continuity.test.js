@@ -4040,3 +4040,73 @@ test('reconcileStage1EditTurn: generic uncertain round without quiescence return
   assert.equal(res.outcome, 'uncertain');
   assert.equal(reloaded, false);
 });
+
+test('browserLaneLeasePath: scopes lock files across conversation, explicit lane, page target, and bootstrap', () => {
+  const bootstrapPath = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241' });
+  const conv1Path = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', conversation: '6ab3625c-9d58-83ec-aac4-1ecca712f3df' });
+  const conv2Path = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', conversation: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c' });
+  const lane1Path = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', lane: 'worker-1' });
+  const lane2Path = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', lane: 'worker-2' });
+  const pagePath = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', targetId: 'E183A7888C611D8F38251B279319A2C4' });
+
+  assert.notEqual(bootstrapPath, conv1Path);
+  assert.notEqual(conv1Path, conv2Path);
+  assert.notEqual(lane1Path, lane2Path);
+  assert.notEqual(conv1Path, lane1Path);
+  assert.notEqual(conv1Path, pagePath);
+});
+
+test('acquireBrowserLaneLease: allows concurrent leases across different conversations on same CDP', async () => {
+  const argsA = { cdp: 'http://127.0.0.1:9241', conversation: '11111111-1111-4111-8111-111111111111' };
+  const argsB = { cdp: 'http://127.0.0.1:9241', conversation: '22222222-2222-4222-8222-222222222222' };
+
+  let leaseA = null;
+  let leaseB = null;
+  try {
+    leaseA = acquireBrowserLaneLease(argsA, 'op-a');
+    assert.ok(leaseA);
+
+    // Concurrent acquisition on different conversation MUST succeed
+    leaseB = acquireBrowserLaneLease(argsB, 'op-b');
+    assert.ok(leaseB);
+
+    // Concurrent acquisition on SAME conversation MUST fail closed
+    assert.throws(
+      () => acquireBrowserLaneLease(argsA, 'op-a-conflict'),
+      (err) => err.code === 'BROWSER_LANE_BUSY'
+    );
+  } finally {
+    if (leaseA) releaseBrowserLaneLease(leaseA);
+    if (leaseB) releaseBrowserLaneLease(leaseB);
+  }
+});
+
+test('findTargetAppPage: allocates dedicated page when requested conversation is not among open pages', async () => {
+  let createdUrl = null;
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [{
+        url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+      }],
+      newPage: async () => ({
+        goto: async (url) => { createdUrl = url; },
+        url: () => createdUrl,
+      }),
+    }],
+    newContext: async () => ({
+      newPage: async () => ({
+        goto: async (url) => { createdUrl = url; },
+        url: () => createdUrl,
+      }),
+    }),
+  };
+
+  const args = {
+    conversation: '22222222-2222-4222-8222-222222222222',
+  };
+
+  const page = await findTargetAppPage(mockBrowser, args);
+  assert.ok(page);
+  // Must NOT steal tab 11111111! Must create dedicated tab navigating to 22222222
+  assert.equal(createdUrl, 'https://chatgpt.com/c/22222222-2222-4222-8222-222222222222');
+});

@@ -308,6 +308,8 @@ function parseArgs(argv) {
     editSuffix: '.',
     branchTurn: '',
     recoverBranchId: '',
+    lane: '',
+    targetId: '',
     autoRecover: false,
     downloadArtifacts: false,
     showArtifacts: false,
@@ -387,6 +389,8 @@ function parseArgs(argv) {
     }
     else if (arg === '--recover-branch') args.recoverBranchId = next();
     else if (arg === '--auto-recover') args.autoRecover = true;
+    else if (arg === '--lane') args.lane = next();
+    else if (arg === '--target-id') args.targetId = next();
     else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -841,6 +845,13 @@ function sessionIdFromUrl(url) {
   return STABLE_SESSION_ID_RE.test(routeId) ? routeId : '';
 }
 
+function extractConversationId(val) {
+  if (!val) return '';
+  const str = String(val).trim();
+  if (STABLE_SESSION_ID_RE.test(str)) return str;
+  return routeSessionIdFromUrl(str) || sessionIdFromUrl(str) || str;
+}
+
 function isEphemeralRouteId(id) {
   return /^WEB:/i.test(String(id || ''));
 }
@@ -1062,16 +1073,42 @@ function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
 }
 
 function browserLaneLeasePath(args) {
-  return path.join(CONVERSATION_LEASES_DIR, `lane-${bootstrapLeaseKey(args)}.lock`);
+  const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
+  let laneScope;
+  if (args?.lane) {
+    laneScope = ['explicit-lane', args.lane, normalizedCdp].join('|');
+  } else if (args?.conversation || args?.expectedSessionId) {
+    const rawConv = args.conversation || args.expectedSessionId;
+    const convId = extractConversationId(rawConv);
+    laneScope = ['conversation-lane', TARGET_APP_BASE.origin, normalizedCdp, convId].join('|');
+  } else if (args?.targetId || args?.pageTargetId) {
+    const tid = args.targetId || args.pageTargetId;
+    laneScope = ['page-lane', TARGET_APP_BASE.origin, normalizedCdp, tid].join('|');
+  } else {
+    laneScope = ['bootstrap-lane', TARGET_APP_BASE.origin, normalizedCdp].join('|');
+  }
+
+  const hash = crypto
+    .createHash('sha256')
+    .update(laneScope)
+    .digest('hex')
+    .slice(0, 24);
+
+  return path.join(CONVERSATION_LEASES_DIR, `lane-${hash}.lock`);
 }
 
 function acquireBrowserLaneLease(args, transactionId) {
+  const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
+  const convId = (args?.conversation || args?.expectedSessionId) ? extractConversationId(args.conversation || args.expectedSessionId) : '';
   return acquireNamedLease(
     browserLaneLeasePath(args),
     {
       kind: 'browser_lane',
       transactionId,
-      cdp: args.cdp || DEFAULT_CDP,
+      cdp: normalizedCdp,
+      conversationId: convId,
+      lane: args?.lane || '',
+      targetId: args?.targetId || args?.pageTargetId || '',
       targetOrigin: TARGET_APP_BASE.origin,
     },
     'BROWSER_LANE_BUSY',
@@ -1877,6 +1914,15 @@ function printQueueStatus(args) {
 }
 
 async function findTargetAppPage(browser, args = {}) {
+  if (args.targetId || args.pageTargetId) {
+    const tid = args.targetId || args.pageTargetId;
+    for (const candidateContext of browser.contexts()) {
+      for (const p of candidateContext.pages()) {
+        if (typeof p._targetId === 'string' && p._targetId === tid) return p;
+      }
+    }
+  }
+
   if (args.newTab) {
     if (!args._laneLease) {
       args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
@@ -1888,11 +1934,18 @@ async function findTargetAppPage(browser, args = {}) {
   }
 
   const expectedId = args.expectedSessionId || args.conversation;
-  if (expectedId && STABLE_SESSION_ID_RE.test(expectedId)) {
+  const normalizedExpectedId = expectedId ? extractConversationId(expectedId) : null;
+
+  if (normalizedExpectedId && STABLE_SESSION_ID_RE.test(normalizedExpectedId)) {
     for (const candidateContext of browser.contexts()) {
-      const matchPage = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === expectedId);
+      const matchPage = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === normalizedExpectedId);
       if (matchPage) return matchPage;
     }
+    // Dedicated page for requested conversation — NEVER hijack another conversation's tab!
+    const context = browser.contexts()[0] || await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(`${TARGET_APP_BASE.origin}/c/${normalizedExpectedId}`, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    return page;
   }
 
   for (const candidateContext of browser.contexts()) {
@@ -11105,6 +11158,7 @@ module.exports = {
   ROUTE_SESSION_ID_RE,
   routeSessionIdFromUrl,
   sessionIdFromUrl,
+  extractConversationId,
   isEphemeralRouteId,
   assertThreadIdentity,
   turnRef,
