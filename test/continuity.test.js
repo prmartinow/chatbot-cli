@@ -1878,52 +1878,37 @@ test('branchConversationTurn: succeeds via same-page navigation and transitions 
   const parentSessionId = '11111111-2222-4333-8444-555555555555';
   const childSessionId = '66666666-7777-4888-8999-000000000000';
   let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
-  let menuCount = 0;
 
-  const mockMenuContainer = {
-    count: async () => 1,
-    isVisible: async () => true,
-    last: () => mockMenuContainer,
-    first: () => mockMenuContainer,
-    waitFor: async () => {},
-    locator: (sel) => ({
-      first: () => ({
-        count: async () => 1,
-        isVisible: async () => true,
-        hover: async () => { menuCount = 2; },
-      })
-    })
+  const mockOpenBranchItem = {
+    hover: async () => {},
+  };
+  const mockBranchInNewChatItem = {
+    click: async () => {
+      currentUrl = `https://chatgpt.com/c/${childSessionId}`;
+    },
   };
 
-  const mockSubmenuContainer = {
-    count: async () => 1,
-    isVisible: async () => true,
-    last: () => mockSubmenuContainer,
-    first: () => mockSubmenuContainer,
-    waitFor: async () => {},
-    locator: (sel) => ({
-      first: () => ({
-        count: async () => 1,
-        isVisible: async () => true,
-        click: async () => {
-          currentUrl = `https://chatgpt.com/c/${childSessionId}`;
-        },
-      })
-    })
+  const mockMenuEl = {
+    $$: async (sel) => [mockOpenBranchItem],
   };
+  const mockSubmenuEl = {
+    $$: async (sel) => [mockBranchInNewChatItem],
+  };
+
+  let evalHandleCalls = 0;
 
   const mockTurnEl = {
     count: async () => 1,
     scrollIntoViewIfNeeded: async () => {},
     hover: async () => {},
-    last: () => mockTurnEl,
     first: () => mockTurnEl,
+    last: () => mockTurnEl,
     waitFor: async () => {},
     locator: (sel) => ({
       first: () => ({
         count: async () => 1,
         isVisible: async () => true,
-        click: async () => { menuCount = 1; },
+        click: async () => {},
       })
     })
   };
@@ -1940,7 +1925,12 @@ test('branchConversationTurn: succeeds via same-page navigation and transitions 
     waitForTimeout: async () => {},
     waitForSelector: async () => {},
     keyboard: { press: async () => {} },
-    $$eval: async (sel, fn) => menuCount,
+    locator: (sel) => mockTurnEl,
+    evaluateHandle: async () => {
+      evalHandleCalls++;
+      if (evalHandleCalls === 1) return { asElement: () => mockMenuEl, dispose: async () => {} };
+      return { asElement: () => mockSubmenuEl, dispose: async () => {} };
+    },
     evaluate: async (fn, ...args) => {
       if (typeof fn === 'function') {
         const fnStr = fn.toString();
@@ -1977,16 +1967,8 @@ test('branchConversationTurn: succeeds via same-page navigation and transitions 
           ];
         }
       }
-      return {
-        role: 'ready',
-        isGenerating: false,
-      };
+      return { role: 'ready', isGenerating: false };
     },
-    locator: (sel) => {
-      if (sel.includes('Open new branch')) return mockMenuContainer;
-      if (sel.includes('Branch in new Chat') || sel.includes('Branch in new chat')) return mockSubmenuContainer;
-      return mockTurnEl;
-    }
   };
 
   const mockArgs = {
@@ -2005,59 +1987,44 @@ test('branchConversationTurn: succeeds via same-page navigation and transitions 
 test('branchConversationTurn: fails closed on destination ambiguity (new page + parent navigation)', async () => {
   const parentSessionId = '11111111-2222-4333-8444-555555555555';
   let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
-  let menuCount = 0;
   let newTabOpened = false;
 
   const mockNewPage = {
     url: () => 'https://chatgpt.com/c/77777777-8888-4999-8000-111111111111',
   };
 
-  const mockMenuContainer = {
-    count: async () => 1,
-    isVisible: async () => true,
-    last: () => mockMenuContainer,
-    first: () => mockMenuContainer,
-    waitFor: async () => {},
-    locator: (sel) => ({
-      first: () => ({
-        count: async () => 1,
-        isVisible: async () => true,
-        hover: async () => { menuCount = 2; },
-      })
-    })
+  const mockOpenBranchItem = {
+    hover: async () => {},
+  };
+  const mockBranchInNewChatItem = {
+    click: async () => {
+      // BOTH: parent navigates AND new tab opens!
+      currentUrl = 'https://chatgpt.com/c/66666666-7777-4888-8999-000000000000';
+      newTabOpened = true;
+    },
   };
 
-  const mockSubmenuContainer = {
-    count: async () => 1,
-    isVisible: async () => true,
-    last: () => mockSubmenuContainer,
-    first: () => mockSubmenuContainer,
-    waitFor: async () => {},
-    locator: (sel) => ({
-      first: () => ({
-        count: async () => 1,
-        isVisible: async () => true,
-        click: async () => {
-          // BOTH: parent navigates AND new tab opens!
-          currentUrl = 'https://chatgpt.com/c/66666666-7777-4888-8999-000000000000';
-          newTabOpened = true;
-        },
-      })
-    })
+  const mockMenuEl = {
+    $$: async (sel) => [mockOpenBranchItem],
   };
+  const mockSubmenuEl = {
+    $$: async (sel) => [mockBranchInNewChatItem],
+  };
+
+  let evalHandleCalls = 0;
 
   const mockTurnEl = {
     count: async () => 1,
     scrollIntoViewIfNeeded: async () => {},
     hover: async () => {},
-    last: () => mockTurnEl,
     first: () => mockTurnEl,
+    last: () => mockTurnEl,
     waitFor: async () => {},
     locator: (sel) => ({
       first: () => ({
         count: async () => 1,
         isVisible: async () => true,
-        click: async () => { menuCount = 1; },
+        click: async () => {},
       })
     })
   };
@@ -2074,7 +2041,12 @@ test('branchConversationTurn: fails closed on destination ambiguity (new page + 
     waitForTimeout: async () => {},
     waitForSelector: async () => {},
     keyboard: { press: async () => {} },
-    $$eval: async (sel, fn) => menuCount,
+    locator: (sel) => mockTurnEl,
+    evaluateHandle: async () => {
+      evalHandleCalls++;
+      if (evalHandleCalls === 1) return { asElement: () => mockMenuEl, dispose: async () => {} };
+      return { asElement: () => mockSubmenuEl, dispose: async () => {} };
+    },
     evaluate: async (fn, ...args) => {
       if (typeof fn === 'function') {
         const fnStr = fn.toString();
@@ -2096,11 +2068,6 @@ test('branchConversationTurn: fails closed on destination ambiguity (new page + 
       }
       return { role: 'ready', isGenerating: false };
     },
-    locator: (sel) => {
-      if (sel.includes('Open new branch')) return mockMenuContainer;
-      if (sel.includes('Branch in new Chat') || sel.includes('Branch in new chat')) return mockSubmenuContainer;
-      return mockTurnEl;
-    }
   };
 
   const mockArgs = {
@@ -2234,7 +2201,77 @@ test('recoverCandidateBranchLineage: attests candidate child and transitions str
   assert.strictEqual(updated.childUrl, `https://chatgpt.com/c/${childSessionId}`);
 });
 
-test('openBranchMenu: fails closed when no newly visible menu or duplicate menus appear', async () => {
+test('recoverCandidateBranchLineage: marks branch failed when candidate child divider contradicts parent', async () => {
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  const childSessionId = '66666666-7777-4888-8999-000000000000';
+  const wrongParentId = '99999999-8888-4777-8666-555555555555';
+  let currentUrl = `https://chatgpt.com/c/${parentSessionId}`;
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => { currentUrl = url; },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: (sel) => ({
+      last: () => ({
+        waitFor: async () => {},
+      })
+    }),
+    evaluate: async (fn, ...args) => {
+      if (typeof fn === 'function') {
+        const fnStr = fn.toString();
+        if (fnStr.includes('dividerData') || fnStr.includes('branchLink')) {
+          return {
+            href: currentUrl,
+            pathname: new URL(currentUrl).pathname,
+            dividerData: {
+              hasDivider: true,
+              parentSessionId: wrongParentId, // Contradictory parent!
+              branchText: 'Branched from earlier conversation',
+              precedingTurnCount: 1,
+              postDividerTurnTestids: [],
+              totalTurns: 2,
+            },
+            docTitle: 'Branch · Test',
+            sidebarTitle: 'Branch · Test',
+          };
+        }
+        if (fnStr.includes('hydrated') || fnStr.includes('sessionIdFromLocation')) {
+          return {
+            hydrated: true,
+            sessionId: childSessionId,
+            turnCount: 2,
+            roleNodeCount: 2,
+            composerVisible: true,
+          };
+        }
+      }
+      return { hydrated: true };
+    }
+  };
+
+  const mockArgs = {
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  const mockSourceTurn = { messageId: 'msg-rec-2', testid: 'turn-r2', role: 'assistant' };
+  const branch = registerPendingBranch(mockArgs, mockPage, mockSourceTurn, {
+    parentSessionId,
+  });
+  const updatedRecord = updateBranchLineage(branch.id, {
+    dispatchState: 'stable_candidate',
+    candidateChildSessionId: childSessionId,
+  });
+
+  const updated = await recoverCandidateBranchLineage(mockPage, mockArgs, updatedRecord);
+  assert.ok(updated);
+  assert.strictEqual(updated.dispatchState, 'lineage_unverified');
+  assert.strictEqual(updated.status, 'failed');
+  assert.match(updated.lastError, /contradicts expected parent/);
+});
+
+test('openBranchMenu: fails closed when JSHandle.asElement() returns null (realistic Playwright null handle)', async () => {
   const mockTurnEl = {
     first: () => mockTurnEl,
     count: async () => 1,
@@ -2249,16 +2286,52 @@ test('openBranchMenu: fails closed when no newly visible menu or duplicate menus
     })
   };
 
-  // Case 1: evaluateHandle returns null (no unique newly visible menu)
+  let disposed = false;
+  // Realistic Playwright evaluateHandle returning JSHandle<null> where asElement() is null
   const mockPageNoMenu = {
     locator: () => mockTurnEl,
     waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
     evaluate: async () => {},
-    evaluateHandle: async () => null,
+    evaluateHandle: async () => ({
+      asElement: () => null,
+      dispose: async () => { disposed = true; },
+    }),
   };
 
   await assert.rejects(
     async () => openBranchMenu(mockPageNoMenu, { messageId: 'm1' }),
     (err) => err.code === 'BRANCH_ACTION_UNVERIFIED'
+  );
+  assert.strictEqual(disposed, true);
+});
+
+test('openBranchMenu: fails closed if baseline visible menus snapshot throws', async () => {
+  const mockTurnEl = {
+    first: () => mockTurnEl,
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        isVisible: async () => true,
+        click: async () => {},
+      })
+    })
+  };
+
+  const mockPageBaselineFail = {
+    locator: () => mockTurnEl,
+    waitForTimeout: async () => {},
+    keyboard: { press: async () => {} },
+    evaluate: async () => {
+      throw new Error('CDP execution context destroyed');
+    },
+  };
+
+  await assert.rejects(
+    async () => openBranchMenu(mockPageBaselineFail, { messageId: 'm1' }),
+    (err) => err.code === 'BRANCH_ACTION_UNVERIFIED' && /Could not snapshot visible action menus/.test(err.message)
   );
 });

@@ -6722,13 +6722,17 @@ async function openBranchMenu(page, sourceAssistant) {
     throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate More actions button on target assistant turn');
   }
 
-  // Snapshot visible menus before clicking More actions
-  await page.evaluate(() => {
-    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    window.__cbExistingMenus = new Set(
-      Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
-    );
-  }).catch(() => {});
+  // Snapshot visible menus fail-closed before clicking More actions
+  try {
+    await page.evaluate(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      window.__cbExistingMenus = new Set(
+        Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
+      );
+    });
+  } catch (err) {
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Could not snapshot visible action menus before opening: ${err.message || err}`);
+  }
 
   try {
     await moreBtn.click({ timeout: 2000 });
@@ -6737,79 +6741,89 @@ async function openBranchMenu(page, sourceAssistant) {
   }
   await page.waitForTimeout(400);
 
-  // Identify newly visible menu
-  let newMenuEl = null;
-  if (typeof page.evaluateHandle === 'function') {
-    const menuHandle = await page.evaluateHandle(() => {
+  // Identify newly visible menu strictly via asElement() handle
+  let menuHandle = null;
+  try {
+    menuHandle = await page.evaluateHandle(() => {
       const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
       const current = Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
       const existing = window.__cbExistingMenus || new Set();
       const newlyVisible = current.filter(m => !existing.has(m));
       delete window.__cbExistingMenus;
       return newlyVisible.length === 1 ? newlyVisible[0] : null;
-    }).catch(() => null);
-    newMenuEl = menuHandle?.asElement?.() || menuHandle;
-    if (!newMenuEl) {
-      throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened action menu after clicking More actions');
-    }
+    });
+  } catch (err) {
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Failed to evaluate newly visible action menu: ${err.message || err}`);
   }
 
-  const menuContainer = newMenuEl || page.locator('[role="menu"]:has([role="menuitem"]:has-text("Open new branch"))').last();
-  let openBranchItem = null;
-  if (newMenuEl?.$) {
-    openBranchItem = await newMenuEl.$('[role="menuitem"]:has-text("Open new branch")');
-  } else {
-    openBranchItem = menuContainer.locator('[role="menuitem"]:has-text("Open new branch")').first();
+  const newMenuEl = menuHandle?.asElement ? menuHandle.asElement() : null;
+  if (!newMenuEl) {
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened action menu after clicking More actions');
   }
 
-  if (!openBranchItem) {
+  // Require exactly one "Open new branch" item inside the proven menu
+  const openBranchItems = await newMenuEl.$$('[role="menuitem"]:has-text("Open new branch")');
+  if (!openBranchItems || openBranchItems.length !== 1) {
     await page.keyboard.press('Escape').catch(() => {});
-    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item inside opened menu');
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Expected exactly 1 "Open new branch" item in menu, found ${openBranchItems?.length || 0}`);
   }
+  const openBranchItem = openBranchItems[0];
 
-  // Snapshot visible menus before hovering "Open new branch"
-  await page.evaluate(() => {
-    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    window.__cbExistingSubmenus = new Set(
-      Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
-    );
-  }).catch(() => {});
+  // Snapshot visible menus fail-closed before hovering "Open new branch"
+  try {
+    await page.evaluate(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      window.__cbExistingSubmenus = new Set(
+        Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible)
+      );
+    });
+  } catch (err) {
+    await page.keyboard.press('Escape').catch(() => {});
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Could not snapshot visible submenus before hover: ${err.message || err}`);
+  }
 
   await openBranchItem.hover().catch(() => {});
   await page.waitForTimeout(400);
 
-  // Identify newly visible submenu
-  let newSubmenuEl = null;
-  if (typeof page.evaluateHandle === 'function') {
-    const submenuHandle = await page.evaluateHandle(() => {
+  // Identify newly visible submenu strictly via asElement() handle
+  let submenuHandle = null;
+  try {
+    submenuHandle = await page.evaluateHandle(() => {
       const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
       const current = Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
       const existing = window.__cbExistingSubmenus || new Set();
       const newlyVisible = current.filter(m => !existing.has(m));
       delete window.__cbExistingSubmenus;
       return newlyVisible.length === 1 ? newlyVisible[0] : null;
-    }).catch(() => null);
-    newSubmenuEl = submenuHandle?.asElement?.() || submenuHandle;
-    if (!newSubmenuEl) {
-      await page.keyboard.press('Escape').catch(() => {});
-      throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened branch submenu after hovering Open new branch');
-    }
+    });
+  } catch (err) {
+    await page.keyboard.press('Escape').catch(() => {});
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Failed to evaluate newly visible branch submenu: ${err.message || err}`);
   }
 
-  const submenuContainer = newSubmenuEl || page.locator('[role="menu"]:has([role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat"))').last();
-  let branchInNewChatItem = null;
-  if (newSubmenuEl?.$) {
-    branchInNewChatItem = await newSubmenuEl.$('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")');
-  } else {
-    branchInNewChatItem = submenuContainer.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
+  const newSubmenuEl = submenuHandle?.asElement ? submenuHandle.asElement() : null;
+  if (!newSubmenuEl) {
+    await page.keyboard.press('Escape').catch(() => {});
+    if (submenuHandle?.dispose) await submenuHandle.dispose().catch(() => {});
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Failed to uniquely identify newly opened branch submenu after hovering Open new branch');
   }
 
-  if (!branchInNewChatItem) {
+  // Require exactly one "Branch in new Chat" item inside the proven submenu
+  const branchInNewChatItems = await newSubmenuEl.$$('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")');
+  if (!branchInNewChatItems || branchInNewChatItems.length !== 1) {
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(100);
     await page.keyboard.press('Escape').catch(() => {});
-    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Branch in new Chat" menu item inside branch submenu');
+    if (submenuHandle?.dispose) await submenuHandle.dispose().catch(() => {});
+    if (menuHandle?.dispose) await menuHandle.dispose().catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', `Expected exactly 1 "Branch in new Chat" item in submenu, found ${branchInNewChatItems?.length || 0}`);
   }
+  const branchInNewChatItem = branchInNewChatItems[0];
 
   return {
     moreBtn,
@@ -6834,34 +6848,45 @@ async function recoverCandidateBranchLineage(page, args, branch) {
       await settlePage(page, 5000).catch(() => {});
 
       const branchInfo = await getBranchInfo(page).catch(() => null);
-      if (branchInfo?.isFork && branchInfo.parentResolution === 'dom_divider' && branchInfo.parentSessionId === parentSessionId) {
-        updateBranchLineage(branch.id, {
-          dispatchState: 'lineage_attested',
-          childSessionId,
-          parentAttestation: {
-            parentSessionId,
-            verifiedVia: 'dom_divider',
-          },
-          lineageAttestation: {
-            parentSessionId: branchInfo.parentSessionId,
-            parentResolution: branchInfo.parentResolution,
-            detectionVectors: branchInfo.detectionVectors,
-            branchText: branchInfo.branchText,
-          },
-        }, 'branch_lineage_attested');
+      if (branchInfo?.isFork && branchInfo.parentResolution === 'dom_divider') {
+        if (branchInfo.parentSessionId === parentSessionId) {
+          updateBranchLineage(branch.id, {
+            dispatchState: 'lineage_attested',
+            childSessionId,
+            parentAttestation: {
+              parentSessionId,
+              verifiedVia: 'dom_divider',
+            },
+            lineageAttestation: {
+              parentSessionId: branchInfo.parentSessionId,
+              parentResolution: branchInfo.parentResolution,
+              detectionVectors: branchInfo.detectionVectors,
+              branchText: branchInfo.branchText,
+            },
+          }, 'branch_lineage_attested');
 
-        ensureTranscript(transcriptPathForSession(childSessionId));
+          ensureTranscript(transcriptPathForSession(childSessionId));
 
-        const updated = updateBranchLineage(branch.id, {
-          status: 'done',
-          dispatchState: 'bound',
-          childSessionId,
-          childUrl: targetConversationUrl(childSessionId),
-          lastError: '',
-        }, 'branch_bound');
+          const updated = updateBranchLineage(branch.id, {
+            status: 'done',
+            dispatchState: 'bound',
+            childSessionId,
+            childUrl: targetConversationUrl(childSessionId),
+            lastError: '',
+          }, 'branch_bound');
 
-        info(`[stage3-recover] Successfully attested and bound stranded branch ${branch.id} -> ${childSessionId}`);
-        return updated || branch;
+          info(`[stage3-recover] Successfully attested and bound stranded branch ${branch.id} -> ${childSessionId}`);
+          return updated || branch;
+        } else {
+          // Positively contradictory parent recorded
+          const updated = updateBranchLineage(branch.id, {
+            status: 'failed',
+            dispatchState: 'lineage_unverified',
+            lastError: `Candidate child ${childSessionId} divider parent "${branchInfo.parentSessionId}" contradicts expected parent "${parentSessionId}"`,
+          }, 'branch_lineage_unverified');
+          info(`[stage3-recover] Candidate child ${childSessionId} has contradictory parent "${branchInfo.parentSessionId}" (expected "${parentSessionId}")`);
+          return updated || branch;
+        }
       } else {
         info(`[stage3-recover] Candidate child ${childSessionId} divider could not be verified against parent ${parentSessionId}`);
         return branch;
