@@ -297,6 +297,7 @@ function parseArgs(argv) {
     handoffNewSession: false,
     recoverInterrupted: false,
     recoveryResend: false,
+    recoveryIncidentId: '',
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
@@ -355,6 +356,7 @@ function parseArgs(argv) {
     else if (arg === '--compact-conversation' || arg === '--compact' || arg === '--export-context-summary') args.compactConversation = true;
     else if (arg === '--handoff-new-session' || arg === '--compact-handoff' || arg === '--handoff') args.handoffNewSession = true;
     else if (arg === '--recovery-resend') args.recoveryResend = true;
+    else if (arg === '--recovery-incident') args.recoveryIncidentId = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
     else if (arg === '--show-artifacts') args.showArtifacts = true;
@@ -1314,6 +1316,9 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
   const now = nowIso();
   const round = {
     id,
+    operationKind: extra.operationKind || 'prompt',
+    recoveryStage: Number(extra.recoveryStage) || 0,
+    recoveryIncidentId: extra.recoveryIncidentId || '',
     status: 'pending',
     dispatchState: extra.dispatchState || 'prepared',
     sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
@@ -5919,14 +5924,22 @@ async function openConversationBySessionId(page, sessionId) {
 }
 
 async function prepareConversationForPrompt(page, args) {
-  if (args.recoveryResend && args.newConversation) {
-    throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with --new-conversation');
-  }
-  if (args.recoveryResend && !args.conversation && !args.expectedSessionId) {
-    const rawUrl = page.url();
-    const currentSessionId = sessionIdFromUrl(rawUrl);
-    if (!currentSessionId) {
-      throw cbError('RECOVERY_TARGET_REQUIRED', 'Stage 2 recovery requires an existing stable conversation');
+  if (args.recoveryResend) {
+    if (args.newConversation) {
+      throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with --new-conversation');
+    }
+    if (args.schedule || args.runQueue || args.queueWatch) {
+      throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with scheduling or queue operations');
+    }
+    if (!args.message) {
+      throw cbError('RECOVERY_MESSAGE_REQUIRED', '--recovery-resend is a one-shot operation and requires --message');
+    }
+    if (!args.conversation && !args.expectedSessionId) {
+      const rawUrl = page.url();
+      const currentSessionId = sessionIdFromUrl(rawUrl);
+      if (!currentSessionId) {
+        throw cbError('RECOVERY_TARGET_REQUIRED', 'Stage 2 recovery requires an existing stable conversation');
+      }
     }
   }
   if (args.newConversation) {
@@ -6861,6 +6874,7 @@ async function ask(page, message, args) {
     if (args.recoveryResend) {
       roundExtra.operationKind = 'recovery_resend';
       roundExtra.recoveryStage = 2;
+      roundExtra.recoveryIncidentId = args.recoveryIncidentId || '';
     }
     const round = registerPendingRound(args, page, message, baselineLastTurnId, roundExtra);
 
@@ -8055,6 +8069,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  registerPendingRound,
   reloadExactConversation,
   watchTargetAppState,
   executeCompactionHandoff,

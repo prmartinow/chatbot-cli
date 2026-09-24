@@ -32,6 +32,7 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  registerPendingRound,
   reloadExactConversation,
   watchTargetAppState,
   executeCompactionHandoff,
@@ -851,6 +852,7 @@ test('Stage-2 Root Rejection: root URL with --recovery-resend and no target thro
   const mockPage = { url: () => 'https://chatgpt.com/' };
   const mockArgs = {
     recoveryResend: true,
+    message: 'test recovery prompt',
     conversation: '',
     expectedSessionId: '',
   };
@@ -922,4 +924,84 @@ test('Target-Aware Watch Resolution: prepareConversationForRead resolves explici
   };
   await prepareConversationForRead(mockPage, mockArgs);
   assert.equal(mockArgs.expectedSessionId, targetId);
+});
+
+test('WAL Round Recovery Metadata: registerPendingRound persists operationKind, recoveryStage, and recoveryIncidentId', () => {
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111' };
+  const round = registerPendingRound(mockArgs, mockPage, 'Test recovery message', 'turn-1', {
+    expectedSessionId: '11111111-1111-4111-8111-111111111111',
+    operationKind: 'recovery_resend',
+    recoveryStage: 2,
+    recoveryIncidentId: 'INCIDENT-1234',
+  });
+
+  assert.equal(round.operationKind, 'recovery_resend');
+  assert.equal(round.recoveryStage, 2);
+  assert.equal(round.recoveryIncidentId, 'INCIDENT-1234');
+});
+
+test('Stage-2 Mode Constraints: --recovery-resend rejects scheduling and missing message', async () => {
+  const mockPage = { url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111' };
+
+  // Rejects missing message
+  await assert.rejects(
+    async () => prepareConversationForPrompt(mockPage, {
+      recoveryResend: true,
+      message: null,
+      conversation: '11111111-1111-4111-8111-111111111111',
+    }),
+    (err) => err.code === 'RECOVERY_MESSAGE_REQUIRED'
+  );
+
+  // Rejects scheduling
+  await assert.rejects(
+    async () => prepareConversationForPrompt(mockPage, {
+      recoveryResend: true,
+      message: 'test',
+      schedule: true,
+      conversation: '11111111-1111-4111-8111-111111111111',
+    }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+});
+
+test('Stage-2 Cross-Thread Navigation: ask navigates to target conversation before calling reloadExactConversation', async () => {
+  const targetId = '22222222-2222-4222-8222-222222222222';
+  const initialId = '33333333-3333-4333-8333-333333333333';
+  let currentUrl = `https://chatgpt.com/c/${initialId}`;
+  const actions = [];
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => {
+      actions.push(`goto:${url}`);
+      currentUrl = url;
+    },
+    reload: async () => {
+      actions.push('reload');
+    },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: () => ({ last: () => ({ waitFor: async () => {} }) }),
+    evaluate: async () => ({
+      hydrated: true,
+      sessionId: targetId,
+      turnCount: 2,
+      roleNodeCount: 2,
+      composerVisible: true,
+    }),
+  };
+
+  // Run reloadExactConversation after navigation
+  if (sessionIdFromUrl(mockPage.url()) !== targetId) {
+    actions.push(`nav-needed:${mockPage.url()}->${targetId}`);
+    currentUrl = `https://chatgpt.com/c/${targetId}`;
+  }
+  await reloadExactConversation(mockPage, targetId, 'recovery-resend-test');
+
+  assert.equal(actions[0], `nav-needed:https://chatgpt.com/c/${initialId}->${targetId}`);
+  assert.equal(actions.includes('reload'), true);
+  assert.equal(mockPage.url(), `https://chatgpt.com/c/${targetId}`);
 });

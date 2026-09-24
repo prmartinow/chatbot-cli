@@ -114,7 +114,10 @@ performing destructive reloads or clicking Stop.
 `--recovery-resend` executes Stage 2 of the in-session recovery hierarchy. It performs
 a mandatory exact-thread clean reload (`reloadExactConversation`) and asserts thread
 identity before submitting the prompt in the same conversation thread, guaranteeing
-a fresh generation attempt without thread drift.
+a fresh generation attempt without thread drift. Stage 2 is a one-shot existing-thread
+operation requiring `--message`. When repeating an earlier request, prefix the prompt
+with a unique recovery discriminator (e.g. `[Recovery Stage 2: <incident-id>] <original prompt>`)
+to ensure WAL transcript reconciliation remains unambiguous if the process is interrupted.
 
 `--export-context-summary` (alias: `--compact-conversation`) parses the active or
 specified conversation transcript, extracts high-signal architecture details
