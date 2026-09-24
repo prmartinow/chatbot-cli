@@ -1863,8 +1863,69 @@ function turnMatchesRef(turn, ref) {
   return Boolean(ref.textHash && messageHash(normalizeTurnText(turn.text)) === ref.textHash);
 }
 
+function turnRevisionMatchesRef(turn, ref) {
+  if (!turn || !ref) return false;
+  const hashMatches = !ref.textHash || messageHash(normalizeTurnText(turn.text)) === ref.textHash;
+  if (ref.messageId && turn.messageId) {
+    return turn.messageId === ref.messageId && hashMatches;
+  }
+  if (ref.testid) {
+    return turn.testid === ref.testid && hashMatches;
+  }
+  return Boolean(ref.textHash && hashMatches);
+}
+
 function responseAfterAcceptedTurnExcludingRevision(turns, acceptedUserTurnRef, priorAssistantTurnRef) {
-  const outcome = responseAfterAcceptedTurn(turns, acceptedUserTurnRef);
+  if (!acceptedUserTurnRef) {
+    return { text: '', assistantTurn: null, userTurnMissing: false, concurrentUserTurn: null };
+  }
+
+  // Use revision-aware matching: require BOTH message identity and revision text hash to match
+  const userIndex = turns.findIndex((turn) =>
+    turn.role === 'user' && turnRevisionMatchesRef(turn, acceptedUserTurnRef)
+  );
+
+  if (userIndex === -1) {
+    return {
+      text: '',
+      assistantTurn: null,
+      userTurnMissing: true,
+      concurrentUserTurn: null,
+    };
+  }
+
+  let outcome = null;
+  for (let i = userIndex + 1; i < turns.length; i++) {
+    const turn = turns[i];
+    if (turn.role === 'user') {
+      outcome = {
+        text: '',
+        assistantTurn: null,
+        userTurnMissing: false,
+        concurrentUserTurn: turn,
+      };
+      break;
+    }
+    if (turn.role === 'assistant') {
+      outcome = {
+        text: isProgressOnlyText(turn.text) ? '' : turn.text,
+        assistantTurn: turn,
+        userTurnMissing: false,
+        concurrentUserTurn: null,
+      };
+      break;
+    }
+  }
+
+  if (!outcome) {
+    outcome = {
+      text: '',
+      assistantTurn: null,
+      userTurnMissing: false,
+      concurrentUserTurn: null,
+    };
+  }
+
   if (priorAssistantTurnRef && outcome.assistantTurn) {
     if (sameTurnRevision(outcome.assistantTurn, priorAssistantTurnRef)) {
       return {
@@ -6033,42 +6094,30 @@ async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = 
   }
 
   const canonicalTurns = await getConversationTurns(page).catch(() => []);
+  if (!canonicalTurns || !canonicalTurns.length) {
+    throw cbError('EDIT_SOURCE_UNVERIFIED', 'Could not extract canonical conversation turns from page');
+  }
+
+  const sourceUserIdx = canonicalTurns.findIndex(t =>
+    (sourceUser.id && t.messageId === sourceUser.id) ||
+    (sourceUser.testid && t.testid === sourceUser.testid)
+  );
+  if (sourceUserIdx === -1) {
+    throw cbError('EDIT_SOURCE_UNVERIFIED', 'Selected source user turn was not found within canonical conversation turns');
+  }
+
   let sourceAssistant = null;
-  if (canonicalTurns.length) {
-    const sourceUserIdx = canonicalTurns.findIndex(t =>
-      (sourceUser.id && t.messageId === sourceUser.id) ||
-      (sourceUser.testid && t.testid === sourceUser.testid)
-    );
-    if (sourceUserIdx !== -1 && sourceUserIdx + 1 < canonicalTurns.length) {
-      const nextTurn = canonicalTurns[sourceUserIdx + 1];
-      if (nextTurn.role === 'assistant') {
-        sourceAssistant = {
-          messageId: nextTurn.messageId || nextTurn.id || '',
-          id: nextTurn.messageId || nextTurn.id || '',
-          testid: nextTurn.testid || '',
-          role: 'assistant',
-          text: nextTurn.text,
-          textHash: messageHash(normalizeTurnText(nextTurn.text)),
-        };
-      }
-    }
-  } else {
-    const sourceUserIdx = turns.findIndex(t =>
-      (sourceUser.id && t.id === sourceUser.id) ||
-      (sourceUser.testid && t.testid === sourceUser.testid)
-    );
-    if (sourceUserIdx !== -1 && sourceUserIdx + 1 < turns.length) {
-      const nextTurn = turns[sourceUserIdx + 1];
-      if (nextTurn.role === 'assistant') {
-        sourceAssistant = {
-          messageId: nextTurn.id || '',
-          id: nextTurn.id || '',
-          testid: nextTurn.testid || '',
-          role: 'assistant',
-          text: nextTurn.text,
-          textHash: messageHash(normalizeTurnText(nextTurn.text)),
-        };
-      }
+  if (sourceUserIdx + 1 < canonicalTurns.length) {
+    const nextTurn = canonicalTurns[sourceUserIdx + 1];
+    if (nextTurn.role === 'assistant') {
+      sourceAssistant = {
+        messageId: nextTurn.messageId || nextTurn.id || '',
+        id: nextTurn.messageId || nextTurn.id || '',
+        testid: nextTurn.testid || '',
+        role: 'assistant',
+        text: nextTurn.text,
+        textHash: messageHash(normalizeTurnText(nextTurn.text)),
+      };
     }
   }
 
@@ -8635,6 +8684,7 @@ module.exports = {
   parseArgs,
   responseAfterAcceptedTurnExcludingRevision,
   sameTurnRevision,
+  turnRevisionMatchesRef,
   validateStage1Mode,
   resolveEditableUserTurn,
   openUserTurnEditor,

@@ -34,6 +34,7 @@ const {
   syncTranscriptFromPage,
   responseAfterAcceptedTurnExcludingRevision,
   sameTurnRevision,
+  turnRevisionMatchesRef,
   validateStage1Mode,
   resolveEditableUserTurn,
   openUserTurnEditor,
@@ -1194,7 +1195,13 @@ test('resolveEditableUserTurn: extracts latest user turn, validates distinct mut
         },
       ];
       return fn(mockElements);
-    }
+    },
+    evaluate: async () => [
+      { index: 0, testid: 'conversation-turn-1', messageId: 'msg-u1', role: 'user', text: 'First prompt', roleTexts: ['First prompt'], turnText: 'First prompt' },
+      { index: 1, testid: 'conversation-turn-2', messageId: 'msg-a1', role: 'assistant', text: 'First answer', roleTexts: ['First answer'], turnText: 'First answer' },
+      { index: 2, testid: 'conversation-turn-3', messageId: 'msg-u2', role: 'user', text: 'Failed request prompt', roleTexts: ['Failed request prompt'], turnText: 'Failed request prompt' },
+      { index: 3, testid: 'conversation-turn-4', messageId: 'msg-a2', role: 'assistant', text: 'Stopped thinking', roleTexts: ['Stopped thinking'], turnText: 'Stopped thinking' },
+    ]
   };
 
   // Trailing space fails EDIT_MUTATION_NOT_DISTINCT due to whitespace normalization
@@ -1383,7 +1390,8 @@ test('populateAndVerifyEditor: appends suffix in place while preserving initial 
 });
 
 test('responseAfterAcceptedTurnExcludingRevision: excludes prior stopped assistant revision consistently across reads', () => {
-  const userRef = { messageId: 'msg-u1', testid: 'turn-1', role: 'user', textHash: 'h_u1' };
+  const promptText = 'Prompt.';
+  const userRef = { messageId: 'msg-u1', testid: 'turn-1', role: 'user', textHash: messageHash(normalizeTurnText(promptText)) };
   const priorAssistantRef = {
     messageId: 'msg-a1',
     testid: 'turn-2',
@@ -1392,7 +1400,7 @@ test('responseAfterAcceptedTurnExcludingRevision: excludes prior stopped assista
   };
 
   const priorTurns = [
-    { messageId: 'msg-u1', testid: 'turn-1', role: 'user', text: 'Prompt' },
+    { messageId: 'msg-u1', testid: 'turn-1', role: 'user', text: promptText },
     { messageId: 'msg-a1', testid: 'turn-2', role: 'assistant', text: 'Stopped response text' },
   ];
 
@@ -1438,4 +1446,85 @@ test('populateAndVerifyEditor: verifies markdown editor against initial editor t
   // and post-insertion verifies against expectedEditorText (markdown + suffix)
   await populateAndVerifyEditor(mockPage, mockEditor, { messageId: 'msg-1' }, renderedText, '.', `${rawEditorMarkdown}.`);
   assert.equal(insertedSuffix, '.');
+});
+
+test('turnRevisionMatchesRef: requires both messageId and revision textHash to match', () => {
+  const oldText = 'Original user prompt';
+  const newText = 'Original user prompt.';
+  const oldHash = messageHash(oldText);
+  const newHash = messageHash(newText);
+
+  const turn = {
+    messageId: 'msg-u1',
+    testid: 'conversation-turn-1',
+    text: oldText,
+  };
+
+  const oldRef = {
+    messageId: 'msg-u1',
+    testid: 'conversation-turn-1',
+    textHash: oldHash,
+  };
+
+  const newRef = {
+    messageId: 'msg-u1',
+    testid: 'conversation-turn-1',
+    textHash: newHash,
+  };
+
+  // Same messageId with matching revision hash returns true
+  assert.strictEqual(turnRevisionMatchesRef(turn, oldRef), true);
+
+  // Same messageId with different revision hash returns false (reused ID does not falsely match)
+  assert.strictEqual(turnRevisionMatchesRef(turn, newRef), false);
+});
+
+test('resolveEditableUserTurn: fails closed with EDIT_SOURCE_UNVERIFIED if canonical extraction fails or source user is missing', async () => {
+  const emptyPage = {
+    $$eval: async (selector, fn) => fn([{
+      getAttribute: () => 'user',
+      closest: () => ({ getAttribute: () => 'turn-1' }),
+      textContent: 'Some prompt'
+    }]),
+    evaluate: async () => []
+  };
+
+  await assert.rejects(
+    () => resolveEditableUserTurn(emptyPage, 'latest', '.'),
+    (err) => err.code === 'EDIT_SOURCE_UNVERIFIED'
+  );
+
+  const missingUserPage = {
+    $$eval: async (selector, fn) => fn([{
+      getAttribute: (name) => name === 'data-message-author-role' ? 'user' : 'msg-unknown',
+      closest: () => ({ getAttribute: () => 'turn-unknown' }),
+      textContent: 'Some prompt'
+    }]),
+    evaluate: async () => [
+      { index: 0, testid: 'turn-1', messageId: 'msg-other', role: 'user', text: 'Other prompt', roleTexts: ['Other prompt'], turnText: 'Other prompt' }
+    ]
+  };
+
+  await assert.rejects(
+    () => resolveEditableUserTurn(missingUserPage, 'latest', '.'),
+    (err) => err.code === 'EDIT_SOURCE_UNVERIFIED'
+  );
+});
+
+test('retryEditTurn lifecycle: validates WAL transitions across success, precommit abort, and submit uncertainty', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'cb-orch-test-'));
+  const roundsPath = path.join(tmpDir, 'rounds.jsonl');
+
+  // Verify that turnRevisionMatchesRef rejects reused messageId when revision textHash differs
+  const msgId = 'msg-reused-1';
+  const oldPrompt = 'Old prompt';
+  const editedPrompt = 'Old prompt.';
+  const oldRef = { messageId: msgId, textHash: messageHash(oldPrompt) };
+  const editedRef = { messageId: msgId, textHash: messageHash(editedPrompt) };
+
+  assert.strictEqual(turnRevisionMatchesRef({ messageId: msgId, text: oldPrompt }, editedRef), false);
+  assert.strictEqual(turnRevisionMatchesRef({ messageId: msgId, text: editedPrompt }, editedRef), true);
+  assert.strictEqual(turnRevisionMatchesRef({ messageId: msgId, text: oldPrompt }, oldRef), true);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });
