@@ -2757,6 +2757,8 @@ test('attestEditedUserTurnVersion: verifies K+1 version count and matching rende
   assert.equal(attestation.acceptedCount, 3);
   assert.equal(attestation.acceptedIndex, 3);
   assert.equal(attestation.nextDisabled, true);
+  assert.equal(attestation.method, 'variants_ui_post_reload');
+  assert.equal(attestation.commitBarrier?.method, 'exact_thread_reload');
   assert.equal(closeClicked, true);
 });
 
@@ -3324,6 +3326,11 @@ test('stage1CommitIsAttested: validates complete dual-vector attestation and rej
       acceptedCount: 3,
       contentHash: 'hash-edited',
       nextDisabled: true,
+      method: 'variants_ui_post_reload',
+      commitBarrier: {
+        method: 'exact_thread_reload',
+        phase: 'stage1-post-submit-rehydration',
+      },
     },
   };
   assert.equal(stage1CommitIsAttested(validRound), true);
@@ -3347,6 +3354,16 @@ test('stage1CommitIsAttested: validates complete dual-vector attestation and rej
   assert.equal(stage1CommitIsAttested({
     ...validRound,
     versionAttestation: { ...validRound.versionAttestation, nextDisabled: false },
+  }), false);
+
+  // Pre-barrier legacy attestation method without reload commit barrier rejected
+  assert.equal(stage1CommitIsAttested({
+    ...validRound,
+    versionAttestation: {
+      ...validRound.versionAttestation,
+      method: 'variants_ui',
+      commitBarrier: null,
+    },
   }), false);
 });
 
@@ -3517,7 +3534,7 @@ test('attestEditedUserTurnVersion: resolves numeric K+1 when active version labe
   assert.equal(closeClicked, true);
 });
 
-test('reconcileStage1EditTurn: recovers crashed preparing round by marking aborted_precommit', async () => {
+test('reconcileStage1EditTurn: recovers crashed preparing round by positively restoring branch or failing closed', async () => {
   const preparingRound = {
     id: 'round-prep-1',
     operationKind: 'edit_retry',
@@ -3525,19 +3542,159 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by marking abort
     dispatchState: 'preparing',
     status: 'pending',
     expectedSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    sourceUserTurn: { testid: 'turn-u1', text: 'Original text', textHash: 'hash-orig' },
     versionProbe: {
       initialActiveIndex: 2,
       initialLabelKind: 'current',
     },
   };
 
-  const fakePage = {
+  // 1. When restoration throws, fails closed with preparing_needs_reconciliation and conflict outcome
+  const fakePageFailing = {
     url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
-    reload: async () => {},
+    reload: async () => { throw new Error('Network failure during reload'); },
   };
 
-  const res = await reconcileStage1EditTurn(fakePage, {}, preparingRound);
-  assert.equal(res.outcome, 'aborted_precommit');
-  assert.equal(res.round.dispatchState, 'aborted_precommit');
-  assert.equal(res.round.status, 'failed');
+  const resFail = await reconcileStage1EditTurn(fakePageFailing, {}, preparingRound);
+  assert.equal(resFail.outcome, 'conflict');
+  assert.equal(resFail.round.dispatchState, 'preparing_needs_reconciliation');
+
+  // 2. When no versionProbe was persisted yet, safely marks aborted_precommit
+  const preProbeRound = {
+    id: 'round-prep-2',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'preparing',
+    status: 'pending',
+    versionProbe: null,
+  };
+  const resPre = await reconcileStage1EditTurn({}, {}, preProbeRound);
+  assert.equal(resPre.outcome, 'aborted_precommit');
+  assert.equal(resPre.round.dispatchState, 'aborted_precommit');
+});
+
+test('reconcileStage1EditTurn: proves numeric K+1 under Current version via predecessor probe', async () => {
+  const editedText = 'Reconciled edited prompt text';
+  const expectedHash = messageHash(normalizeTurnText(editedText));
+
+  let currentLabel = 'Current version';
+  let nextDisabled = true;
+  let prevDisabled = false;
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version') || sel.includes('Current version')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => currentLabel,
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => prevDisabled,
+            click: async () => {
+              currentLabel = 'Version 2';
+              nextDisabled = false;
+            },
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => nextDisabled,
+            click: async () => {
+              currentLabel = 'Current version';
+              nextDisabled = true;
+            },
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakeTurnRoot = {
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('user')) {
+        return {
+          first: () => ({
+            innerText: async () => editedText,
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0, isVisible: async () => false }) };
+    },
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    bringToFront: async () => {},
+    reload: async () => {},
+    waitForLoadState: async () => {},
+    waitForSelector: async () => ({}),
+    evaluate: async () => ({ hydrated: true, sessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', turnCount: 3, roleNodeCount: 3, composerVisible: true }),
+    locator: (sel) => {
+      if (sel.includes('turn-u-recon')) {
+        return {
+          first: () => fakeTurnRoot,
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          last: () => fakeHeader,
+        };
+      }
+      if (sel.includes('close-button')) {
+        return {
+          last: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      return {
+        first: () => ({ count: async () => 0, waitFor: async () => {} }),
+        last: () => ({ count: async () => 0, waitFor: async () => {} }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const uncertainRound = {
+    id: 'round-recon-curr',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'uncertain',
+    status: 'pending',
+    expectedSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    sourceUserTurn: { testid: 'turn-u-recon', text: 'Original text' },
+    versionBaseline: { count: 2 },
+    editedMessageHash: expectedHash,
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, uncertainRound);
+  assert.equal(res.outcome, 'promoted_to_accepted');
+  assert.equal(res.round.dispatchState, 'accepted');
+  assert.equal(res.round.versionAttestation.acceptedCount, 3);
+  assert.equal(res.round.versionAttestation.baselineCount, 2);
+  assert.equal(res.round.versionAttestation.method, 'variants_ui_reconciled_post_reload');
+  assert.equal(res.round.versionAttestation.commitBarrier?.method, 'exact_thread_reload');
+  assert.equal(stage1CommitIsAttested(res.round), true);
 });
