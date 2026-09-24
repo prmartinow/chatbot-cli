@@ -134,6 +134,18 @@ CB CLI automatically injects a unique recovery discriminator prefix into the use
 entry point and strictly prohibits combination with `--new-conversation`, scheduling,
 or queue operations.
 
+`--branch-turn [latest|prior-assistant|<turnId>]` executes Stage 3 of the in-session recovery
+hierarchy (native backend branching). It performs an exact-thread reload of the parent conversation,
+proves generation is idle, locates the target assistant turn (`latest` or `prior-assistant`),
+records a pre-branch WAL entry (`lineage.jsonl`), opens the turn's scoped `More actions` menu,
+navigates to `Open new branch` -> `Branch in new Chat`, executes the single commit click,
+identifies the destination page (navigated tab or newly opened tab), handles ephemeral `/c/WEB:*`
+routes until a stable child UUID is observed, and attests parent lineage via the live DOM divider
+(`a[href*="/c/<parentSessionId>"]` starting with "Branched from"). It briefly holds overlapping
+conversation leases on both parent and child during ledger persistence and transcript seeding,
+and guarantees that no user prompt is automatically sent as part of the branch transaction.
+Stage 3 is a one-shot operation requiring `--conversation <parent-uuid>` and `--recovery-incident <id>`.
+
 `--export-context-summary` (alias: `--compact-conversation`) parses the active or
 specified conversation transcript, extracts high-signal architecture details
 (overarching mission, verified code references, commit SHAs, empirical findings,

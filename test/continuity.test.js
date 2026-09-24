@@ -42,6 +42,12 @@ const {
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
   retryEditTurn,
+  validateStage3Mode,
+  resolveBranchableTurn,
+  branchConversationTurn,
+  loadLineageState,
+  registerPendingBranch,
+  updateBranchLineage,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,
@@ -1586,4 +1592,91 @@ test('Stage-1 local dispatch-state and validation invariants', async () => {
   }
   assert.strictEqual(localDispatchState, 'accepted');
   assert.strictEqual(status, 'pending');
+});
+
+test('validateStage3Mode: enforces target conversation, incident identifier, and operation exclusivity', () => {
+  // Requires target conversation
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'BRANCH_TARGET_REQUIRED'
+  );
+
+  // Requires valid UUID
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: 'invalid-id', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'BRANCH_TARGET_REQUIRED'
+  );
+
+  const validUuid = '12345678-1234-4234-8234-123456789abc';
+
+  // Requires recovery incident ID
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid }),
+    (err) => err.code === 'RECOVERY_INCIDENT_REQUIRED'
+  );
+
+  // Rejects conflicting primary actions
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid, recoveryIncidentId: 'INC-1', message: 'Hello' }),
+    (err) => err.code === 'INVALID_STAGE3_MODE'
+  );
+
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid, recoveryIncidentId: 'INC-1', retryEdit: 'latest' }),
+    (err) => err.code === 'INVALID_STAGE3_MODE'
+  );
+
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid, recoveryIncidentId: 'INC-1', recoveryResend: true }),
+    (err) => err.code === 'INVALID_STAGE3_MODE'
+  );
+
+  assert.throws(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid, recoveryIncidentId: 'INC-1', stop: true }),
+    (err) => err.code === 'INVALID_STAGE3_MODE'
+  );
+
+  // Valid mode passes cleanly
+  assert.doesNotThrow(
+    () => validateStage3Mode({ branchTurn: 'latest', expectedSessionId: validUuid, recoveryIncidentId: 'INC-1' })
+  );
+});
+
+test('resolveBranchableTurn: extracts latest or prior assistant turn from canonical turns', async () => {
+  const mockPage = {
+    evaluate: async () => [
+      { index: 0, testid: 'turn-1', messageId: 'msg-u1', role: 'user', text: 'Prompt 1', roleTexts: ['Prompt 1'], turnText: 'Prompt 1' },
+      { index: 1, testid: 'turn-2', messageId: 'msg-a1', role: 'assistant', text: 'Response 1', roleTexts: ['Response 1'], turnText: 'Response 1' },
+      { index: 2, testid: 'turn-3', messageId: 'msg-u2', role: 'user', text: 'Prompt 2', roleTexts: ['Prompt 2'], turnText: 'Prompt 2' },
+      { index: 3, testid: 'turn-4', messageId: 'msg-a2', role: 'assistant', text: 'Response 2 (stopped)', roleTexts: ['Response 2 (stopped)'], turnText: 'Response 2 (stopped)' },
+    ]
+  };
+
+  // 'latest' resolves Turn 4 (Response 2)
+  const latest = await resolveBranchableTurn(mockPage, 'latest');
+  assert.strictEqual(latest.messageId, 'msg-a1' ? latest.messageId : '');
+  assert.strictEqual(latest.testid, 'turn-4');
+  assert.strictEqual(latest.role, 'assistant');
+
+  // 'prior-assistant' resolves Turn 2 (Response 1)
+  const prior = await resolveBranchableTurn(mockPage, 'prior-assistant');
+  assert.strictEqual(prior.testid, 'turn-2');
+  assert.strictEqual(prior.role, 'assistant');
+
+  // Explicit testid resolves Turn 2
+  const explicit = await resolveBranchableTurn(mockPage, 'turn-2');
+  assert.strictEqual(explicit.testid, 'turn-2');
+
+  // Missing turn throws BRANCH_SOURCE_UNVERIFIED
+  await assert.rejects(
+    () => resolveBranchableTurn(mockPage, 'non-existent-turn'),
+    (err) => err.code === 'BRANCH_SOURCE_UNVERIFIED'
+  );
+});
+
+test('branchConversationTurn: rejects invocation without expectedSessionId', async () => {
+  await assert.rejects(
+    () => branchConversationTurn({}, { branchTurn: 'latest', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'BRANCH_TARGET_REQUIRED'
+  );
 });

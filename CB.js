@@ -63,6 +63,8 @@ const CONVERSATION_INDEX_PATH = path.join(SCHEDULER_DIR, 'conversation-index.jso
 const CONVERSATION_EVENTS_PATH = path.join(SCHEDULER_DIR, 'conversation-index.jsonl');
 const ROUND_STATE_PATH = path.join(SCHEDULER_DIR, 'rounds.json');
 const ROUND_EVENTS_PATH = path.join(SCHEDULER_DIR, 'rounds.jsonl');
+const LINEAGE_STATE_PATH = path.join(SCHEDULER_DIR, 'lineage.json');
+const LINEAGE_EVENTS_PATH = path.join(SCHEDULER_DIR, 'lineage.jsonl');
 const SCHEDULER_LOCK_PATH = path.join(SCHEDULER_DIR, '.lock');
 const BRACKETED_PASTE_ON = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
@@ -366,6 +368,14 @@ function parseArgs(argv) {
         args.retryEdit = next();
       } else {
         args.retryEdit = 'latest';
+      }
+    }
+    else if (arg === '--branch-turn') {
+      const val = peek();
+      if (val && !val.startsWith('-')) {
+        args.branchTurn = next();
+      } else {
+        args.branchTurn = 'latest';
       }
     }
     else if (arg === '--edit-suffix') args.editSuffix = next();
@@ -1390,6 +1400,79 @@ function updateRound(roundId, patch, eventType = 'round_updated') {
       round,
     });
     return round;
+  });
+}
+
+function loadLineageState() {
+  if (!fs.existsSync(LINEAGE_STATE_PATH)) {
+    return { branches: [] };
+  }
+  try {
+    const raw = fs.readFileSync(LINEAGE_STATE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return { branches: Array.isArray(parsed.branches) ? parsed.branches : [] };
+  } catch {
+    return { branches: [] };
+  }
+}
+
+function saveLineageState(state) {
+  writeJsonAtomic(LINEAGE_STATE_PATH, state);
+}
+
+function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
+  const parentSessionId = extra.parentSessionId || sessionIdFromUrl(page.url());
+  const id = randomId('branch');
+  const now = nowIso();
+  const record = {
+    id,
+    operationKind: 'native_branch',
+    recoveryStage: 3,
+    recoveryIncidentId: args.recoveryIncidentId || '',
+    parentSessionId,
+    sourceTurnRef,
+    dispatchState: 'prepared',
+    status: 'pending',
+    sourceUrl: page.url(),
+    provisionalRoute: '',
+    candidateChildSessionId: '',
+    childSessionId: '',
+    parentAttestation: null,
+    lineageAttestation: null,
+    createdAt: now,
+    updatedAt: now,
+    pid: process.pid,
+    cdp: args.cdp,
+    lastError: '',
+  };
+
+  withSchedulerLock(() => {
+    const state = loadLineageState();
+    state.branches.push(record);
+    saveLineageState(state);
+    appendJsonl(LINEAGE_EVENTS_PATH, {
+      type: 'branch_pending',
+      at: now,
+      branch: record,
+    });
+  });
+  return record;
+}
+
+function updateBranchLineage(branchId, patch, eventType = 'branch_updated') {
+  if (!branchId) return null;
+  return withSchedulerLock(() => {
+    const state = loadLineageState();
+    const branch = state.branches.find((b) => b.id === branchId);
+    if (!branch) return null;
+    Object.assign(branch, patch, { updatedAt: nowIso() });
+    saveLineageState(state);
+    appendJsonl(LINEAGE_EVENTS_PATH, {
+      type: eventType,
+      at: branch.updatedAt,
+      branch,
+    });
+    return branch;
   });
 }
 
@@ -6490,6 +6573,308 @@ async function retryEditTurn(page, args) {
   return await withBrowserLaneLease(args, randomId('stage1-edit-op'), action);
 }
 
+function validateStage3Mode(args) {
+  if (!args.branchTurn) return;
+
+  if (!args.expectedSessionId) {
+    throw cbError('BRANCH_TARGET_REQUIRED', 'Stage 3 recovery branching requires an explicit stable conversation: --conversation <uuid>');
+  }
+  if (!STABLE_SESSION_ID_RE.test(args.expectedSessionId)) {
+    throw cbError('BRANCH_TARGET_REQUIRED', 'Stage 3 recovery branching target must be a valid stable UUID');
+  }
+  if (!args.recoveryIncidentId) {
+    throw cbError('RECOVERY_INCIDENT_REQUIRED', 'Stage 3 recovery branching requires an explicit incident identifier: --recovery-incident <id>');
+  }
+
+  const conflictingStage3Actions = [
+    args.message,
+    args.newConversation,
+    args.recoveryResend,
+    args.retryEdit,
+    args.schedule,
+    args.runQueue,
+    args.stop,
+    args.status,
+    args.watchState,
+    args.syncTranscript,
+    args.latestAssistant,
+    args.compactConversation,
+    args.handoffNewSession,
+    args.recoverInterrupted,
+    args.downloadArtifacts,
+  ];
+  if (conflictingStage3Actions.some(Boolean)) {
+    throw cbError('INVALID_STAGE3_MODE', '--branch-turn cannot be combined with another primary operation or send prompt');
+  }
+}
+
+async function resolveBranchableTurn(page, selection = 'latest') {
+  const canonicalTurns = await getConversationTurns(page).catch(() => []);
+  if (!canonicalTurns || !canonicalTurns.length) {
+    throw cbError('BRANCH_SOURCE_UNVERIFIED', 'Could not extract canonical conversation turns from page');
+  }
+
+  const assistantTurns = canonicalTurns.filter(t => t.role === 'assistant');
+  if (!assistantTurns.length) {
+    throw cbError('BRANCH_SOURCE_UNVERIFIED', 'No assistant turns found in conversation');
+  }
+
+  let targetTurn = null;
+  if (selection === 'latest') {
+    targetTurn = assistantTurns[assistantTurns.length - 1];
+  } else if (selection === 'prior-assistant') {
+    if (assistantTurns.length < 2) {
+      throw cbError('BRANCH_SOURCE_UNVERIFIED', 'Conversation has only one assistant turn; prior-assistant does not exist');
+    }
+    targetTurn = assistantTurns[assistantTurns.length - 2];
+  } else {
+    targetTurn = assistantTurns.find(t => (t.messageId && t.messageId === selection) || (t.testid && t.testid === selection));
+    if (!targetTurn) {
+      throw cbError('BRANCH_SOURCE_UNVERIFIED', `Target turn "${selection}" not found among assistant turns`);
+    }
+  }
+
+  return {
+    messageId: targetTurn.messageId || targetTurn.id || '',
+    id: targetTurn.messageId || targetTurn.id || '',
+    testid: targetTurn.testid || '',
+    role: 'assistant',
+    text: targetTurn.text,
+    textHash: messageHash(normalizeTurnText(targetTurn.text)),
+  };
+}
+
+async function openBranchMenu(page, sourceAssistant) {
+  let turnEl;
+  if (sourceAssistant.testid) {
+    turnEl = page.locator(`[data-testid="${sourceAssistant.testid}"]`).first();
+  } else if (sourceAssistant.messageId) {
+    turnEl = page.locator(`[data-message-id="${sourceAssistant.messageId}"]`).first();
+  }
+  if (!turnEl || !(await turnEl.count().catch(() => 0))) {
+    turnEl = page.locator('[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])').last();
+  }
+
+  await turnEl.scrollIntoViewIfNeeded().catch(() => {});
+  await turnEl.hover().catch(() => {});
+  await page.waitForTimeout(300);
+
+  const moreBtn = turnEl.locator('button[aria-label="More actions"], button:has-text("More actions")').first();
+  if (!(await moreBtn.count().catch(() => 0)) || !(await moreBtn.isVisible().catch(() => false))) {
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate More actions button on target assistant turn');
+  }
+
+  await moreBtn.click({ force: true });
+  await page.waitForTimeout(400);
+
+  const openBranchItem = page.locator('[role="menuitem"]:has-text("Open new branch")').first();
+  if (!(await openBranchItem.count().catch(() => 0)) || !(await openBranchItem.isVisible().catch(() => false))) {
+    await page.keyboard.press('Escape').catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Open new branch" menu item');
+  }
+
+  await openBranchItem.hover().catch(() => {});
+  await page.waitForTimeout(400);
+
+  const branchInNewChatItem = page.locator('[role="menuitem"]:has-text("Branch in new Chat"), [role="menuitem"]:has-text("Branch in new chat")').first();
+  if (!(await branchInNewChatItem.count().catch(() => 0)) || !(await branchInNewChatItem.isVisible().catch(() => false))) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Escape').catch(() => {});
+    throw cbError('BRANCH_ACTION_UNVERIFIED', 'Could not locate "Branch in new Chat" submenu item');
+  }
+
+  return { moreBtn, openBranchItem, branchInNewChatItem };
+}
+
+async function branchConversationTurn(page, args) {
+  await prepareConversationForRead(page, args);
+  const expectedParentSessionId = args.expectedSessionId;
+  if (!expectedParentSessionId) {
+    throw cbError('BRANCH_TARGET_REQUIRED', 'Stage 3 recovery branching requires an existing stable conversation');
+  }
+
+  const action = async () => {
+    if (sessionIdFromUrl(page.url()) !== expectedParentSessionId) {
+      await openConversationBySessionId(page, expectedParentSessionId);
+    }
+    await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
+
+    const provisionalBranchId = randomId('branch');
+    const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
+
+    let branchRecord = null;
+    let localDispatchState = 'unregistered';
+    let childLease = null;
+    try {
+      await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
+
+      const preState = await getTargetAppState(page);
+      const generation = await getCombinedGenerationState(page, preState);
+      if (generation.isGenerating) {
+        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active');
+      }
+
+      await syncTranscriptFromPage(page, args);
+
+      const sourceAssistant = await resolveBranchableTurn(page, args.branchTurn || 'latest');
+      branchRecord = registerPendingBranch(args, page, sourceAssistant, {
+        parentSessionId: expectedParentSessionId,
+      });
+      localDispatchState = 'prepared';
+
+      const controls = await openBranchMenu(page, sourceAssistant);
+      const { branchInNewChatItem } = controls;
+
+      await assertThreadIdentity(page, expectedParentSessionId, 'immediately before branch click');
+
+      const genCheck = await getCombinedGenerationState(page);
+      if (genCheck.isGenerating) {
+        throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
+      }
+
+      localDispatchState = 'dispatching';
+      branchRecord = updateBranchLineage(branchRecord.id, {
+        dispatchState: 'dispatching',
+        dispatchStartedAt: nowIso(),
+      }, 'branch_dispatching') || branchRecord;
+
+      const pagesBefore = new Set(page.context().pages());
+      try {
+        await branchInNewChatItem.click();
+      } catch (clickErr) {
+        localDispatchState = 'uncertain';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'pending',
+          dispatchState: 'dispatch_uncertain',
+          lastError: clickErr.message || String(clickErr),
+        }, 'branch_dispatch_uncertain') || branchRecord;
+        throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
+      }
+
+      let destinationPage = null;
+      const startWait = Date.now();
+      while (Date.now() - startWait < 15000) {
+        const currentPages = page.context().pages();
+        const newlyOpened = currentPages.find((p) => !pagesBefore.has(p));
+        if (newlyOpened) {
+          destinationPage = newlyOpened;
+          break;
+        }
+        if (page.url() !== branchRecord.sourceUrl) {
+          destinationPage = page;
+          break;
+        }
+        await page.waitForTimeout(300);
+      }
+
+      if (!destinationPage) {
+        localDispatchState = 'uncertain';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'pending',
+          dispatchState: 'destination_unverified',
+          lastError: 'Timed out waiting for destination page to navigate or open',
+        }, 'branch_destination_unverified') || branchRecord;
+        throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Timed out waiting for branch destination page to navigate or open');
+      }
+
+      await destinationPage.waitForLoadState('domcontentloaded').catch(() => {});
+
+      const currentUrl = destinationPage.url();
+      if (isEphemeralRouteId(routeSessionIdFromUrl(currentUrl))) {
+        localDispatchState = 'provisional';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          dispatchState: 'provisional',
+          provisionalRoute: currentUrl,
+        }, 'branch_provisional') || branchRecord;
+      }
+
+      let childSessionId;
+      try {
+        childSessionId = await waitForSessionIdInUrl(destinationPage, 30000);
+      } catch (idErr) {
+        localDispatchState = 'uncertain';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'pending',
+          dispatchState: 'destination_unverified',
+          lastError: idErr.message || String(idErr),
+        }, 'branch_destination_unverified') || branchRecord;
+        throw idErr;
+      }
+
+      if (childSessionId === expectedParentSessionId) {
+        throw cbError('BRANCH_IDENTITY_INVALID', 'Child session ID matches parent session ID');
+      }
+
+      childLease = await acquireConversationLease(childSessionId, branchRecord.id);
+
+      await settlePage(destinationPage, 5000).catch(() => {});
+      const branchInfo = await getBranchInfo(destinationPage).catch(() => null);
+
+      const domParentId = branchInfo?.dividerData?.parentSessionId || '';
+      if (!domParentId || domParentId !== expectedParentSessionId) {
+        localDispatchState = 'lineage_unverified';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'failed',
+          dispatchState: 'lineage_unverified',
+          candidateChildSessionId: childSessionId,
+          lastError: `DOM divider parent ID "${domParentId}" does not match expected parent "${expectedParentSessionId}"`,
+        }, 'branch_lineage_unverified') || branchRecord;
+        throw cbError('BRANCH_LINEAGE_UNVERIFIED', `DOM divider parent ID "${domParentId}" does not match expected parent "${expectedParentSessionId}"`);
+      }
+
+      localDispatchState = 'lineage_attested';
+      branchRecord = updateBranchLineage(branchRecord.id, {
+        dispatchState: 'lineage_attested',
+        childSessionId,
+        parentAttestation: {
+          parentSessionId: expectedParentSessionId,
+          verifiedVia: 'dom_divider',
+        },
+        lineageAttestation: branchInfo.dividerData,
+      }, 'branch_lineage_attested') || branchRecord;
+
+      const childTranscriptPath = transcriptPathForSession(childSessionId);
+      await syncTranscriptFromPage(destinationPage, { transcript: childTranscriptPath }).catch(() => {});
+
+      localDispatchState = 'bound';
+      branchRecord = updateBranchLineage(branchRecord.id, {
+        status: 'done',
+        dispatchState: 'bound',
+        childSessionId,
+        childUrl: targetConversationUrl(childSessionId),
+        lastError: '',
+      }, 'branch_bound') || branchRecord;
+
+      info(`[stage3] Successfully branched ${expectedParentSessionId} -> ${childSessionId} at ${sourceAssistant.testid || sourceAssistant.messageId}`);
+      return {
+        childSessionId,
+        childUrl: targetConversationUrl(childSessionId),
+        branchRecord,
+      };
+    } catch (err) {
+      if (branchRecord && localDispatchState === 'prepared') {
+        localDispatchState = 'aborted_precommit';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'failed',
+          dispatchState: 'aborted_precommit',
+          lastError: err.message || String(err),
+        }, 'branch_aborted') || branchRecord;
+      }
+      throw err;
+    } finally {
+      if (childLease) {
+        await releaseConversationLease(childLease).catch(() => {});
+      }
+      if (parentLease) {
+        await releaseConversationLease(parentLease).catch(() => {});
+      }
+    }
+  };
+
+  return await withBrowserLaneLease(args, randomId('stage3-branch-op'), action);
+}
+
 function validateRecoveryMode(args) {
   if (!args.recoveryResend) return;
 
@@ -8427,6 +8812,7 @@ async function main() {
   }
 
   validateStage1Mode(args);
+  validateStage3Mode(args);
   validateRecoveryMode(args);
 
   if (args.queueStatus) {
@@ -8548,6 +8934,12 @@ async function main() {
 
     if (args.retryEdit) {
       await retryEditTurn(page, args);
+      return;
+    }
+
+    if (args.branchTurn) {
+      const result = await branchConversationTurn(page, args);
+      console.log(`[stage3] Branched to ${result.childSessionId} (${result.childUrl})`);
       return;
     }
 
@@ -8704,6 +9096,13 @@ module.exports = {
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
   retryEditTurn,
+  validateStage3Mode,
+  resolveBranchableTurn,
+  openBranchMenu,
+  branchConversationTurn,
+  loadLineageState,
+  registerPendingBranch,
+  updateBranchLineage,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,
