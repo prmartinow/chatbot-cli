@@ -57,6 +57,7 @@ const {
   captureUserTurnVersionBaseline,
   attestEditedUserTurnVersion,
   reconcileStage1EditTurn,
+  stage1CommitIsAttested,
   loadRoundState,
   saveRoundState,
   validateStage3Mode,
@@ -3255,12 +3256,13 @@ test('autoRecoverConversationTurn: stage3_running restart reconciles existing br
   );
   updateRecoveryIncident(incidentId, { state: 'stage3_running' });
 
-  // Seed existing bound Stage 3 branch
+  // Seed existing bound Stage 3 branch with real production schema
   const lineageState = loadLineageState();
   lineageState.branches.push({
     id: 'branch-s3-test',
     recoveryIncidentId: incidentId,
-    status: 'bound',
+    status: 'done',
+    dispatchState: 'bound',
     parentSessionId: parentId,
     childSessionId: childId,
     childUrl: `https://chatgpt.com/c/${childId}`,
@@ -3295,4 +3297,55 @@ test('resolveEditableUserTurn: rejects mutation if selected turn is not the late
     async () => resolveEditableUserTurn(fakePage, 'u1', '.'),
     (err) => err.code === 'CONCURRENT_CONVERSATION_MUTATION'
   );
+});
+
+
+test('resolveEditableUserTurn: rejects mutation if turn revision hash drifts with REVISION_HASH_DRIFT', async () => {
+  const fakePage = {
+    $$eval: async () => [
+      { role: 'user', id: 'u1', testid: 'turn-1', text: 'Modified prompt text' },
+    ],
+  };
+
+  // Expected frozen hash does not match current text
+  await assert.rejects(
+    async () => resolveEditableUserTurn(fakePage, 'u1', '.', 'frozen-original-hash-12345'),
+    (err) => err.code === 'REVISION_HASH_DRIFT'
+  );
+});
+
+test('stage1CommitIsAttested: validates complete dual-vector attestation and rejects incomplete records', () => {
+  const validRound = {
+    dispatchState: 'accepted',
+    editedMessageHash: 'hash-edited',
+    versionBaseline: { count: 2 },
+    versionAttestation: {
+      baselineCount: 2,
+      acceptedCount: 3,
+      contentHash: 'hash-edited',
+      nextDisabled: true,
+    },
+  };
+  assert.equal(stage1CommitIsAttested(validRound), true);
+
+  // Missing versionAttestation
+  assert.equal(stage1CommitIsAttested({ ...validRound, versionAttestation: null }), false);
+
+  // Accepted count not baseline + 1
+  assert.equal(stage1CommitIsAttested({
+    ...validRound,
+    versionAttestation: { ...validRound.versionAttestation, acceptedCount: 2 },
+  }), false);
+
+  // Content hash mismatch
+  assert.equal(stage1CommitIsAttested({
+    ...validRound,
+    versionAttestation: { ...validRound.versionAttestation, contentHash: 'wrong-hash' },
+  }), false);
+
+  // Next not disabled (not latest version)
+  assert.equal(stage1CommitIsAttested({
+    ...validRound,
+    versionAttestation: { ...validRound.versionAttestation, nextDisabled: false },
+  }), false);
 });
