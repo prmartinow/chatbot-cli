@@ -211,12 +211,12 @@ Options:
                   Dismiss one known safe blocker, then exit. Does not send a prompt.
   --models        Print visible model picker options and exit.
   --stop          Click the visible stop/interrupt control, if target app is generating.
-  --compact-conversation
-                  Export structured compaction summary for current/specified session.
-  --compact-handoff
-                  Compact active session and start Turn 1 in a new continuation session.
+  --compact-conversation, --export-context-summary
+                  Export diagnostic context summary for current/specified session.
+  --recovery-resend
+                  Reload exact conversation URL and resend prompt in the same session (Stage 2).
   --recover-interrupted
-                  Stop stalled generation and reload conversation URL for connection errors.
+                  Reload exact conversation URL without stopping active generation to restore composer.
   --download-artifacts
                   Save artifacts from the latest assistant turn, or after the reply.
   --show-artifacts
@@ -247,10 +247,10 @@ Interactive commands:
   /artifacts      Print links/images/download controls from the latest assistant turn.
   /download       Download visible artifacts from the latest assistant turn.
   /stop           Stop the current generation if a stop/interrupt control is visible.
-  /compact        Export compaction summary for the active thread.
-  /handoff        Compact active thread and seed Turn 1 in a new continuation thread.
+  /compact        Export diagnostic context summary for the active thread.
+  /handoff        (Legacy/Quarantined) Compact active thread and seed Turn 1.
   /recover-interrupted
-                  Stop stalled answer and reload conversation URL to restore composer.
+                  Reload exact conversation URL without stopping active generation to restore composer.
   /stream on|off  Toggle live response streaming.
 `);
 }
@@ -296,6 +296,7 @@ function parseArgs(argv) {
     compactConversation: false,
     handoffNewSession: false,
     recoverInterrupted: false,
+    recoveryResend: false,
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
@@ -351,8 +352,9 @@ function parseArgs(argv) {
     else if (arg === '--alias') args.alias = next();
     else if (arg === '--models') args.models = true;
     else if (arg === '--stop') args.stop = true;
-    else if (arg === '--compact-conversation' || arg === '--compact') args.compactConversation = true;
+    else if (arg === '--compact-conversation' || arg === '--compact' || arg === '--export-context-summary') args.compactConversation = true;
     else if (arg === '--handoff-new-session' || arg === '--compact-handoff' || arg === '--handoff') args.handoffNewSession = true;
+    else if (arg === '--recovery-resend') args.recoveryResend = true;
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
     else if (arg === '--show-artifacts') args.showArtifacts = true;
@@ -3327,7 +3329,7 @@ function summarizeState(state, modelConfig = null) {
     lines.push(`Branch status: Forked branch at turn ${state.branchInfo.forkTurn}${parent}${vectors}`);
   }
   if (state.maxLengthReached) {
-    lines.push(`Thread limit: Maximum conversation length reached. Run 'CB --compact-handoff' to seed continuation thread.`);
+    lines.push(`Thread limit: Maximum conversation length advisory banner visible. Follow 3-stage recovery (edit/regenerate -> resend -> native branch).`);
   }
   if (state.connectionInterrupted) {
     lines.push(`Connection status: Interrupted / waiting for answer. Run 'CB --recover-interrupted' to reload.`);
@@ -5875,6 +5877,27 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
   return { ...last, hydrated: false, timedOut: true };
 }
 
+async function reloadExactConversation(page, expectedSessionId, phase = 'exact-reload') {
+  if (!STABLE_SESSION_ID_RE.test(expectedSessionId || '')) {
+    throw cbError('INVALID_TARGET_SESSION', `reloadExactConversation: invalid target session id: ${expectedSessionId}`, { expectedSessionId, phase });
+  }
+  await assertThreadIdentity(page, expectedSessionId, `${phase}: before reload`);
+  info(`[recovery] Reloading exact conversation ${expectedSessionId} (${phase})...`);
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+  await settlePage(page);
+  const hydration = await waitForConversationHydration(page, expectedSessionId);
+  if (!hydration.hydrated) {
+    throw cbError(
+      'CONVERSATION_NOT_HYDRATED',
+      `Conversation ${expectedSessionId} did not hydrate after reload (${phase})`,
+      { sessionId: expectedSessionId, hydration, url: page.url(), phase }
+    );
+  }
+  await assertThreadIdentity(page, expectedSessionId, `${phase}: after reload`);
+  info(`[recovery] Exact conversation ${expectedSessionId} reloaded and hydrated.`);
+  return hydration;
+}
+
 async function openConversationBySessionId(page, sessionId) {
   if (!STABLE_SESSION_ID_RE.test(sessionId || '')) {
     throw cbError('INVALID_TARGET_SESSION', `Invalid target app session id: ${sessionId}`, { sessionId });
@@ -5918,7 +5941,7 @@ async function prepareConversationForPrompt(page, args) {
     args.expectedSessionId = currentSessionId;
     const state = await getTargetAppState(page).catch(() => null);
     if (state?.maxLengthReached) {
-      info('[state] Note: Maximum conversation length advisory banner visible on thread. If prompt is rejected, consider branching the last prompt or running CB --compact-handoff.');
+      info('[state] Note: Maximum conversation length advisory banner visible on thread. If prompt is rejected, follow 3-stage recovery (edit/regenerate -> resend -> native branch).');
     }
     return;
   }
@@ -6754,7 +6777,9 @@ async function ask(page, message, args) {
       await openNewConversation(page);
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
-      if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+      if (args.recoveryResend) {
+        await reloadExactConversation(page, expectedSessionId, 'recovery-resend');
+      } else if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
         await openConversationBySessionId(page, expectedSessionId);
       }
       await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
@@ -7430,6 +7455,12 @@ async function compactTargetConversation(page, args, operationId = 'compact-op')
 }
 
 async function executeCompactionHandoff(page, args) {
+  if (process.env.CB_ENABLE_LEGACY_COMPACTION !== '1') {
+    throw cbError(
+      'LEGACY_COMPACTION_HANDOFF_DISABLED',
+      'Compaction handoff is excluded from the Hermes recovery protocol. Use the 3-stage recovery hierarchy (Stage 1 edit/regenerate -> Stage 2 same-thread resend -> Stage 3 native branch). Set CB_ENABLE_LEGACY_COMPACTION=1 to override.'
+    );
+  }
   info('[handoff] Extracting and compacting context from current thread...');
   const result = await compactTargetConversation(page, args, 'handoff-compact');
   info(`[handoff] Compaction artifacts saved to:
@@ -7877,7 +7908,19 @@ async function main() {
     }
 
     if (args.watchState) {
-      await watchTargetAppState(page, args);
+      if (args.expectedSessionId) {
+        const action = async () => {
+          if (sessionIdFromUrl(page.url()) !== args.expectedSessionId) {
+            await openConversationBySessionId(page, args.expectedSessionId);
+          }
+          await assertThreadIdentity(page, args.expectedSessionId, 'before watch-state');
+          refreshSessionTranscript(page, args);
+          await watchTargetAppState(page, args);
+        };
+        await withBrowserLaneLease(args, randomId('watch-state-op'), action);
+      } else {
+        await watchTargetAppState(page, args);
+      }
       return;
     }
 
@@ -7979,6 +8022,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+  reloadExactConversation,
+  executeCompactionHandoff,
+  parseArgs,
   canonicalRawPrompt,
   findTargetAppPage,
   compactActiveConversation,

@@ -32,6 +32,9 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  reloadExactConversation,
+  executeCompactionHandoff,
+  parseArgs,
   prepareConversationForRead,
   bootstrapLeaseKey,
   bootstrapLeasePath,
@@ -770,4 +773,62 @@ test('Handoff State Reset: Post-ask handoff resets newConversation=false and der
   assert.equal(mockArgs.conversation, '');
   assert.equal(mockArgs.expectedSessionId, continuationId);
   assert.equal(newUrl, `https://chatgpt.com/c/${continuationId}`);
+});
+
+test('reloadExactConversation: rejects missing or invalid expectedSessionId fail-closed', async () => {
+  const mockPage = { url: () => 'https://chatgpt.com/' };
+  await assert.rejects(
+    async () => reloadExactConversation(mockPage, ''),
+    (err) => err.code === 'INVALID_TARGET_SESSION'
+  );
+  await assert.rejects(
+    async () => reloadExactConversation(mockPage, 'WEB:provisional-id'),
+    (err) => err.code === 'INVALID_TARGET_SESSION'
+  );
+});
+
+test('Compaction Quarantine: executeCompactionHandoff rejects with LEGACY_COMPACTION_HANDOFF_DISABLED by default', async () => {
+  const origEnv = process.env.CB_ENABLE_LEGACY_COMPACTION;
+  delete process.env.CB_ENABLE_LEGACY_COMPACTION;
+  try {
+    const mockPage = { url: () => 'https://chatgpt.com/' };
+    await assert.rejects(
+      async () => executeCompactionHandoff(mockPage, {}),
+      (err) => err.code === 'LEGACY_COMPACTION_HANDOFF_DISABLED'
+    );
+  } finally {
+    if (origEnv !== undefined) process.env.CB_ENABLE_LEGACY_COMPACTION = origEnv;
+  }
+});
+
+test('Recovery Resend Flag & Diagnostics: parseArgs correctly parses --recovery-resend and --export-context-summary', () => {
+  const parsed1 = parseArgs(['node', 'CB.js', '--recovery-resend', '--conversation', '11111111-1111-4111-8111-111111111111']);
+  assert.equal(parsed1.recoveryResend, true);
+  assert.equal(parsed1.conversation, '11111111-1111-4111-8111-111111111111');
+
+  const parsed2 = parseArgs(['node', 'CB.js', '--export-context-summary']);
+  assert.equal(parsed2.compactConversation, true);
+});
+
+test('reloadExactConversation: enforces thread identity before and after reload', async () => {
+  const targetId = '55555555-5555-4555-8555-555555555555';
+  let reloaded = false;
+  const mockPage = {
+    url: () => `https://chatgpt.com/c/${targetId}`,
+    reload: async () => { reloaded = true; },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: () => ({ last: () => ({ waitFor: async () => {} }) }),
+    evaluate: async () => ({
+      hydrated: true,
+      sessionId: targetId,
+      turnCount: 2,
+      roleNodeCount: 2,
+      composerVisible: true,
+    }),
+  };
+  const res = await reloadExactConversation(mockPage, targetId, 'test-phase');
+  assert.equal(reloaded, true);
+  assert.equal(res.hydrated, true);
 });
