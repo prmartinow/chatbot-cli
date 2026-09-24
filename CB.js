@@ -6292,13 +6292,23 @@ function inlineEditorContainer(editor) {
 
 async function readInlineEditorSource(editor) {
   let text = '';
+  let method = 'none';
   if (typeof editor.innerText === 'function') {
     text = await editor.innerText().catch(() => '');
+    if (text) {
+      method = 'prosemirror_innerText';
+    }
   }
   if (!text && typeof editor.textContent === 'function') {
     text = await editor.textContent().catch(() => '');
+    if (text) {
+      method = 'prosemirror_textContent_fallback';
+    }
   }
-  return String(text).replace(/\r\n?/g, '\n');
+  return {
+    text: String(text).replace(/\r\n?/g, '\n'),
+    method: method === 'none' ? 'prosemirror_innerText' : method,
+  };
 }
 
 async function openUserTurnEditor(page, sourceUserTurn) {
@@ -6329,13 +6339,21 @@ async function openUserTurnEditor(page, sourceUserTurn) {
 
   let editor = null;
   if (sourceUserTurn.id) {
-    editor = page.locator(`div[id="message-edit-${sourceUserTurn.id}"][contenteditable="true"]`).first();
+    const exactLocator = turnRoot.locator(`div[id="message-edit-${sourceUserTurn.id}"][contenteditable="true"]`);
+    const count = await exactLocator.count().catch(() => 0);
+    if (count !== 1) {
+      throw cbError('EDIT_EDITOR_NOT_FOUND', `Expected exactly 1 matching message-edit editor for turn ${sourceUserTurn.id}, found ${count}`);
+    }
+    editor = exactLocator.first();
+  } else {
+    const genericLocator = turnRoot.locator('div[contenteditable="true"].ProseMirror');
+    if (!(await genericLocator.count().catch(() => 0))) {
+      throw cbError('EDIT_EDITOR_NOT_FOUND', `Could not find inline editor for user turn ${sourceUserTurn.testid}`);
+    }
+    editor = genericLocator.first();
   }
-  if (!editor || !(await editor.count().catch(() => 0))) {
-    editor = turnRoot.locator('div[contenteditable="true"].ProseMirror').first();
-  }
-  if (!editor || !(await editor.count().catch(() => 0)) || !(await editor.isVisible().catch(() => false))) {
-    throw cbError('EDIT_EDITOR_NOT_FOUND', `Could not find visible inline editor for user turn ${sourceUserTurn.id || sourceUserTurn.testid}`);
+  if (!(await editor.isVisible().catch(() => false))) {
+    throw cbError('EDIT_EDITOR_NOT_FOUND', `Inline editor for user turn ${sourceUserTurn.id || sourceUserTurn.testid} is not visible`);
   }
 
   return { turnRoot, editor };
@@ -6345,7 +6363,8 @@ async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalTex
   const container = inlineEditorContainer(editor);
   const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
 
-  const initialRaw = await readInlineEditorSource(editor);
+  const initialSource = await readInlineEditorSource(editor);
+  const initialRaw = initialSource.text;
   if (!initialRaw.trim()) {
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
@@ -6375,42 +6394,59 @@ async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalTex
     }
   }
 
-  let populatedRaw = await readInlineEditorSource(editor);
+  let populatedSource = await readInlineEditorSource(editor);
   let attempts = 0;
-  while (populatedRaw !== expectedEditorText && attempts < 10) {
+  while (populatedSource.text !== expectedEditorText && attempts < 10) {
     if (typeof page?.waitForTimeout === 'function') {
       await page.waitForTimeout(100);
     }
-    populatedRaw = await readInlineEditorSource(editor);
+    populatedSource = await readInlineEditorSource(editor);
     attempts++;
   }
 
-  if (populatedRaw !== expectedEditorText) {
+  if (populatedSource.text !== expectedEditorText) {
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
     throw cbError('EDIT_EDITOR_POPULATION_FAILED', 'Inline editor content verification failed after text insertion');
   }
 
+  let actualDomId = '';
+  if (typeof editor.getAttribute === 'function') {
+    actualDomId = await editor.getAttribute('id').catch(() => '');
+  }
+  if (!actualDomId && sourceUserTurn?.id) {
+    actualDomId = `message-edit-${sourceUserTurn.id}`;
+  }
+
   return {
-    sourceMethod: 'prosemirror_innerText',
-    editorId: sourceUserTurn?.id ? `message-edit-${sourceUserTurn.id}` : 'prosemirror',
+    sourceMethod: initialSource.method,
+    editorId: actualDomId || 'prosemirror',
     sourceHash: crypto.createHash('sha256').update(initialRaw).digest('hex'),
     expectedHash: crypto.createHash('sha256').update(expectedEditorText).digest('hex'),
     suffix: editSuffix,
   };
 }
 
-async function submitEditedUserTurn(page, editor, expectedSessionId) {
+async function submitEditedUserTurn(page, editor, expectedSessionId, editorAttestation = null) {
   const container = inlineEditorContainer(editor);
-  const sendBtn = container.locator('button:has-text("Send"), button[aria-label="Send"]').first();
+  const sendBtns = container.locator('button:has-text("Send"), button[aria-label="Send"]');
   const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
 
-  if (!(await sendBtn.count().catch(() => 0)) || !(await sendBtn.isVisible().catch(() => false))) {
+  const count = await sendBtns.count().catch(() => 0);
+  if (count !== 1) {
     if (await cancelBtn.isVisible().catch(() => false)) {
       await cancelBtn.click().catch(() => {});
     }
-    throw cbError('EDIT_SUBMIT_CONTROL_UNVERIFIED', 'Could not locate scoped Send button for inline editor');
+    throw cbError('EDIT_SUBMIT_CONTROL_UNVERIFIED', `Expected exactly 1 scoped Send button for inline editor, found ${count}`);
+  }
+
+  const sendBtn = sendBtns.first();
+  if (!(await sendBtn.isVisible().catch(() => false)) || !(await sendBtn.isEnabled().catch(() => false))) {
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw cbError('EDIT_SUBMIT_CONTROL_UNVERIFIED', 'Scoped Send button is not visible and enabled');
   }
 
   await assertThreadIdentity(page, expectedSessionId, 'immediately before edit submission');
@@ -6428,6 +6464,17 @@ async function submitEditedUserTurn(page, editor, expectedSessionId) {
       await cancelBtn.click().catch(() => {});
     }
     throw cbError('CONVERSATION_BUSY', 'Generation became active before edit could be submitted');
+  }
+
+  if (editorAttestation && editorAttestation.expectedHash) {
+    const preSubmitSource = await readInlineEditorSource(editor);
+    const preSubmitHash = crypto.createHash('sha256').update(preSubmitSource.text).digest('hex');
+    if (preSubmitHash !== editorAttestation.expectedHash) {
+      if (await cancelBtn.isVisible().catch(() => false)) {
+        await cancelBtn.click().catch(() => {});
+      }
+      throw cbError('EDIT_EDITOR_CHANGED_BEFORE_SUBMIT', 'Editor source content mutated between population and submission boundary');
+    }
   }
 
   return sendBtn;
@@ -7107,7 +7154,7 @@ async function retryEditTurn(page, args) {
       const { editor } = await openUserTurnEditor(page, sourceUser);
       const editorAttestation = await populateAndVerifyEditor(page, editor, sourceUser, originalText, args.editSuffix || '.', editedText);
 
-      const sendBtn = await submitEditedUserTurn(page, editor, expectedSessionId);
+      const sendBtn = await submitEditedUserTurn(page, editor, expectedSessionId, editorAttestation);
 
       localDispatchState = 'dispatching';
       round = updateRound(round.id, {
@@ -7423,7 +7470,8 @@ function releaseRecoveryIncidentLease(leaseHandle) {
 
 async function captureAndFreezeSourcePrompt(page, sourceUserTurn, incidentId) {
   const { editor } = await openUserTurnEditor(page, sourceUserTurn);
-  const rawText = await readInlineEditorSource(editor);
+  const sourceRes = await readInlineEditorSource(editor);
+  const rawText = sourceRes.text;
   const container = inlineEditorContainer(editor);
   const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
   if (await cancelBtn.isVisible().catch(() => false)) {

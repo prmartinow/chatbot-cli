@@ -3825,3 +3825,60 @@ test('reconcileStage1EditTurn: proves numeric K+1 under Current version via pred
   assert.equal(res.round.versionAttestation.commitBarrier?.method, 'exact_thread_reload');
   assert.equal(stage1CommitIsAttested(res.round), true);
 });
+
+test('submitEditedUserTurn: rejects disabled Send button', async () => {
+  let cancelCalled = false;
+  const mockCancel = { isVisible: async () => true, click: async () => { cancelCalled = true; } };
+  const mockSend = { isVisible: async () => true, isEnabled: async () => false };
+  const mockContainer = {
+    locator: (sel) => {
+      if (sel.includes('Cancel')) return { first: () => mockCancel };
+      return {
+        count: async () => 1,
+        first: () => mockSend,
+      };
+    },
+  };
+  const mockEditor = {
+    locator: () => mockContainer,
+  };
+
+  await assert.rejects(
+    async () => submitEditedUserTurn({ url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c' }, mockEditor, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c'),
+    (err) => err.code === 'EDIT_SUBMIT_CONTROL_UNVERIFIED'
+  );
+  assert.equal(cancelCalled, true);
+});
+
+test('submitEditedUserTurn: rejects mutated editor content before submit', async () => {
+  let cancelCalled = false;
+  const mockCancel = { isVisible: async () => true, click: async () => { cancelCalled = true; } };
+  const mockSend = { isVisible: async () => true, isEnabled: async () => true };
+  const mockContainer = {
+    locator: (sel) => {
+      if (sel.includes('Cancel')) return { first: () => mockCancel };
+      return {
+        count: async () => 1,
+        first: () => mockSend,
+      };
+    },
+  };
+  const mockEditor = {
+    innerText: async () => 'Unexpected mutated content',
+    locator: () => mockContainer,
+  };
+
+  const attestation = {
+    expectedHash: 'correct_expected_hash',
+  };
+
+  await assert.rejects(
+    async () => submitEditedUserTurn({
+      url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+      locator: () => ({ first: () => ({ isVisible: async () => false }) }),
+      evaluate: async () => ({ isGenerating: false }),
+    }, mockEditor, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', attestation),
+    (err) => err.code === 'EDIT_EDITOR_CHANGED_BEFORE_SUBMIT'
+  );
+  assert.equal(cancelCalled, true);
+});
