@@ -1073,9 +1073,10 @@ function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
 }
 
 async function getPageTargetId(page) {
-  if (typeof page?.context?.newCDPSession === 'function') {
+  const ctx = typeof page?.context === 'function' ? page.context() : page?.context;
+  if (ctx && typeof ctx.newCDPSession === 'function') {
     try {
-      const session = await page.context().newCDPSession(page);
+      const session = await ctx.newCDPSession(page);
       try {
         const { targetInfo } = await session.send('Target.getTargetInfo');
         if (targetInfo?.targetId) return targetInfo.targetId;
@@ -1085,6 +1086,7 @@ async function getPageTargetId(page) {
     } catch {}
   }
   if (typeof page?._targetId === 'string') return page._targetId;
+  if (typeof page?._guid === 'string') return page._guid;
   if (page && (typeof page.context !== 'function' || !page.context)) {
     return page._mockTargetId || 'test-mock-target';
   }
