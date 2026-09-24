@@ -6711,15 +6711,24 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     };
   }
 
+  if (typeof variantsBtn.scrollIntoViewIfNeeded === 'function') { await variantsBtn.scrollIntoViewIfNeeded().catch(() => {}); }
+  await page.waitForTimeout(200);
   try {
     await variantsBtn.click({ timeout: 2000 });
   } catch {
     await variantsBtn.click({ force: true });
   }
-  await page.waitForTimeout(400);
+
+  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  if (typeof closeBtn.waitFor === 'function') {
+    await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
 
   const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
-  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  if (typeof viewerHeader.waitFor === 'function') {
+    await viewerHeader.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+
   if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
     throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header');
   }
