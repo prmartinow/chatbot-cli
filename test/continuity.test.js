@@ -32,6 +32,8 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  validateRecoveryMode,
+  prepareRecoveryResendTarget,
   registerPendingRound,
   reloadExactConversation,
   watchTargetAppState,
@@ -1003,5 +1005,81 @@ test('Stage-2 Cross-Thread Navigation: ask navigates to target conversation befo
 
   assert.equal(actions[0], `nav-needed:https://chatgpt.com/c/${initialId}->${targetId}`);
   assert.equal(actions.includes('reload'), true);
+  assert.equal(mockPage.url(), `https://chatgpt.com/c/${targetId}`);
+});
+
+test('validateRecoveryMode: enforces mandatory incident id, non-empty message, and mode exclusions', () => {
+  // Requires recovery-incident
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: 'hello', recoveryIncidentId: '' }),
+    (err) => err.code === 'RECOVERY_INCIDENT_REQUIRED'
+  );
+
+  // Requires message
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: '', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'RECOVERY_MESSAGE_REQUIRED'
+  );
+
+  // Rejects --new-conversation
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, newConversation: true, message: 'hi', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Rejects scheduling
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, schedule: true, message: 'hi', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Rejects queue runner
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, runQueue: true, message: 'hi', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Injects discriminator prefix automatically
+  const args = { recoveryResend: true, message: 'Original prompt text', recoveryIncidentId: 'CB-INC-42' };
+  validateRecoveryMode(args);
+  assert.equal(args.message, '[Recovery Stage 2: CB-INC-42] Original prompt text');
+
+  // Does not duplicate prefix if already present
+  validateRecoveryMode(args);
+  assert.equal(args.message, '[Recovery Stage 2: CB-INC-42] Original prompt text');
+});
+
+test('prepareRecoveryResendTarget: navigates to target conversation before invoking reloadExactConversation', async () => {
+  const targetId = '55555555-5555-4555-8555-555555555555';
+  const initialId = '66666666-6666-4666-8666-666666666666';
+  let currentUrl = `https://chatgpt.com/c/${initialId}`;
+  const actionLog = [];
+
+  const mockPage = {
+    url: () => currentUrl,
+    goto: async (url) => {
+      actionLog.push(`goto:${url}`);
+      currentUrl = url;
+    },
+    reload: async () => {
+      actionLog.push('reload');
+    },
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    locator: () => ({ last: () => ({ waitFor: async () => {} }) }),
+    evaluate: async () => ({
+      hydrated: true,
+      sessionId: targetId,
+      turnCount: 3,
+      roleNodeCount: 3,
+      composerVisible: true,
+    }),
+  };
+
+  await prepareRecoveryResendTarget(mockPage, {}, targetId);
+
+  assert.equal(actionLog[0], `goto:https://chatgpt.com/c/${targetId}`);
+  assert.equal(actionLog[1], 'reload');
   assert.equal(mockPage.url(), `https://chatgpt.com/c/${targetId}`);
 });

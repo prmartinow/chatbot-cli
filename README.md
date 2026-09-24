@@ -115,9 +115,13 @@ performing destructive reloads or clicking Stop.
 a mandatory exact-thread clean reload (`reloadExactConversation`) and asserts thread
 identity before submitting the prompt in the same conversation thread, guaranteeing
 a fresh generation attempt without thread drift. Stage 2 is a one-shot existing-thread
-operation requiring `--message`. When repeating an earlier request, prefix the prompt
-with a unique recovery discriminator (e.g. `[Recovery Stage 2: <incident-id>] <original prompt>`)
-to ensure WAL transcript reconciliation remains unambiguous if the process is interrupted.
+operation requiring `--message` and a mandatory `--recovery-incident <id>`.
+
+To prevent ambiguous WAL transcript reconciliation if a recovery turn is interrupted,
+CB CLI automatically injects a unique recovery discriminator prefix into the user prompt:
+`[Recovery Stage 2: <incident-id>] <original prompt>`. Stage 2 is gated at the CLI
+entry point and strictly prohibits combination with `--new-conversation`, scheduling,
+or queue operations.
 
 `--export-context-summary` (alias: `--compact-conversation`) parses the active or
 specified conversation transcript, extracts high-signal architecture details

@@ -5923,6 +5923,38 @@ async function openConversationBySessionId(page, sessionId) {
   return hydration;
 }
 
+function validateRecoveryMode(args) {
+  if (!args.recoveryResend) return;
+
+  if (args.newConversation) {
+    throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with --new-conversation');
+  }
+  if (args.schedule || args.runQueue || args.queueWatch || args.queueStatus || args.recoverQueue) {
+    throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with scheduling or queue operations');
+  }
+  if (typeof args.message !== 'string' || !args.message.trim()) {
+    throw cbError('RECOVERY_MESSAGE_REQUIRED', '--recovery-resend is a one-shot operation and requires non-empty --message');
+  }
+  if (!args.recoveryIncidentId || !args.recoveryIncidentId.trim()) {
+    throw cbError('RECOVERY_INCIDENT_REQUIRED', '--recovery-resend requires --recovery-incident <id>');
+  }
+
+  // Automatic discriminator injection: guarantees WAL transcript uniqueness
+  const cleanIncidentId = args.recoveryIncidentId.trim();
+  const discriminator = `[Recovery Stage 2: ${cleanIncidentId}]`;
+  if (!args.message.startsWith(discriminator)) {
+    args.message = `${discriminator} ${args.message.trim()}`;
+  }
+}
+
+async function prepareRecoveryResendTarget(page, args, expectedSessionId) {
+  if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+    await openConversationBySessionId(page, expectedSessionId);
+  }
+  await reloadExactConversation(page, expectedSessionId, 'recovery-resend');
+  await assertThreadIdentity(page, expectedSessionId, 'before recovery-resend prompt preparation');
+}
+
 async function prepareConversationForPrompt(page, args) {
   if (args.recoveryResend) {
     if (args.newConversation) {
@@ -6753,7 +6785,7 @@ async function watchTargetAppState(page, args, options = {}) {
   const expectedSessionId = options.expectedSessionId || args.expectedSessionId || '';
   if (expectedSessionId) {
     await assertThreadIdentity(page, expectedSessionId, 'before starting watch-state');
-    args.transcript = transcriptPathForSession(expectedSessionId);
+    if (!args.transcriptOverride) args.transcript = transcriptPathForSession(expectedSessionId);
   } else {
     refreshSessionTranscript(page, args);
   }
@@ -6779,7 +6811,7 @@ async function watchTargetAppState(page, args, options = {}) {
     await page.waitForTimeout(args.stateInterval);
     if (expectedSessionId) {
       await assertThreadIdentity(page, expectedSessionId, 'while watching target state');
-      args.transcript = transcriptPathForSession(expectedSessionId);
+      if (!args.transcriptOverride) args.transcript = transcriptPathForSession(expectedSessionId);
     } else {
       refreshSessionTranscript(page, args);
     }
@@ -6815,14 +6847,13 @@ async function ask(page, message, args) {
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
       if (args.recoveryResend) {
-        if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
-          await openConversationBySessionId(page, expectedSessionId);
-        }
-        await reloadExactConversation(page, expectedSessionId, 'recovery-resend');
+        await prepareRecoveryResendTarget(page, args, expectedSessionId);
       } else if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
         await openConversationBySessionId(page, expectedSessionId);
+        await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
+      } else {
+        await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
       }
-      await assertThreadIdentity(page, expectedSessionId, 'before conversation preparation');
     }
 
     await reconcileCurrentConversation(page, args, { suppressAlias: isNewChat }).catch(() => {});
@@ -7810,6 +7841,8 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  validateRecoveryMode(args);
+
   if (args.queueStatus) {
     printQueueStatus(args);
     return;
@@ -7961,7 +7994,7 @@ async function main() {
             await openConversationBySessionId(page, args.expectedSessionId);
           }
           await assertThreadIdentity(page, args.expectedSessionId, 'before watch-state');
-          args.transcript = transcriptPathForSession(args.expectedSessionId);
+          if (!args.transcriptOverride) args.transcript = transcriptPathForSession(args.expectedSessionId);
           await watchTargetAppState(page, args, { expectedSessionId: args.expectedSessionId });
         };
         await withBrowserLaneLease(args, randomId('watch-state-op'), action);
@@ -8069,6 +8102,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  validateRecoveryMode,
+  prepareRecoveryResendTarget,
   registerPendingRound,
   reloadExactConversation,
   watchTargetAppState,
