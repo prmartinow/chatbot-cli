@@ -1072,6 +1072,53 @@ function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
   });
 }
 
+async function getPageTargetId(page) {
+  if (typeof page?.context?.newCDPSession === 'function') {
+    try {
+      const session = await page.context().newCDPSession(page);
+      const { targetInfo } = await session.send('Target.getTargetInfo');
+      await session.detach().catch(() => {});
+      if (targetInfo?.targetId) return targetInfo.targetId;
+    } catch {}
+  }
+  if (typeof page?._targetId === 'string') return page._targetId;
+  return null;
+}
+
+function topologyLeasePath(args) {
+  const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
+  const scope = ['topology-lock', TARGET_APP_BASE.origin, normalizedCdp].join('|');
+  const hash = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 24);
+  return path.join(CONVERSATION_LEASES_DIR, `topology-${hash}.lock`);
+}
+
+function acquireTopologyLease(args, transactionId) {
+  return acquireNamedLease(
+    topologyLeasePath(args),
+    {
+      kind: 'browser_topology',
+      transactionId,
+      cdp: normalizeCdpUrl(args?.cdp || DEFAULT_CDP),
+      targetOrigin: TARGET_APP_BASE.origin,
+    },
+    'BROWSER_TOPOLOGY_BUSY',
+    'Another process is currently modifying browser topology (allocating tabs/windows)'
+  );
+}
+
+function releaseTopologyLease(leaseHandle) {
+  return releaseConversationLease(leaseHandle);
+}
+
+async function withTopologyLease(args, transactionId, fn) {
+  const lease = acquireTopologyLease(args, transactionId);
+  try {
+    return await fn();
+  } finally {
+    releaseTopologyLease(lease);
+  }
+}
+
 function browserLaneLeasePath(args) {
   const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
   let laneScope;
@@ -1915,37 +1962,66 @@ function printQueueStatus(args) {
 
 async function findTargetAppPage(browser, args = {}) {
   if (args.targetId || args.pageTargetId) {
-    const tid = args.targetId || args.pageTargetId;
+    const requestedTid = args.targetId || args.pageTargetId;
+    let foundPage = null;
     for (const candidateContext of browser.contexts()) {
       for (const p of candidateContext.pages()) {
-        if (typeof p._targetId === 'string' && p._targetId === tid) return p;
+        const tid = await getPageTargetId(p);
+        if (tid === requestedTid) {
+          foundPage = p;
+          break;
+        }
       }
+      if (foundPage) break;
     }
+    if (!foundPage) {
+      throw cbError('PAGE_TARGET_NOT_FOUND', `No page matches target ID "${requestedTid}"`);
+    }
+    return foundPage;
   }
 
   if (args.newTab) {
-    if (!args._laneLease) {
-      args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
-    }
-    const context = browser.contexts()[0] || await browser.newContext();
-    const page = await context.newPage();
-    await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    return page;
+    return await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
+      if (!args._laneLease) {
+        args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
+      }
+      const context = browser.contexts()[0] || await browser.newContext();
+      const page = await context.newPage();
+      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      return page;
+    });
   }
 
   const expectedId = args.expectedSessionId || args.conversation;
   const normalizedExpectedId = expectedId ? extractConversationId(expectedId) : null;
 
   if (normalizedExpectedId && STABLE_SESSION_ID_RE.test(normalizedExpectedId)) {
+    const matchingPages = [];
     for (const candidateContext of browser.contexts()) {
-      const matchPage = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === normalizedExpectedId);
-      if (matchPage) return matchPage;
+      for (const p of candidateContext.pages()) {
+        if (sessionIdFromUrl(p.url()) === normalizedExpectedId) {
+          matchingPages.push(p);
+        }
+      }
     }
-    // Dedicated page for requested conversation — NEVER hijack another conversation's tab!
-    const context = browser.contexts()[0] || await browser.newContext();
-    const page = await context.newPage();
-    await page.goto(`${TARGET_APP_BASE.origin}/c/${normalizedExpectedId}`, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    return page;
+    if (matchingPages.length > 1) {
+      throw cbError('PAGE_TARGET_AMBIGUOUS', `Multiple open pages match conversation "${normalizedExpectedId}". Disambiguate with --target-id.`);
+    }
+    if (matchingPages.length === 1) {
+      return matchingPages[0];
+    }
+    // Dedicated page under topology lease — NEVER hijack another conversation's tab!
+    return await withTopologyLease(args, randomId('dedicated-page-alloc'), async () => {
+      // Re-scan under topology lock (TOCTOU protection)
+      for (const candidateContext of browser.contexts()) {
+        const match = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === normalizedExpectedId);
+        if (match) return match;
+      }
+      const context = browser.contexts()[0] || await browser.newContext();
+      const page = await context.newPage();
+      await page.goto(`${TARGET_APP_BASE.origin}/c/${normalizedExpectedId}`, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      return page;
+    });
   }
 
   for (const candidateContext of browser.contexts()) {
@@ -1953,13 +2029,15 @@ async function findTargetAppPage(browser, args = {}) {
     if (page) return page;
   }
 
-  if (!args._laneLease) {
-    args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
-  }
-  const context = browser.contexts()[0] || await browser.newContext();
-  const page = await context.newPage();
-  await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  return page;
+  return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
+    if (!args._laneLease) {
+      args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
+    }
+    const context = browser.contexts()[0] || await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    return page;
+  });
 }
 
 async function getConversationTurns(page) {
@@ -6157,7 +6235,6 @@ async function attachFiles(page, filePaths) {
 }
 
 async function settlePage(page) {
-  await page.bringToFront().catch(() => {});
   await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
   await page.locator('#prompt-textarea, [data-testid="composer-input"], div[contenteditable="true"]').last()
     .waitFor({ state: 'visible', timeout: 5000 })
@@ -6772,12 +6849,49 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     await variantsBtn.click({ force: true });
   }
 
-  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+  let viewerHeader = null;
+  let closeBtn = null;
+
+  const prevLoc = page.locator('button[aria-label="Previous version"]');
+  const prevAnchor = typeof prevLoc.first === 'function' ? prevLoc.first() : (typeof prevLoc.last === 'function' ? prevLoc.last() : prevLoc);
+
+  if (prevAnchor && typeof prevAnchor.waitFor === 'function') {
+    await prevAnchor.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+
+  if (prevAnchor && typeof prevAnchor.locator === 'function') {
+    try {
+      const viewerRoot = prevAnchor.locator(
+        'xpath=ancestor::*[' +
+          './/button[@aria-label="Next version"] and ' +
+          './/button[@data-testid="close-button"]' +
+        '][1]'
+      );
+      if (viewerRoot && typeof viewerRoot.locator === 'function') {
+        const candidateHeader = viewerRoot.locator('div:has(> button[aria-label="Previous version"])');
+        const candidateClose = viewerRoot.locator('button[data-testid="close-button"][aria-label="Close"]');
+        if (candidateHeader && typeof candidateHeader.first === 'function' && (await candidateHeader.first().count().catch(() => 0))) {
+          viewerHeader = candidateHeader.first();
+        }
+        if (candidateClose && typeof candidateClose.first === 'function' && (await candidateClose.first().count().catch(() => 0))) {
+          closeBtn = candidateClose.first();
+        }
+      }
+    } catch {}
+  }
+
+  if (!viewerHeader) {
+    const headerLoc = page.locator('div:has(> button[aria-label="Previous version"])');
+    viewerHeader = typeof headerLoc.last === 'function' ? headerLoc.last() : headerLoc;
+  }
+  if (!closeBtn) {
+    const closeLoc = page.locator('button[data-testid="close-button"][aria-label="Close"]');
+    closeBtn = typeof closeLoc.last === 'function' ? closeLoc.last() : closeLoc;
+  }
+
   if (typeof closeBtn.waitFor === 'function') {
     await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
   }
-
-  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
   if (typeof viewerHeader.waitFor === 'function') {
     await viewerHeader.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
   }
@@ -10811,6 +10925,14 @@ async function main() {
     return;
   }
 
+  if (args.conversation && !isCurrentConversationRef(args.conversation)) {
+    const index = loadConversationIndex();
+    const parsed = parseConversationRef(args.conversation, index);
+    if (parsed.sessionId) {
+      args.expectedSessionId = parsed.sessionId;
+    }
+  }
+
   const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
   try {
     const page = await findTargetAppPage(browser, args);
@@ -11138,6 +11260,11 @@ module.exports = {
   normalizeTurnText,
   browserLaneLeasePath,
   acquireBrowserLaneLease,
+  topologyLeasePath,
+  acquireTopologyLease,
+  releaseTopologyLease,
+  withTopologyLease,
+  getPageTargetId,
   takeBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,

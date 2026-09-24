@@ -37,6 +37,11 @@ const {
   normalizeTurnText,
   browserLaneLeasePath,
   acquireBrowserLaneLease,
+  topologyLeasePath,
+  acquireTopologyLease,
+  releaseTopologyLease,
+  withTopologyLease,
+  getPageTargetId,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
   takeBrowserLaneLease,
@@ -4109,4 +4114,72 @@ test('findTargetAppPage: allocates dedicated page when requested conversation is
   assert.ok(page);
   // Must NOT steal tab 11111111! Must create dedicated tab navigating to 22222222
   assert.equal(createdUrl, 'https://chatgpt.com/c/22222222-2222-4222-8222-222222222222');
+});
+
+test('withTopologyLease: enforces mutual exclusion and releases cleanly', async () => {
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  let insideRan = false;
+
+  await withTopologyLease(mockArgs, 'topo-test', async () => {
+    insideRan = true;
+    const p = topologyLeasePath(mockArgs);
+    assert.equal(fs.existsSync(p), true);
+
+    assert.throws(
+      () => acquireTopologyLease(mockArgs, 'topo-concurrent'),
+      (err) => err.code === 'BROWSER_TOPOLOGY_BUSY'
+    );
+  });
+
+  assert.equal(insideRan, true);
+  const p = topologyLeasePath(mockArgs);
+  assert.equal(fs.existsSync(p), false);
+});
+
+test('findTargetAppPage: fails closed with PAGE_TARGET_NOT_FOUND when explicit targetId is missing', async () => {
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [{
+        _targetId: 'TARGET-A',
+        url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+      }],
+    }],
+  };
+
+  const args = {
+    targetId: 'NONEXISTENT-TARGET',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    () => findTargetAppPage(mockBrowser, args),
+    (err) => err.code === 'PAGE_TARGET_NOT_FOUND'
+  );
+});
+
+test('findTargetAppPage: fails closed with PAGE_TARGET_AMBIGUOUS when multiple open pages match requested UUID', async () => {
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [
+        {
+          _targetId: 'TARGET-1',
+          url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+        },
+        {
+          _targetId: 'TARGET-2',
+          url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111',
+        },
+      ],
+    }],
+  };
+
+  const args = {
+    conversation: '11111111-1111-4111-8111-111111111111',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  await assert.rejects(
+    () => findTargetAppPage(mockBrowser, args),
+    (err) => err.code === 'PAGE_TARGET_AMBIGUOUS'
+  );
 });
