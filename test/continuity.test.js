@@ -2546,7 +2546,7 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
 
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -2643,7 +2643,7 @@ test('captureUserTurnVersionBaseline: traverses versions to find K and restores 
 test('captureUserTurnVersionBaseline: fails closed if version label is malformed', async () => {
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -2686,7 +2686,7 @@ test('attestEditedUserTurnVersion: verifies K+1 version count and matching rende
 
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -2764,7 +2764,7 @@ test('attestEditedUserTurnVersion: rejects count mismatch with EDIT_VERSION_COUN
   const baseline = { count: 2 };
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -2845,7 +2845,7 @@ test('reconcileStage1EditTurn: positively promotes uncertain round to accepted w
 
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -2966,7 +2966,7 @@ test('reconcileStage1EditTurn: marks conflict when observed version > expected K
 
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,
@@ -3025,7 +3025,7 @@ test('reconcileStage1EditTurn: marks conflict when content hash mismatches expec
 
   const fakeHeader = {
     locator: (sel) => {
-      if (sel.includes('Version ')) {
+      if (sel.includes('Version')) {
         return {
           first: () => ({
             count: async () => 1,

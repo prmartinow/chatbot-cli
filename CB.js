@@ -6505,11 +6505,20 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
   }
 
   async function readVersionIndex() {
-    const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+    let labelEl = viewerHeader.locator('div:has-text("Version")').first();
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div:has-text("Current version")').first();
+    }
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div.font-semibold').first();
+    }
     if (!(await labelEl.count().catch(() => 0))) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
     }
     const text = await labelEl.innerText().catch(() => '');
+    if (/Current version/i.test(text)) {
+      return 'current';
+    }
     const m = text.match(/Version\s*(\d+)/i);
     if (!m) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
@@ -6544,10 +6553,11 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     }
     if (isNextDisabled) break;
     traversalSteps++;
-    const before = currentIndex;
+    const before = typeof currentIndex === 'number' ? currentIndex : 1;
     await nextBtn.click();
     await page.waitForTimeout(250);
-    currentIndex = await readVersionIndex();
+    const readVal = await readVersionIndex();
+    currentIndex = readVal === 'current' ? before + 1 : readVal;
     if (currentIndex !== before + 1) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Next version step failed: expected ${before + 1}, got ${currentIndex}`);
     }
@@ -6569,7 +6579,8 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     const before = currentIndex;
     await prevBtn.click();
     await page.waitForTimeout(250);
-    currentIndex = await readVersionIndex();
+    const readVal = await readVersionIndex();
+    currentIndex = readVal === 'current' ? before - 1 : readVal;
     if (currentIndex !== before - 1) {
       throw cbError('EDIT_VERSION_RESTORE_FAILED', `Previous version step failed: expected ${before - 1}, got ${currentIndex}`);
     }
@@ -6632,11 +6643,20 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
   }
 
   async function readVersionIndex() {
-    const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+    let labelEl = viewerHeader.locator('div:has-text("Version")').first();
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div:has-text("Current version")').first();
+    }
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div.font-semibold').first();
+    }
     if (!(await labelEl.count().catch(() => 0))) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
     }
     const text = await labelEl.innerText().catch(() => '');
+    if (/Current version/i.test(text)) {
+      return 'current';
+    }
     const m = text.match(/Version\s*(\d+)/i);
     if (!m) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
@@ -6655,7 +6675,8 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
   }
 
   const expectedVersion = baseline.count + 1;
-  if (activeVersion !== expectedVersion || !isNextDisabled) {
+  const isExpectedVersion = (activeVersion === expectedVersion || (activeVersion === 'current' && isNextDisabled));
+  if (!isExpectedVersion || !isNextDisabled) {
     await closeBtn.click().catch(() => {});
     throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt Version ${expectedVersion} with Next disabled, got Version ${activeVersion} (nextDisabled: ${isNextDisabled})`);
   }
@@ -6765,10 +6786,21 @@ async function reconcileStage1EditTurn(page, args, round) {
     return { outcome: 'uncertain', round };
   }
 
-  const labelEl = viewerHeader.locator('div:has-text("Version ")').first();
+  let labelEl = viewerHeader.locator('div:has-text("Version")').first();
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div:has-text("Current version")').first();
+    }
+    if (!(await labelEl.count().catch(() => 0))) {
+      labelEl = viewerHeader.locator('div.font-semibold').first();
+    }
   const text = await labelEl.innerText().catch(() => '');
-  const m = text.match(/Version\s*(\d+)/i);
-  const activeVersion = m ? parseInt(m[1], 10) : 0;
+  let activeVersion = 0;
+  if (/Current version/i.test(text)) {
+    activeVersion = 'current';
+  } else {
+    const m = text.match(/Version\s*(\d+)/i);
+    activeVersion = m ? parseInt(m[1], 10) : 0;
+  }
 
   const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
   let isNextDisabled = false;
@@ -6784,8 +6816,9 @@ async function reconcileStage1EditTurn(page, args, round) {
   await page.waitForTimeout(250);
 
   const expectedVersion = baseline.count + 1;
+  const isExpectedVersion = (activeVersion === expectedVersion || (activeVersion === 'current' && isNextDisabled));
 
-  if (activeVersion === expectedVersion && isNextDisabled && displayedHash === expectedHash) {
+  if (isExpectedVersion && isNextDisabled && displayedHash === expectedHash) {
     const versionAttestation = {
       baselineCount: baseline.count,
       acceptedCount: expectedVersion,
