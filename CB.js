@@ -6576,13 +6576,13 @@ async function retryEditTurn(page, args) {
 function validateStage3Mode(args) {
   if (!args.branchTurn) return;
 
-  if (!args.expectedSessionId) {
+  const rawTarget = args.expectedSessionId || args.conversation || '';
+  if (!rawTarget || !STABLE_SESSION_ID_RE.test(rawTarget)) {
     throw cbError('BRANCH_TARGET_REQUIRED', 'Stage 3 recovery branching requires an explicit stable conversation: --conversation <uuid>');
   }
-  if (!STABLE_SESSION_ID_RE.test(args.expectedSessionId)) {
-    throw cbError('BRANCH_TARGET_REQUIRED', 'Stage 3 recovery branching target must be a valid stable UUID');
-  }
-  if (!args.recoveryIncidentId) {
+  args.expectedSessionId = rawTarget;
+
+  if (!args.recoveryIncidentId?.trim()) {
     throw cbError('RECOVERY_INCIDENT_REQUIRED', 'Stage 3 recovery branching requires an explicit incident identifier: --recovery-incident <id>');
   }
 
@@ -6593,11 +6593,18 @@ function validateStage3Mode(args) {
     args.retryEdit,
     args.schedule,
     args.runQueue,
+    args.queueStatus,
+    args.queueWatch,
+    args.recoverQueue,
     args.stop,
     args.status,
     args.watchState,
+    args.waitReady,
     args.syncTranscript,
     args.latestAssistant,
+    args.dismissBlocker,
+    Boolean(args.searchQuery),
+    args.models,
     args.compactConversation,
     args.handoffNewSession,
     args.recoverInterrupted,
@@ -6623,10 +6630,23 @@ async function resolveBranchableTurn(page, selection = 'latest') {
   if (selection === 'latest') {
     targetTurn = assistantTurns[assistantTurns.length - 1];
   } else if (selection === 'prior-assistant') {
-    if (assistantTurns.length < 2) {
-      throw cbError('BRANCH_SOURCE_UNVERIFIED', 'Conversation has only one assistant turn; prior-assistant does not exist');
+    const latestUserIndex = canonicalTurns
+      .map((t, i) => [t, i])
+      .filter(([t]) => t.role === 'user')
+      .at(-1)?.[1];
+
+    if (latestUserIndex === undefined) {
+      throw cbError('BRANCH_SOURCE_UNVERIFIED', 'No user turns found in conversation to anchor prior-assistant');
     }
-    targetTurn = assistantTurns[assistantTurns.length - 2];
+
+    const priorAssistant = [...canonicalTurns.slice(0, latestUserIndex)]
+      .reverse()
+      .find(t => t.role === 'assistant');
+
+    if (!priorAssistant) {
+      throw cbError('BRANCH_SOURCE_UNVERIFIED', 'No assistant turn exists prior to the latest user prompt');
+    }
+    targetTurn = priorAssistant;
   } else {
     targetTurn = assistantTurns.find(t => (t.messageId && t.messageId === selection) || (t.testid && t.testid === selection));
     if (!targetTurn) {
@@ -6645,14 +6665,14 @@ async function resolveBranchableTurn(page, selection = 'latest') {
 }
 
 async function openBranchMenu(page, sourceAssistant) {
-  let turnEl;
+  let turnEl = null;
   if (sourceAssistant.testid) {
     turnEl = page.locator(`[data-testid="${sourceAssistant.testid}"]`).first();
   } else if (sourceAssistant.messageId) {
     turnEl = page.locator(`[data-message-id="${sourceAssistant.messageId}"]`).first();
   }
   if (!turnEl || !(await turnEl.count().catch(() => 0))) {
-    turnEl = page.locator('[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])').last();
+    throw cbError('BRANCH_SOURCE_UNVERIFIED', `Exact source turn "${sourceAssistant.testid || sourceAssistant.messageId}" could not be located in DOM`);
   }
 
   await turnEl.scrollIntoViewIfNeeded().catch(() => {});
@@ -6728,6 +6748,13 @@ async function branchConversationTurn(page, args) {
 
       await assertThreadIdentity(page, expectedParentSessionId, 'immediately before branch click');
 
+      // Re-verify that source turn revision is still present in canonical turns
+      const currentTurns = await getConversationTurns(page).catch(() => []);
+      const sourceStillPresent = currentTurns.some(t => t.role === 'assistant' && sameTurnRevision(t, sourceAssistant));
+      if (!sourceStillPresent) {
+        throw cbError('BRANCH_SOURCE_UNVERIFIED', 'Source turn revision changed or disappeared before branch dispatch');
+      }
+
       const genCheck = await getCombinedGenerationState(page);
       if (genCheck.isGenerating) {
         throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
@@ -6752,13 +6779,23 @@ async function branchConversationTurn(page, args) {
         throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
       }
 
+      // Discover destination page
       let destinationPage = null;
       const startWait = Date.now();
       while (Date.now() - startWait < 15000) {
         const currentPages = page.context().pages();
-        const newlyOpened = currentPages.find((p) => !pagesBefore.has(p));
-        if (newlyOpened) {
-          destinationPage = newlyOpened;
+        const newPages = currentPages.filter((p) => !pagesBefore.has(p));
+        if (newPages.length > 1) {
+          localDispatchState = 'uncertain';
+          branchRecord = updateBranchLineage(branchRecord.id, {
+            status: 'pending',
+            dispatchState: 'destination_unverified',
+            lastError: 'Multiple newly opened pages detected after branch click',
+          }, 'branch_destination_unverified') || branchRecord;
+          throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Multiple newly opened pages detected after branch click');
+        }
+        if (newPages.length === 1) {
+          destinationPage = newPages[0];
           break;
         }
         if (page.url() !== branchRecord.sourceUrl) {
@@ -6780,47 +6817,67 @@ async function branchConversationTurn(page, args) {
 
       await destinationPage.waitForLoadState('domcontentloaded').catch(() => {});
 
-      const currentUrl = destinationPage.url();
-      if (isEphemeralRouteId(routeSessionIdFromUrl(currentUrl))) {
-        localDispatchState = 'provisional';
-        branchRecord = updateBranchLineage(branchRecord.id, {
-          dispatchState: 'provisional',
-          provisionalRoute: currentUrl,
-        }, 'branch_provisional') || branchRecord;
-      }
-
-      let childSessionId;
-      try {
-        childSessionId = await waitForSessionIdInUrl(destinationPage, 30000);
-      } catch (idErr) {
+      // Validate destination page origin matches target base
+      const targetBase = new URL(page.url());
+      const destUrl = new URL(destinationPage.url());
+      if (destUrl.origin !== targetBase.origin) {
         localDispatchState = 'uncertain';
         branchRecord = updateBranchLineage(branchRecord.id, {
           status: 'pending',
           dispatchState: 'destination_unverified',
-          lastError: idErr.message || String(idErr),
+          lastError: `Destination page origin "${destUrl.origin}" does not match target origin "${targetBase.origin}"`,
         }, 'branch_destination_unverified') || branchRecord;
-        throw idErr;
+        throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Destination page origin does not match ChatGPT target origin');
+      }
+
+      // Handle provisional route (/c/WEB:*)
+      if (isEphemeralRouteId(routeSessionIdFromUrl(destinationPage.url()))) {
+        localDispatchState = 'provisional';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          dispatchState: 'provisional',
+          provisionalRoute: destinationPage.url(),
+        }, 'branch_provisional') || branchRecord;
+      }
+
+      // Wait for stable child UUID
+      const childSessionId = await waitForSessionIdInUrl(destinationPage, 30000);
+      if (!childSessionId || !STABLE_SESSION_ID_RE.test(childSessionId)) {
+        localDispatchState = 'destination_unverified';
+        branchRecord = updateBranchLineage(branchRecord.id, {
+          status: 'pending',
+          dispatchState: 'destination_unverified',
+          lastError: 'Stable child session ID was not observed in URL',
+        }, 'branch_destination_unverified') || branchRecord;
+        throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Stable child session ID was not observed');
       }
 
       if (childSessionId === expectedParentSessionId) {
         throw cbError('BRANCH_IDENTITY_INVALID', 'Child session ID matches parent session ID');
       }
 
+      // Persist stable_candidate state before acquiring child lease
+      localDispatchState = 'stable_candidate';
+      branchRecord = updateBranchLineage(branchRecord.id, {
+        dispatchState: 'stable_candidate',
+        candidateChildSessionId: childSessionId,
+      }, 'branch_stable_candidate') || branchRecord;
+
+      // Acquire child lease while still holding parent lease (overlapping leases)
       childLease = await acquireConversationLease(childSessionId, branchRecord.id);
 
+      // Settle and verify lineage via dom_divider
       await settlePage(destinationPage, 5000).catch(() => {});
       const branchInfo = await getBranchInfo(destinationPage).catch(() => null);
 
-      const domParentId = branchInfo?.dividerData?.parentSessionId || '';
-      if (!domParentId || domParentId !== expectedParentSessionId) {
+      if (!branchInfo?.isFork || branchInfo.parentResolution !== 'dom_divider' || branchInfo.parentSessionId !== expectedParentSessionId) {
         localDispatchState = 'lineage_unverified';
         branchRecord = updateBranchLineage(branchRecord.id, {
           status: 'failed',
           dispatchState: 'lineage_unverified',
           candidateChildSessionId: childSessionId,
-          lastError: `DOM divider parent ID "${domParentId}" does not match expected parent "${expectedParentSessionId}"`,
+          lastError: `Parent resolution "${branchInfo?.parentResolution}" / parent ID "${branchInfo?.parentSessionId}" does not match expected parent "${expectedParentSessionId}"`,
         }, 'branch_lineage_unverified') || branchRecord;
-        throw cbError('BRANCH_LINEAGE_UNVERIFIED', `DOM divider parent ID "${domParentId}" does not match expected parent "${expectedParentSessionId}"`);
+        throw cbError('BRANCH_LINEAGE_UNVERIFIED', `DOM divider parent ID "${branchInfo?.parentSessionId}" does not match expected parent "${expectedParentSessionId}"`);
       }
 
       localDispatchState = 'lineage_attested';
@@ -6831,11 +6888,16 @@ async function branchConversationTurn(page, args) {
           parentSessionId: expectedParentSessionId,
           verifiedVia: 'dom_divider',
         },
-        lineageAttestation: branchInfo.dividerData,
+        lineageAttestation: {
+          parentSessionId: branchInfo.parentSessionId,
+          parentResolution: branchInfo.parentResolution,
+          detectionVectors: branchInfo.detectionVectors,
+          branchText: branchInfo.branchText,
+        },
       }, 'branch_lineage_attested') || branchRecord;
 
-      const childTranscriptPath = transcriptPathForSession(childSessionId);
-      await syncTranscriptFromPage(destinationPage, { transcript: childTranscriptPath }).catch(() => {});
+      // Ensure child transcript exists cleanly without fabricating ancestry
+      ensureTranscript(transcriptPathForSession(childSessionId));
 
       localDispatchState = 'bound';
       branchRecord = updateBranchLineage(branchRecord.id, {
@@ -6873,6 +6935,49 @@ async function branchConversationTurn(page, args) {
   };
 
   return await withBrowserLaneLease(args, randomId('stage3-branch-op'), action);
+}
+
+function reconcileIncompleteBranches() {
+  return withSchedulerLock(() => {
+    const state = loadLineageState();
+    let modified = false;
+
+    for (const branch of state.branches) {
+      if (branch.status === 'done' || branch.status === 'failed') continue;
+
+      const pid = branch.pid;
+      let isAlive = false;
+      if (pid) {
+        try {
+          process.kill(pid, 0);
+          isAlive = true;
+        } catch {
+          isAlive = false;
+        }
+      }
+
+      if (!isAlive) {
+        if (branch.dispatchState === 'prepared') {
+          branch.status = 'failed';
+          branch.dispatchState = 'aborted_precommit';
+          branch.lastError = 'Owner process died before branch dispatch';
+          branch.updatedAt = nowIso();
+          modified = true;
+        } else if (branch.dispatchState === 'dispatching') {
+          branch.status = 'pending';
+          branch.dispatchState = 'dispatch_uncertain';
+          branch.lastError = 'Owner process died during branch dispatch';
+          branch.updatedAt = nowIso();
+          modified = true;
+        }
+      }
+    }
+
+    if (modified) {
+      saveLineageState(state);
+    }
+    return state;
+  });
 }
 
 function validateRecoveryMode(args) {
@@ -9103,6 +9208,7 @@ module.exports = {
   loadLineageState,
   registerPendingBranch,
   updateBranchLineage,
+  reconcileIncompleteBranches,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,

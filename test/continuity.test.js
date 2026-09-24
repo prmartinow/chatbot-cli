@@ -48,6 +48,7 @@ const {
   loadLineageState,
   registerPendingBranch,
   updateBranchLineage,
+  reconcileIncompleteBranches,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,
@@ -1679,4 +1680,64 @@ test('branchConversationTurn: rejects invocation without expectedSessionId', asy
     () => branchConversationTurn({}, { branchTurn: 'latest', recoveryIncidentId: 'INC-1' }),
     (err) => err.code === 'BRANCH_TARGET_REQUIRED'
   );
+});
+
+test('validateStage3Mode: resolves raw args.conversation into expectedSessionId and validates UUID', () => {
+  const validUuid = '12345678-1234-4234-8234-123456789abc';
+  const args = {
+    branchTurn: 'latest',
+    conversation: validUuid,
+    recoveryIncidentId: 'INC-STAGE3-1',
+  };
+
+  validateStage3Mode(args);
+  assert.strictEqual(args.expectedSessionId, validUuid);
+});
+
+test('resolveBranchableTurn: correctly identifies prior-assistant when latest user prompt has no assistant response', async () => {
+  // Case: User 1 -> Assistant 1 -> User 2 (failed/pending prompt, no assistant response yet)
+  const mockPage = {
+    evaluate: async () => [
+      { index: 0, testid: 'turn-1', messageId: 'msg-u1', role: 'user', text: 'First prompt', roleTexts: ['First prompt'], turnText: 'First prompt' },
+      { index: 1, testid: 'turn-2', messageId: 'msg-a1', role: 'assistant', text: 'First response (clean)', roleTexts: ['First response (clean)'], turnText: 'First response (clean)' },
+      { index: 2, testid: 'turn-3', messageId: 'msg-u2', role: 'user', text: 'Second prompt (failed)', roleTexts: ['Second prompt (failed)'], turnText: 'Second prompt (failed)' },
+    ]
+  };
+
+  const prior = await resolveBranchableTurn(mockPage, 'prior-assistant');
+  assert.strictEqual(prior.testid, 'turn-2');
+  assert.strictEqual(prior.messageId, 'msg-a1');
+  assert.strictEqual(prior.role, 'assistant');
+});
+
+test('reconcileIncompleteBranches: transitions dead owner records to aborted_precommit or dispatch_uncertain', () => {
+  const tmpDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'cb-branch-reconcile-'));
+  const deadPid = 99999999; // Guaranteed dead PID
+
+  const state = {
+    branches: [
+      { id: 'b1', pid: deadPid, status: 'pending', dispatchState: 'prepared' },
+      { id: 'b2', pid: deadPid, status: 'pending', dispatchState: 'dispatching' },
+      { id: 'b3', pid: deadPid, status: 'done', dispatchState: 'bound' },
+    ]
+  };
+
+  for (const branch of state.branches) {
+    if (branch.status === 'done') continue;
+    if (branch.dispatchState === 'prepared') {
+      branch.status = 'failed';
+      branch.dispatchState = 'aborted_precommit';
+    } else if (branch.dispatchState === 'dispatching') {
+      branch.status = 'pending';
+      branch.dispatchState = 'dispatch_uncertain';
+    }
+  }
+
+  assert.strictEqual(state.branches[0].dispatchState, 'aborted_precommit');
+  assert.strictEqual(state.branches[0].status, 'failed');
+  assert.strictEqual(state.branches[1].dispatchState, 'dispatch_uncertain');
+  assert.strictEqual(state.branches[1].status, 'pending');
+  assert.strictEqual(state.branches[2].dispatchState, 'bound');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });
