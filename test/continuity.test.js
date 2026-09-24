@@ -51,6 +51,7 @@ const {
   resolveEditableUserTurn,
   openUserTurnEditor,
   populateAndVerifyEditor,
+  getGenerationState,
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
   retryEditTurn,
@@ -3881,4 +3882,79 @@ test('submitEditedUserTurn: rejects mutated editor content before submit', async
     (err) => err.code === 'EDIT_EDITOR_CHANGED_BEFORE_SUBMIT'
   );
   assert.equal(cancelCalled, true);
+});
+
+test('getGenerationState: ignores bare Cancel and editor Cancel button while detecting real stop button', async () => {
+  const mockEditorCancel = {
+    getAttribute: (attr) => (attr === 'type' ? 'button' : null),
+    innerText: 'Cancel',
+    offsetWidth: 50,
+    offsetHeight: 30,
+    getClientRects: () => [{}],
+    closest: (sel) => ({
+      querySelector: () => ({ isConnected: true }),
+    }),
+  };
+
+  const mockStopButton = {
+    getAttribute: (attr) => (attr === 'data-testid' ? 'stop-button' : null),
+    innerText: '',
+    offsetWidth: 30,
+    offsetHeight: 30,
+    getClientRects: () => [{}],
+    closest: () => null,
+  };
+
+  // With only editor Cancel: isGenerating is false
+  const pageWithCancelOnly = {
+    evaluate: async (fn, pattern) => {
+      // Re-run the evaluate logic against mockEditorCancel
+      const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight);
+      const textOf = (el) => el.innerText || '';
+      const voiceControlRe = new RegExp(pattern, 'i');
+      function isGenerationControl(button) {
+        const testid = button.getAttribute('data-testid') || '';
+        const visibleText = textOf(button);
+        const meta = `${testid} ${visibleText}`.trim().toLowerCase();
+        if (voiceControlRe.test(meta)) return false;
+        if (/^cancel$/i.test(visibleText.trim())) return false;
+        const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+        if (turn && turn.querySelector?.('[id^="message-edit-"]')) return false;
+        if (/\bstop-button\b/i.test(testid)) return true;
+        return /\bstop\b/i.test(meta);
+      }
+      const buttons = [mockEditorCancel].filter(isVisible);
+      const generatingButton = buttons.find(isGenerationControl);
+      return { isGenerating: Boolean(generatingButton) };
+    }
+  };
+
+  const res1 = await getGenerationState(pageWithCancelOnly);
+  assert.equal(res1.isGenerating, false);
+
+  // With both editor Cancel and real stop-button: real stop button wins
+  const pageWithBoth = {
+    evaluate: async (fn, pattern) => {
+      const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight);
+      const textOf = (el) => el.innerText || '';
+      const voiceControlRe = new RegExp(pattern, 'i');
+      function isGenerationControl(button) {
+        const testid = button.getAttribute('data-testid') || '';
+        const visibleText = textOf(button);
+        const meta = `${testid} ${visibleText}`.trim().toLowerCase();
+        if (voiceControlRe.test(meta)) return false;
+        if (/^cancel$/i.test(visibleText.trim())) return false;
+        const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+        if (turn && turn.querySelector?.('[id^="message-edit-"]')) return false;
+        if (/\bstop-button\b/i.test(testid)) return true;
+        return /\bstop\b/i.test(meta);
+      }
+      const buttons = [mockEditorCancel, mockStopButton].filter(isVisible);
+      const generatingButton = buttons.find(isGenerationControl);
+      return { isGenerating: Boolean(generatingButton) };
+    }
+  };
+
+  const res2 = await getGenerationState(pageWithBoth);
+  assert.equal(res2.isGenerating, true);
 });

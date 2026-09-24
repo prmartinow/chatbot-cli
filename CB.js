@@ -3057,20 +3057,42 @@ function turnMatchesMessage(turnText, message) {
 async function getGenerationState(page) {
   return page.evaluate((voiceControlPattern) => {
     const isVisible = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
     const voiceControlRe = new RegExp(voiceControlPattern, 'i');
-    const buttons = [...document.querySelectorAll('button')].filter(isVisible);
-    const generatingButton = buttons.find((button) => {
-      const text = [
-        button.getAttribute('data-testid') || '',
-        button.getAttribute('aria-label') || '',
-        button.getAttribute('title') || '',
-        button.innerText || '',
-      ].join(' ').toLowerCase();
 
-      return /\b(stop|interrupt|cancel)\b/.test(text)
-        && !/\b(share|copy|close|cancel dictation)\b/.test(text)
-        && !voiceControlRe.test(text);
-    });
+    function isGenerationControl(button) {
+      const testid = button.getAttribute('data-testid') || '';
+      const aria = button.getAttribute('aria-label') || '';
+      const title = button.getAttribute('title') || '';
+      const visibleText = textOf(button);
+
+      const meta = `${testid} ${aria} ${title} ${visibleText}`
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      if (voiceControlRe.test(meta)) return false;
+      if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
+      if (/^cancel$/i.test(visibleText.trim())) return false;
+
+      const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+      if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
+        return false;
+      }
+
+      if (
+        /\bstop-button\b/i.test(testid) ||
+        /\b(stop generating|stop answering|stop response)\b/i.test(meta) ||
+        /\binterrupt(?: generation| response| answer)?\b/i.test(meta)
+      ) {
+        return true;
+      }
+
+      return /\bstop\b/i.test(meta) && !/\b(stopped|stopwatch)\b/i.test(meta);
+    }
+
+    const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(isVisible);
+    const generatingButton = buttons.find(isGenerationControl);
 
     return {
       isGenerating: Boolean(generatingButton),
@@ -3078,7 +3100,7 @@ async function getGenerationState(page) {
         ? (generatingButton.getAttribute('data-testid')
           || generatingButton.getAttribute('aria-label')
           || generatingButton.getAttribute('title')
-          || generatingButton.innerText
+          || textOf(generatingButton)
           || 'generation-control')
         : '',
     };
@@ -3224,12 +3246,41 @@ async function getTargetAppState(page) {
       }))
       .filter((item) => item.testid || item.aria || item.title || item.text || item.href);
 
+    function isGenerationControl(button) {
+      const testid = button.getAttribute('data-testid') || '';
+      const aria = button.getAttribute('aria-label') || '';
+      const title = button.getAttribute('title') || '';
+      const visibleText = textOf(button);
+
+      const meta = `${testid} ${aria} ${title} ${visibleText}`
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      if (voiceControlRe.test(meta)) return false;
+      if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
+      if (/^cancel$/i.test(visibleText.trim())) return false;
+
+      const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+      if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
+        return false;
+      }
+
+      if (
+        /\bstop-button\b/i.test(testid) ||
+        /\b(stop generating|stop answering|stop response)\b/i.test(meta) ||
+        /\binterrupt(?: generation| response| answer)?\b/i.test(meta)
+      ) {
+        return true;
+      }
+
+      return /\bstop\b/i.test(meta) && !/\b(stopped|stopwatch)\b/i.test(meta);
+    }
+
     const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(isVisible);
     const generationControls = buttons
-      .map((button) => ({ text: controlText(button), testid: button.getAttribute('data-testid') || '' }))
-      .filter((item) => /\b(stop|interrupt|cancel)\b/i.test(item.text)
-        && !/\b(share|copy|close|cancel dictation)\b/i.test(item.text)
-        && !voiceControlRe.test(item.text));
+      .filter(isGenerationControl)
+      .map((button) => ({ text: controlText(button), testid: button.getAttribute('data-testid') || '' }));
 
     const voiceControls = controls
       .filter((item) => voiceControlRe.test([
@@ -4130,19 +4181,40 @@ async function stopGeneration(page) {
     document.querySelectorAll('[data-cb-stop-generation]').forEach((el) => {
       el.removeAttribute('data-cb-stop-generation');
     });
+    function isGenerationControl(button) {
+      const testid = button.getAttribute('data-testid') || '';
+      const aria = button.getAttribute('aria-label') || '';
+      const title = button.getAttribute('title') || '';
+      const visibleText = textOf(button);
+
+      const meta = `${testid} ${aria} ${title} ${visibleText}`
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      if (voiceControlRe.test(meta)) return false;
+      if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
+      if (/^cancel$/i.test(visibleText.trim())) return false;
+
+      const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+      if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
+        return false;
+      }
+
+      if (
+        /\bstop-button\b/i.test(testid) ||
+        /\b(stop generating|stop answering|stop response)\b/i.test(meta) ||
+        /\binterrupt(?: generation| response| answer)?\b/i.test(meta)
+      ) {
+        return true;
+      }
+
+      return /\bstop\b/i.test(meta) && !/\b(stopped|stopwatch)\b/i.test(meta);
+    }
+
     const control = [...document.querySelectorAll('button,[role="button"]')]
       .filter(isVisible)
-      .find((el) => {
-        const text = [
-          el.getAttribute('data-testid') || '',
-          el.getAttribute('aria-label') || '',
-          el.getAttribute('title') || '',
-          textOf(el),
-        ].join(' ');
-        return /\b(stop|interrupt|cancel)\b/i.test(text)
-          && !/\b(share|copy|close|cancel dictation)\b/i.test(text)
-          && !voiceControlRe.test(text);
-      });
+      .find(isGenerationControl);
     if (!control) return '';
     control.setAttribute('data-cb-stop-generation', 'true');
     return [
@@ -10806,6 +10878,7 @@ module.exports = {
   resolveEditableUserTurn,
   openUserTurnEditor,
   populateAndVerifyEditor,
+  getGenerationState,
   submitEditedUserTurn,
   waitForEditedTurnAccepted,
   retryEditTurn,
