@@ -3572,16 +3572,41 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
   assert.equal(resPre.outcome, 'aborted_precommit');
   assert.equal(resPre.round.dispatchState, 'aborted_precommit');
 
-  // 3. Positive branch restoration succeeds and re-attests source revision
+  // 3. Positive branch restoration succeeds and re-attests both user and assistant revisions
   let closeClicked = false;
+  let currentLabel = 'Current version';
+  let nextDisabled = true;
+
   const fakeHeader = {
     locator: (sel) => {
+      if (sel.includes('Version') || sel.includes('Current version')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => currentLabel,
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => false,
+            click: async () => {
+              currentLabel = 'Version 1';
+              nextDisabled = false;
+            },
+          }),
+        };
+      }
       if (sel.includes('Next version')) {
         return {
           first: () => ({
             count: async () => 1,
-            isDisabled: async () => true,
-            click: async () => {},
+            isDisabled: async () => nextDisabled,
+            click: async () => {
+              currentLabel = 'Current version';
+              nextDisabled = true;
+            },
           }),
         };
       }
@@ -3607,6 +3632,9 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
     },
   };
 
+  const origHash = messageHash(normalizeTurnText('Original text'));
+  const asstHash = messageHash(normalizeTurnText('Original assistant response'));
+
   const fakePageSuccess = {
     url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
     bringToFront: async () => {},
@@ -3616,10 +3644,11 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
     waitForTimeout: async () => {},
     evaluate: async (fn) => {
       if (typeof fn === 'function' && fn.toString().includes('sessionIdFromLocation')) {
-        return { hydrated: true, sessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', turnCount: 1, roleNodeCount: 1, composerVisible: true };
+        return { hydrated: true, sessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', turnCount: 2, roleNodeCount: 2, composerVisible: true };
       }
       return [
         { role: 'user', testid: 'turn-u1', text: 'Original text' },
+        { role: 'assistant', testid: 'turn-a1', text: 'Original assistant response' },
       ];
     },
     locator: (sel) => {
@@ -3645,7 +3674,6 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
     },
   };
 
-  const origHash = messageHash(normalizeTurnText('Original text'));
   const successRound = {
     id: 'round-prep-succ',
     operationKind: 'edit_retry',
@@ -3657,6 +3685,7 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
     versionProbe: {
       initialActiveIndex: 2,
       initialLabelKind: 'current',
+      initialAssistantRef: { testid: 'turn-a1', textHash: asstHash },
     },
   };
 

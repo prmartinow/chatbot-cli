@@ -6785,6 +6785,11 @@ async function reconcileStage1EditTurn(page, args, round) {
               await nextBtn.click().catch(() => {});
               await page.waitForTimeout(200);
             }
+            const finalRes = await resolveNumericVersionIndex(page, viewerHeader);
+            const isNextDis = await nextBtn.isDisabled().catch(() => false);
+            if (!isNextDis || finalRes.labelKind !== 'current' || (typeof targetIndex === 'number' && finalRes.numericIndex !== targetIndex)) {
+              throw cbError('EDIT_VERSION_RESTORE_FAILED', `Failed to restore Current version with Next disabled (got index ${finalRes.numericIndex}, labelKind ${finalRes.labelKind}, nextDisabled ${isNextDis}, expected index ${targetIndex})`);
+            }
           } else if (typeof targetIndex === 'number') {
             let cur = await resolveNumericVersionIndex(page, viewerHeader);
             const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
