@@ -7032,7 +7032,8 @@ async function reconcileStage1EditTurn(page, args, round) {
     }
     return { outcome: 'uncertain', round };
   }
-  if (round.dispatchState !== 'dispatching' && round.dispatchState !== 'uncertain') {
+  const postDispatchStates = ['dispatching', 'client_accepted', 'commit_verifying', 'uncertain'];
+  if (!postDispatchStates.includes(round.dispatchState)) {
     return { outcome: 'unchanged', round };
   }
 
@@ -7155,6 +7156,36 @@ async function reconcileStage1EditTurn(page, args, round) {
 
   return { outcome: 'uncertain', round };
 }
+async function waitForStage1PostSendQuiescence(page, expectedSessionId, timeoutMs = 300000) {
+  const start = Date.now();
+  let generationObserved = false;
+  let idleConsecutiveCount = 0;
+
+  while (Date.now() - start < timeoutMs) {
+    await assertThreadIdentity(page, expectedSessionId, 'while awaiting stage1 post-send quiescence');
+    const gen = await getCombinedGenerationState(page);
+    if (gen.isGenerating) {
+      generationObserved = true;
+      idleConsecutiveCount = 0;
+    } else {
+      idleConsecutiveCount++;
+      if (generationObserved && idleConsecutiveCount >= 2) {
+        return { quiescent: true, generationObserved: true };
+      }
+      if (!generationObserved && idleConsecutiveCount >= 6) {
+        return { quiescent: true, generationObserved: false };
+      }
+    }
+    if (typeof page.waitForTimeout === 'function') {
+      await page.waitForTimeout(500);
+    } else {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  return { quiescent: true, timedOut: true, generationObserved };
+}
+
 async function retryEditTurn(page, args) {
   await prepareConversationForRead(page, args);
   const expectedSessionId = args.expectedSessionId;
@@ -7247,21 +7278,48 @@ async function retryEditTurn(page, args) {
         throw cbError('EDIT_DISPATCH_UNCERTAIN', `Stage 1 edit submit uncertainty: ${submitErr.message || submitErr}`);
       }
 
-      // Preliminary non-authoritative observation to allow in-flight network dispatch
+      // 1. Client Acceptance: editor unmounts and live DOM reflects editedHash
+      if (typeof editor.waitFor === 'function') {
+        await editor.waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
+      }
+      let clientAttestation;
       try {
-        await page.locator('#prompt-textarea, [data-testid="composer-input"], div[contenteditable="true"]').first().waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
-      } catch {}
-      await page.waitForTimeout(500);
+        clientAttestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId, 15000);
+      } catch (attestErr) {
+        localDispatchState = 'uncertain';
+        round = updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: attestErr.message || String(attestErr),
+        }, 'round_dispatch_uncertain') || round;
+        throw attestErr;
+      }
 
-      // Exact Thread Reload as a Commit Barrier against frontend pretense:
-      // Wipes optimistic frontend memory; forces hydration from ChatGPT backend database.
+      localDispatchState = 'client_accepted';
+      round = updateRound(round.id, {
+        dispatchState: 'client_accepted',
+        clientAcceptedUserTurn: clientAttestation.acceptedTurn,
+        clientAcceptanceMethod: 'live_dom_after_send',
+      }, 'round_client_accepted') || round;
+
+      // 2. Passive Quiescence Observation (never reload or click Stop during this phase)
+      await waitForStage1PostSendQuiescence(page, expectedSessionId);
+
+      localDispatchState = 'commit_verifying';
+      round = updateRound(round.id, {
+        dispatchState: 'commit_verifying',
+      }, 'round_commit_verifying') || round;
+
+      // 3. Exact Thread Reload as a Commit Barrier against frontend pretense:
+      // Executed ONLY after the post-Send transaction is quiescent.
       if (typeof page.reload === 'function') {
         await reloadExactConversation(page, expectedSessionId, 'stage1-post-submit-rehydration');
       }
 
-      let attestation;
+      // 4. Server-Rehydrated Proof: verify edited turn and numeric K+1
+      let serverAttestation;
       try {
-        attestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId);
+        serverAttestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId, 15000);
       } catch (attestErr) {
         localDispatchState = 'uncertain';
         round = updateRound(round.id, {
@@ -7274,7 +7332,7 @@ async function retryEditTurn(page, args) {
 
       let versionAttestation = null;
       try {
-        versionAttestation = await attestEditedUserTurnVersion(page, attestation.acceptedTurn || sourceUser, versionBaseline, editedHash);
+        versionAttestation = await attestEditedUserTurnVersion(page, serverAttestation.acceptedTurn || sourceUser, versionBaseline, editedHash);
       } catch (verErr) {
         localDispatchState = 'uncertain';
         round = updateRound(round.id, {
@@ -7289,8 +7347,8 @@ async function retryEditTurn(page, args) {
       round = updateRound(round.id, {
         dispatchState: 'accepted',
         dispatchAcceptedAt: nowIso(),
-        acceptedUserTurn: attestation.acceptedTurn,
-        editAttestation: { method: attestation.attestationMethod },
+        acceptedUserTurn: serverAttestation.acceptedTurn,
+        editAttestation: { method: serverAttestation.attestationMethod },
         versionAttestation,
       }, 'round_dispatch_accepted') || round;
 
