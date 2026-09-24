@@ -65,6 +65,10 @@ const ROUND_STATE_PATH = path.join(SCHEDULER_DIR, 'rounds.json');
 const ROUND_EVENTS_PATH = path.join(SCHEDULER_DIR, 'rounds.jsonl');
 const LINEAGE_STATE_PATH = path.join(SCHEDULER_DIR, 'lineage.json');
 const LINEAGE_EVENTS_PATH = path.join(SCHEDULER_DIR, 'lineage.jsonl');
+const RECOVERY_INCIDENTS_PATH = path.join(SCHEDULER_DIR, 'recovery-incidents.json');
+const RECOVERY_EVENTS_PATH = path.join(SCHEDULER_DIR, 'recovery-incidents.jsonl');
+const RECOVERY_LEASES_DIR = path.join(SCHEDULER_DIR, 'recovery-leases');
+const RECOVERY_ARTIFACTS_DIR = path.join(OUTPUT_DIR, 'recovery');
 const SCHEDULER_LOCK_PATH = path.join(SCHEDULER_DIR, '.lock');
 const BRACKETED_PASTE_ON = '\x1b[?2004h';
 const BRACKETED_PASTE_OFF = '\x1b[?2004l';
@@ -302,6 +306,9 @@ function parseArgs(argv) {
     recoveryIncidentId: '',
     retryEdit: '',
     editSuffix: '.',
+    branchTurn: '',
+    recoverBranchId: '',
+    autoRecover: false,
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
@@ -379,6 +386,7 @@ function parseArgs(argv) {
       }
     }
     else if (arg === '--recover-branch') args.recoverBranchId = next();
+    else if (arg === '--auto-recover') args.autoRecover = true;
     else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -6578,6 +6586,423 @@ async function retryEditTurn(page, args) {
   return await withBrowserLaneLease(args, randomId('stage1-edit-op'), action);
 }
 
+
+function validateAutoRecoverMode(args) {
+  if (!args.autoRecover) return;
+
+  const rawTarget = args.expectedSessionId || args.conversation || '';
+  if (!rawTarget || !STABLE_SESSION_ID_RE.test(rawTarget)) {
+    throw cbError('RECOVERY_TARGET_REQUIRED', '--auto-recover requires an explicit stable conversation: --conversation <uuid>');
+  }
+  args.expectedSessionId = rawTarget;
+
+  if (!args.recoveryIncidentId?.trim()) {
+    throw cbError('RECOVERY_INCIDENT_REQUIRED', '--auto-recover requires an explicit incident identifier: --recovery-incident <id>');
+  }
+
+  const conflicting = [
+    args.message,
+    args.newConversation,
+    args.recoveryResend,
+    args.retryEdit,
+    args.branchTurn,
+    args.recoverBranchId,
+    args.schedule,
+    args.runQueue,
+    args.queueStatus,
+    args.queueWatch,
+    args.recoverQueue,
+    args.stop,
+    args.status,
+    args.watchState,
+    args.waitReady,
+    args.syncTranscript,
+    args.latestAssistant,
+    args.dismissBlocker,
+    Boolean(args.searchQuery),
+    args.models,
+    args.compactConversation,
+    args.handoffNewSession,
+    args.recoverInterrupted,
+    args.downloadArtifacts,
+  ];
+  if (conflicting.some(Boolean)) {
+    throw cbError('INVALID_RECOVERY_MODE', '--auto-recover cannot be combined with another primary operation or prompt');
+  }
+
+  if (args.timeout === undefined || args.timeout === 120) {
+    args.timeout = 0;
+  }
+}
+
+function loadRecoveryIncidentsState() {
+  if (!fs.existsSync(RECOVERY_INCIDENTS_PATH)) {
+    return { version: 1, updatedAt: '', incidents: [] };
+  }
+  try {
+    const raw = fs.readFileSync(RECOVERY_INCIDENTS_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.incidents)) {
+      throw cbError('INCIDENT_STATE_CORRUPT', 'recovery-incidents.json has invalid schema');
+    }
+    return parsed;
+  } catch (err) {
+    if (err.code === 'INCIDENT_STATE_CORRUPT') throw err;
+    throw cbError('INCIDENT_STATE_CORRUPT', `Failed to parse recovery-incidents.json: ${err.message || err}`);
+  }
+}
+
+function saveRecoveryIncidentsState(state) {
+  atomicWriteJson(RECOVERY_INCIDENTS_PATH, state);
+}
+
+function registerRecoveryIncident(incidentId, parentSessionId, sourceUserTurnRef, branchAnchorTurnRef, sourcePromptPath, sourcePromptHash) {
+  return withSchedulerLock(() => {
+    const state = loadRecoveryIncidentsState();
+    const existing = state.incidents.find(i => i.id === incidentId);
+    if (existing) return existing;
+
+    const record = {
+      id: incidentId,
+      operationKind: 'auto_recovery',
+      parentSessionId,
+      sourceUserTurnRef,
+      branchAnchorTurnRef,
+      sourcePromptPath,
+      sourcePromptHash,
+      state: 'prepared',
+      stage1RoundId: '',
+      stage2RoundId: '',
+      stage3BranchId: '',
+      finalSessionId: '',
+      finalOutcome: '',
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      pid: process.pid,
+      lastError: '',
+    };
+    state.incidents.push(record);
+    state.updatedAt = record.updatedAt;
+    saveRecoveryIncidentsState(state);
+    appendJsonl(RECOVERY_EVENTS_PATH, {
+      type: 'incident_registered',
+      at: record.createdAt,
+      incident: record,
+    });
+    return record;
+  });
+}
+
+function updateRecoveryIncident(incidentId, patch, eventType = 'incident_updated') {
+  return withSchedulerLock(() => {
+    const state = loadRecoveryIncidentsState();
+    const incident = state.incidents.find(i => i.id === incidentId);
+    if (!incident) return null;
+
+    Object.assign(incident, patch);
+    incident.updatedAt = nowIso();
+    state.updatedAt = incident.updatedAt;
+    saveRecoveryIncidentsState(state);
+
+    appendJsonl(RECOVERY_EVENTS_PATH, {
+      type: eventType,
+      at: incident.updatedAt,
+      incident,
+    });
+    return incident;
+  });
+}
+
+function recoveryIncidentLeasePath(incidentId) {
+  return path.join(RECOVERY_LEASES_DIR, `${incidentId}.lock`);
+}
+
+async function acquireRecoveryIncidentLease(incidentId, token = randomId('incident-lease')) {
+  fs.mkdirSync(RECOVERY_LEASES_DIR, { recursive: true });
+  const leasePath = recoveryIncidentLeasePath(incidentId);
+
+  return withSchedulerLock(() => {
+    if (fs.existsSync(leasePath)) {
+      try {
+        const current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+        if (current.pid && processExists(current.pid) && current.token !== token) {
+          throw cbError('INCIDENT_BUSY', `Recovery incident ${incidentId} is currently held by active PID ${current.pid}`);
+        }
+      } catch (err) {
+        if (err.code === 'INCIDENT_BUSY') throw err;
+      }
+    }
+    const payload = {
+      incidentId,
+      token,
+      pid: process.pid,
+      acquiredAt: nowIso(),
+    };
+    atomicWriteJson(leasePath, payload);
+    return { incidentId, token, leasePath };
+  });
+}
+
+function releaseRecoveryIncidentLease(leaseHandle) {
+  if (!leaseHandle?.leasePath || !leaseHandle?.token) return;
+  const { leasePath, token } = leaseHandle;
+  return withSchedulerLock(() => {
+    try {
+      if (fs.existsSync(leasePath)) {
+        const current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
+        if (current.token === token) {
+          fs.unlinkSync(leasePath);
+        }
+      }
+    } catch {}
+  });
+}
+
+async function captureAndFreezeSourcePrompt(page, sourceUserTurn, incidentId) {
+  const { editor } = await openUserTurnEditor(page, sourceUserTurn);
+  const rawText = await editor.textContent().catch(() => '');
+  const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+  const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+  if (await cancelBtn.isVisible().catch(() => false)) {
+    await cancelBtn.click().catch(() => {});
+  }
+  await page.waitForTimeout(300);
+
+  if (!rawText.trim()) {
+    throw cbError('EDIT_SOURCE_UNVERIFIED', 'Failed to capture non-empty raw editor source prompt');
+  }
+
+  const promptDir = path.join(RECOVERY_ARTIFACTS_DIR, incidentId);
+  fs.mkdirSync(promptDir, { recursive: true });
+  const promptPath = path.join(promptDir, 'source-prompt.txt');
+  fs.writeFileSync(promptPath, rawText, 'utf8');
+  const promptHash = crypto.createHash('sha256').update(rawText).digest('hex');
+
+  return { promptPath, promptHash, rawText };
+}
+
+async function captureBranchAnchorTurn(page, sourceUserTurn) {
+  const canonicalTurns = await getConversationTurns(page).catch(() => []);
+  if (!canonicalTurns || !canonicalTurns.length) {
+    throw cbError('RECOVERY_ANCHOR_NOT_FOUND', 'Could not extract canonical conversation turns to locate branch anchor');
+  }
+
+  const userIdx = canonicalTurns.findIndex(t =>
+    (sourceUserTurn.id && (t.messageId === sourceUserTurn.id || t.id === sourceUserTurn.id)) ||
+    (sourceUserTurn.testid && t.testid === sourceUserTurn.testid)
+  );
+  if (userIdx === -1) {
+    throw cbError('RECOVERY_ANCHOR_NOT_FOUND', 'Source user turn not found in canonical turns');
+  }
+
+  let anchorTurn = null;
+  for (let i = userIdx - 1; i >= 0; i--) {
+    if (canonicalTurns[i].role === 'assistant') {
+      anchorTurn = canonicalTurns[i];
+      break;
+    }
+  }
+
+  if (!anchorTurn) {
+    throw cbError('RECOVERY_ANCHOR_NOT_FOUND', 'No prior assistant turn exists preceding the source user turn');
+  }
+
+  return {
+    messageId: anchorTurn.messageId || anchorTurn.id || '',
+    id: anchorTurn.messageId || anchorTurn.id || '',
+    testid: anchorTurn.testid || '',
+    role: 'assistant',
+    text: anchorTurn.text,
+    textHash: messageHash(normalizeTurnText(anchorTurn.text)),
+  };
+}
+
+async function autoRecoverConversationTurn(page, args) {
+  await prepareConversationForRead(page, args);
+  const expectedParentSessionId = args.expectedSessionId;
+  if (!expectedParentSessionId) {
+    throw cbError('RECOVERY_TARGET_REQUIRED', 'Auto-recovery requires an existing stable conversation');
+  }
+
+  const incidentId = args.recoveryIncidentId;
+  if (!incidentId) {
+    throw cbError('RECOVERY_INCIDENT_REQUIRED', 'Auto-recovery requires an explicit incident identifier');
+  }
+
+  const incidentLease = await acquireRecoveryIncidentLease(incidentId);
+
+  try {
+    let state = loadRecoveryIncidentsState();
+    let incident = state.incidents.find(i => i.id === incidentId);
+
+    // Phase 1: Initialize and freeze incident inputs if not yet registered
+    if (!incident) {
+      await assertThreadIdentity(page, expectedParentSessionId, 'before auto-recovery initialization');
+      await syncTranscriptFromPage(page, args);
+
+      const resolution = await resolveEditableUserTurn(page, 'latest', args.editSuffix || '.');
+      const sourceUserTurn = resolution.sourceUser;
+
+      const { promptPath, promptHash } = await captureAndFreezeSourcePrompt(page, sourceUserTurn, incidentId);
+      const branchAnchorTurnRef = await captureBranchAnchorTurn(page, sourceUserTurn);
+
+      incident = registerRecoveryIncident(
+        incidentId,
+        expectedParentSessionId,
+        sourceUserTurn,
+        branchAnchorTurnRef,
+        promptPath,
+        promptHash
+      );
+      info(`[auto-recover] Initialized and froze incident ${incidentId} (parent ${expectedParentSessionId}, anchor ${branchAnchorTurnRef.messageId || branchAnchorTurnRef.testid})`);
+    }
+
+    // Phase 2: Stage 1 execution (In-place edit)
+    if (incident.state === 'prepared' || incident.state === 'stage1_running') {
+      incident = updateRecoveryIncident(incidentId, { state: 'stage1_running' }) || incident;
+
+      const stage1Args = {
+        ...args,
+        retryEdit: incident.sourceUserTurnRef.messageId || incident.sourceUserTurnRef.testid || 'latest',
+        editSuffix: args.editSuffix || '.',
+        recoveryIncidentId: incidentId,
+      };
+
+      try {
+        const res = await retryEditTurn(page, stage1Args);
+        incident = updateRecoveryIncident(incidentId, {
+          state: 'completed_stage1',
+          stage1RoundId: res?.round?.id || '',
+          finalSessionId: incident.parentSessionId,
+          finalOutcome: 'stage1_succeeded',
+        }) || incident;
+        info(`[auto-recover] Stage 1 succeeded for incident ${incidentId}`);
+        return { incident, state: 'completed_stage1', sessionId: incident.parentSessionId };
+      } catch (err) {
+        const roundState = loadRoundState();
+        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 1);
+        const isTerminalModelFailure = (
+          round?.dispatchState === 'accepted' &&
+          round?.status === 'failed' &&
+          (err.code === 'ASSISTANT_TERMINAL_ERROR' || round.lastError?.includes('refusal') || round.lastError?.includes('blocked'))
+        );
+
+        if (isTerminalModelFailure) {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage1_terminal_failed',
+            stage1RoundId: round?.id || '',
+            lastError: err.message || String(err),
+          }) || incident;
+          info(`[auto-recover] Stage 1 proven terminal model failure; escalating to Stage 2`);
+        } else {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage1_needs_reconciliation',
+            stage1RoundId: round?.id || '',
+            lastError: err.message || String(err),
+          }) || incident;
+          throw err;
+        }
+      }
+    }
+
+    // Phase 3: Stage 2 execution (Same-session resend with auto-discriminator)
+    if (incident.state === 'stage1_terminal_failed' || incident.state === 'stage2_running') {
+      incident = updateRecoveryIncident(incidentId, { state: 'stage2_running' }) || incident;
+
+      const rawPrompt = fs.readFileSync(incident.sourcePromptPath, 'utf8');
+      const stage2Args = {
+        ...args,
+        recoveryResend: true,
+        message: rawPrompt,
+        recoveryIncidentId: incidentId,
+      };
+
+      try {
+        await prepareConversationForRead(page, stage2Args);
+        const action = async () => {
+          if (stage2Args.expectedSessionId && sessionIdFromUrl(page.url()) !== stage2Args.expectedSessionId) {
+            await openConversationBySessionId(page, stage2Args.expectedSessionId);
+          }
+          await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
+          await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
+          await syncTranscriptFromPage(page, stage2Args);
+          return await ask(page, rawPrompt, stage2Args);
+        };
+        const responseText = await withBrowserLaneLease(stage2Args, randomId('stage2-resend-op'), action);
+
+        const roundState = loadRoundState();
+        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
+
+        incident = updateRecoveryIncident(incidentId, {
+          state: 'completed_stage2',
+          stage2RoundId: round?.id || '',
+          finalSessionId: incident.parentSessionId,
+          finalOutcome: 'stage2_succeeded',
+        }) || incident;
+        info(`[auto-recover] Stage 2 succeeded for incident ${incidentId}`);
+        return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId, responseText };
+      } catch (err) {
+        const roundState = loadRoundState();
+        const round = roundState.rounds.find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
+        const isTerminalModelFailure = (
+          round?.dispatchState === 'accepted' &&
+          round?.status === 'failed' &&
+          (err.code === 'ASSISTANT_TERMINAL_ERROR' || round.lastError?.includes('refusal') || round.lastError?.includes('blocked'))
+        );
+
+        if (isTerminalModelFailure) {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage2_terminal_failed',
+            stage2RoundId: round?.id || '',
+            lastError: err.message || String(err),
+          }) || incident;
+          info(`[auto-recover] Stage 2 proven terminal model failure; escalating to Stage 3`);
+        } else {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'stage2_needs_reconciliation',
+            stage2RoundId: round?.id || '',
+            lastError: err.message || String(err),
+          }) || incident;
+          throw err;
+        }
+      }
+    }
+
+    // Phase 4: Stage 3 execution (Native backend branching at frozen anchor)
+    if (incident.state === 'stage2_terminal_failed' || incident.state === 'stage3_running') {
+      incident = updateRecoveryIncident(incidentId, { state: 'stage3_running' }) || incident;
+
+      const stage3Args = {
+        ...args,
+        branchTurn: incident.branchAnchorTurnRef.messageId || incident.branchAnchorTurnRef.testid,
+        recoveryIncidentId: incidentId,
+      };
+
+      try {
+        const res = await branchConversationTurn(page, stage3Args);
+        incident = updateRecoveryIncident(incidentId, {
+          state: 'completed_stage3_bound',
+          stage3BranchId: res.branchRecord?.id || '',
+          finalSessionId: res.childSessionId,
+          finalOutcome: 'stage3_bound',
+        }) || incident;
+        info(`[auto-recover] Stage 3 succeeded (bound to child ${res.childSessionId}) for incident ${incidentId}`);
+        return { incident, state: 'completed_stage3_bound', childSessionId: res.childSessionId, childUrl: res.childUrl };
+      } catch (err) {
+        incident = updateRecoveryIncident(incidentId, {
+          state: 'stage3_needs_reconciliation',
+          lastError: err.message || String(err),
+        }) || incident;
+        throw err;
+      }
+    }
+
+    return { incident, state: incident.state };
+  } finally {
+    try { releaseRecoveryIncidentLease(incidentLease); } catch {}
+  }
+}
+
 function validateRecoverBranchMode(args) {
   if (!args.recoverBranchId) return;
 
@@ -9183,6 +9608,7 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  validateAutoRecoverMode(args);
   validateRecoverBranchMode(args);
   reconcileIncompleteBranches();
 
@@ -9338,6 +9764,12 @@ async function main() {
 
     if (args.retryEdit) {
       await retryEditTurn(page, args);
+      return;
+    }
+
+    if (args.autoRecover) {
+      const result = await autoRecoverConversationTurn(page, args);
+      console.log(`[auto-recover] State: ${result.state} (session: ${result.sessionId || result.childSessionId || ''})`);
       return;
     }
 
@@ -9504,6 +9936,14 @@ module.exports = {
   validateRecoverBranchMode,
   resolveBranchableTurn,
   openBranchMenu,
+  validateAutoRecoverMode,
+  loadRecoveryIncidentsState,
+  saveRecoveryIncidentsState,
+  registerRecoveryIncident,
+  updateRecoveryIncident,
+  acquireRecoveryIncidentLease,
+  releaseRecoveryIncidentLease,
+  autoRecoverConversationTurn,
   branchConversationTurn,
   recoverCandidateBranchLineage,
   loadLineageState,

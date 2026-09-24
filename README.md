@@ -147,6 +147,22 @@ without fabricating ancestry (leaving ancestral turns cleanly linked in backend 
 and guarantees that no user prompt is automatically sent as part of the branch transaction.
 Stage 3 is a one-shot operation requiring `--conversation <parent-uuid>` and `--recovery-incident <id>`.
 
+`--auto-recover`:
+Unified 3-stage automated recovery coordinator. Orchestrates the full in-session recovery
+escalation hierarchy across Stages 1, 2, and 3 under proof-driven escalation:
+1. **Incident Initialization**: Acquires incident coordinator lease, freezes exact raw source prompt text
+   into `outputs/recovery/<id>/source-prompt.txt` (persisting SHA-256), freezes `branchAnchorTurnRef`
+   (nearest clean assistant turn preceding the failed prompt), and writes entry to `recovery-incidents.json` / `jsonl`.
+2. **Stage 1 (In-Place Edit)**: Executes `--retry-edit` with visible discriminator (`.`). If model succeeds,
+   marks incident `completed_stage1`. If proven terminal model failure occurs, escalates to Stage 2.
+   If automation uncertainty occurs (`stage1_needs_reconciliation`), stops safely without escalating.
+3. **Stage 2 (Same-Session Resend)**: Executes `--recovery-resend` using the frozen raw prompt text and
+   automatic `[Recovery Stage 2: <id>]` discriminator. If model succeeds, marks incident `completed_stage2`.
+   If proven terminal model failure occurs, escalates to Stage 3.
+4. **Stage 3 (Native Backend Branching)**: Executes `--branch-turn` targeting the frozen `branchAnchorTurnRef`.
+   Attests live DOM divider and marks incident `completed_stage3_bound`.
+Requires `--conversation <parent-uuid>` and `--recovery-incident <id>`. Mutually exclusive with other primary commands.
+
 `--recover-branch <branch-id>`:
 Inspects or safely completes a stranded Stage 3 branch transaction from the lineage ledger. If the record is in `stable_candidate`
 or `destination_unverified` with an identified candidate child UUID, and `--cdp` is provided, performs read-only browser-backed

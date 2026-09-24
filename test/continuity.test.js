@@ -60,6 +60,14 @@ const {
   branchConversationTurn,
   recoverCandidateBranchLineage,
   openBranchMenu,
+  validateAutoRecoverMode,
+  loadRecoveryIncidentsState,
+  saveRecoveryIncidentsState,
+  registerRecoveryIncident,
+  updateRecoveryIncident,
+  acquireRecoveryIncidentLease,
+  releaseRecoveryIncidentLease,
+  autoRecoverConversationTurn,
   loadLineageState,
   registerPendingBranch,
   updateBranchLineage,
@@ -2334,4 +2342,103 @@ test('openBranchMenu: fails closed if baseline visible menus snapshot throws', a
     async () => openBranchMenu(mockPageBaselineFail, { messageId: 'm1' }),
     (err) => err.code === 'BRANCH_ACTION_UNVERIFIED' && /Could not snapshot visible action menus/.test(err.message)
   );
+});
+
+test('validateAutoRecoverMode: enforces conversation, incident ID, and exclusivity against other primary operations', () => {
+  const validUuid = '11111111-2222-4333-8444-555555555555';
+
+  assert.doesNotThrow(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid, recoveryIncidentId: 'INC-100' });
+  });
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, recoveryIncidentId: 'INC-100' });
+  }, /--auto-recover requires an explicit stable conversation/);
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid });
+  }, /--auto-recover requires an explicit incident identifier/);
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid, recoveryIncidentId: 'INC-100', message: 'hello' });
+  }, /--auto-recover cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid, recoveryIncidentId: 'INC-100', branchTurn: 'latest' });
+  }, /--auto-recover cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid, recoveryIncidentId: 'INC-100', retryEdit: 'latest' });
+  }, /--auto-recover cannot be combined with another primary operation/);
+
+  assert.throws(() => {
+    validateAutoRecoverMode({ autoRecover: true, conversation: validUuid, recoveryIncidentId: 'INC-100', recoveryResend: true });
+  }, /--auto-recover cannot be combined with another primary operation/);
+});
+
+test('registerRecoveryIncident and updateRecoveryIncident: persist state and journal events to recovery-incidents.jsonl', () => {
+  const incidentId = 'INC-LEDGER-TEST';
+  const parentSessionId = '11111111-2222-4333-8444-555555555555';
+  const userTurnRef = { messageId: 'msg-u1', role: 'user', textHash: 'hash-u1' };
+  const anchorTurnRef = { messageId: 'msg-a0', role: 'assistant', textHash: 'hash-a0' };
+  const promptPath = '/tmp/fake-prompt.txt';
+  const promptHash = 'abc123hash';
+
+  const registered = registerRecoveryIncident(
+    incidentId,
+    parentSessionId,
+    userTurnRef,
+    anchorTurnRef,
+    promptPath,
+    promptHash
+  );
+
+  assert.equal(registered.id, incidentId);
+  assert.equal(registered.state, 'prepared');
+  assert.equal(registered.parentSessionId, parentSessionId);
+
+  // Verify idempotency
+  const dup = registerRecoveryIncident(
+    incidentId,
+    parentSessionId,
+    userTurnRef,
+    anchorTurnRef,
+    promptPath,
+    promptHash
+  );
+  assert.equal(dup.id, incidentId);
+
+  // Update
+  const updated = updateRecoveryIncident(incidentId, {
+    state: 'stage1_running',
+    stage1RoundId: 'round-s1-test',
+  });
+  assert.equal(updated.state, 'stage1_running');
+  assert.equal(updated.stage1RoundId, 'round-s1-test');
+
+  // Verify disk state
+  const state = loadRecoveryIncidentsState();
+  const found = state.incidents.find(i => i.id === incidentId);
+  assert.ok(found);
+  assert.equal(found.state, 'stage1_running');
+});
+
+test('acquireRecoveryIncidentLease: enforces single-runner exclusivity per incident and releases cleanly', async () => {
+  const incidentId = 'INC-LEASE-TEST';
+  const lease1 = await acquireRecoveryIncidentLease(incidentId);
+  assert.ok(lease1);
+
+  // Second acquisition attempt should fail with INCIDENT_BUSY
+  await assert.rejects(
+    async () => acquireRecoveryIncidentLease(incidentId, 'token-2'),
+    (err) => err.code === 'INCIDENT_BUSY'
+  );
+
+  // Release
+  releaseRecoveryIncidentLease(lease1);
+
+  // Should succeed after release
+  const lease2 = await acquireRecoveryIncidentLease(incidentId, 'token-2');
+  assert.ok(lease2);
+  releaseRecoveryIncidentLease(lease2);
 });
