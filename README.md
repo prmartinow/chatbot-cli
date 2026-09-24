@@ -62,7 +62,7 @@ node CB.js --search "project name" --search-all
 node CB.js --search "project name" --search-open 1
 node CB.js --dismiss-blocker
 node CB.js --export-context-summary
-node CB.js --recovery-resend --conversation <id> --message "..."
+node CB.js --recovery-resend --recovery-incident <incident-id> --conversation <id> --message "..."
 node CB.js --recover-interrupted
 ```
 

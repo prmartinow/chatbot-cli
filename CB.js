@@ -5932,6 +5932,25 @@ function validateRecoveryMode(args) {
   if (args.schedule || args.runQueue || args.queueWatch || args.queueStatus || args.recoverQueue) {
     throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with scheduling or queue operations');
   }
+  const conflictingRecoveryActions = [
+    args.status,
+    args.watchState,
+    args.waitReady,
+    args.syncTranscript,
+    args.latestAssistant,
+    args.dismissBlocker,
+    Boolean(args.searchQuery),
+    args.models,
+    args.stop,
+    args.compactConversation,
+    args.handoffNewSession,
+    args.recoverInterrupted,
+    args.downloadCanvas,
+    args.downloadCode,
+  ];
+  if (conflictingRecoveryActions.some(Boolean)) {
+    throw cbError('INVALID_RECOVERY_MODE', '--recovery-resend cannot be combined with another primary operation');
+  }
   if (typeof args.message !== 'string' || !args.message.trim()) {
     throw cbError('RECOVERY_MESSAGE_REQUIRED', '--recovery-resend is a one-shot operation and requires non-empty --message');
   }

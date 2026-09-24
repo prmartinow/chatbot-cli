@@ -1083,3 +1083,29 @@ test('prepareRecoveryResendTarget: navigates to target conversation before invok
   assert.equal(actionLog[1], 'reload');
   assert.equal(mockPage.url(), `https://chatgpt.com/c/${targetId}`);
 });
+
+test('validateRecoveryMode: rejects combination with conflicting primary operations', () => {
+  // Rejects --stop
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: 'hi', recoveryIncidentId: 'INC-1', stop: true }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Rejects --status
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: 'hi', recoveryIncidentId: 'INC-1', status: true }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Rejects --watch-state
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: 'hi', recoveryIncidentId: 'INC-1', watchState: true }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+
+  // Rejects --sync-transcript
+  assert.throws(
+    () => validateRecoveryMode({ recoveryResend: true, message: 'hi', recoveryIncidentId: 'INC-1', syncTranscript: true }),
+    (err) => err.code === 'INVALID_RECOVERY_MODE'
+  );
+});
