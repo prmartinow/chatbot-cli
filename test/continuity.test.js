@@ -1256,3 +1256,78 @@ test('waitForEditedTurnAccepted: attests revised user turn in DOM by edited hash
   assert.equal(attestation.acceptedTurn.textHash, editedHash);
   assert.equal(attestation.attestationMethod, 'same_message_id_edited_hash');
 });
+
+test('parseArgs: parses --retry-edit flag with peek helper without ReferenceError', () => {
+  const args1 = parseArgs(['node', 'CB.js', '--retry-edit', 'latest', '--recovery-incident', 'INC-1', '--conversation', '11111111-1111-4111-8111-111111111111']);
+  assert.equal(args1.retryEdit, 'latest');
+  assert.equal(args1.recoveryIncidentId, 'INC-1');
+
+  // Bare flag defaults to 'latest'
+  const args2 = parseArgs(['node', 'CB.js', '--retry-edit', '--recovery-incident', 'INC-2', '--conversation', '11111111-1111-4111-8111-111111111111']);
+  assert.equal(args2.retryEdit, 'latest');
+  assert.equal(args2.recoveryIncidentId, 'INC-2');
+});
+
+test('WAL Round Lineage Persistence: registerPendingRound persists Stage-1 source turns and hashes', () => {
+  const mockArgs = { cdp: 'http://127.0.0.1:9241' };
+  const mockPage = { url: () => 'https://chatgpt.com/c/11111111-1111-4111-8111-111111111111' };
+  const round = registerPendingRound(mockArgs, mockPage, 'Edited prompt text.', 'turn-1', {
+    expectedSessionId: '11111111-1111-4111-8111-111111111111',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    recoveryIncidentId: 'INC-STAGE1-TEST',
+    sourceUserTurn: { id: 'msg-u1', testid: 'turn-1', textHash: 'hash1' },
+    sourceAssistantTurn: { id: 'msg-a1', testid: 'turn-2', textHash: 'hash2' },
+    originalMessageHash: 'hash1',
+    editedMessageHash: 'hash1_edited',
+    editSuffix: '.',
+    dispatchState: 'prepared',
+  });
+
+  assert.equal(round.operationKind, 'edit_retry');
+  assert.equal(round.recoveryStage, 1);
+  assert.equal(round.recoveryIncidentId, 'INC-STAGE1-TEST');
+  assert.deepEqual(round.sourceUserTurn, { id: 'msg-u1', testid: 'turn-1', textHash: 'hash1' });
+  assert.deepEqual(round.sourceAssistantTurn, { id: 'msg-a1', testid: 'turn-2', textHash: 'hash2' });
+  assert.equal(round.originalMessageHash, 'hash1');
+  assert.equal(round.editedMessageHash, 'hash1_edited');
+  assert.equal(round.editSuffix, '.');
+});
+
+test('waitForEditedTurnAccepted: rejects ambiguous multiple structural matches', async () => {
+  const targetId = '99999999-9999-4999-8999-999999999999';
+  const editedText = 'Ambiguous duplicate prompt.';
+  const editedHash = messageHash(normalizeTurnText(editedText));
+
+  const mockPage = {
+    url: () => `https://chatgpt.com/c/${targetId}`,
+    $$eval: async (selector, fn) => {
+      // Return 2 identical matching user turns with different IDs/testids
+      const mockElements = [
+        {
+          getAttribute: (name) => name === 'data-message-id' ? 'msg-u_old' : null,
+          closest: () => ({ getAttribute: () => 'conversation-turn-1' }),
+          textContent: editedText
+        },
+        {
+          getAttribute: (name) => name === 'data-message-id' ? 'msg-u_middle' : null,
+          closest: () => ({ getAttribute: () => 'conversation-turn-3' }),
+          textContent: editedText
+        },
+        {
+          getAttribute: (name) => name === 'data-message-id' ? 'msg-u_latest' : null,
+          closest: () => ({ getAttribute: () => 'conversation-turn-5' }),
+          textContent: 'Unrelated latest'
+        }
+      ];
+      return fn(mockElements);
+    },
+    waitForTimeout: async () => {},
+  };
+
+  // Multiple candidates and neither matches source ID -> fails closed
+  await assert.rejects(
+    async () => waitForEditedTurnAccepted(mockPage, { id: 'msg-target', testid: 'turn-target' }, editedHash, targetId, 500),
+    (err) => err.code === 'EDIT_ATTRIBUTION_UNVERIFIED'
+  );
+});

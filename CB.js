@@ -312,6 +312,7 @@ function parseArgs(argv) {
       if (i + 1 >= argv.length) throw new Error(`Missing value for ${arg}`);
       return argv[++i];
     };
+    const peek = () => (i + 1 < argv.length ? argv[i + 1] : '');
 
     if (arg === '--message' || arg === '-m') args.message = next();
     else if (arg === '--timeout') {
@@ -1330,6 +1331,12 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     operationKind: extra.operationKind || 'prompt',
     recoveryStage: Number(extra.recoveryStage) || 0,
     recoveryIncidentId: extra.recoveryIncidentId || '',
+    sourceUserTurn: extra.sourceUserTurn || null,
+    sourceAssistantTurn: extra.sourceAssistantTurn || null,
+    originalMessageHash: extra.originalMessageHash || '',
+    editedMessageHash: extra.editedMessageHash || '',
+    editSuffix: extra.editSuffix || '',
+    editAttestation: extra.editAttestation || null,
     status: 'pending',
     dispatchState: extra.dispatchState || 'prepared',
     sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
@@ -6084,7 +6091,8 @@ async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalTex
   }
 
   await editor.focus();
-  await page.keyboard.press('Control+A').catch(() => {});
+  const selectAllKey = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
+  await page.keyboard.press(selectAllKey).catch(() => {});
   await page.keyboard.press('Backspace').catch(() => {});
   await page.keyboard.insertText(editedText);
   await page.waitForTimeout(300);
@@ -6112,7 +6120,16 @@ async function submitEditedUserTurn(page, editor, expectedSessionId) {
   }
 
   await assertThreadIdentity(page, expectedSessionId, 'immediately before edit submission');
-  await sendBtn.click();
+  const generation = await getCombinedGenerationState(page).catch(() => ({ isGenerating: false }));
+  if (generation.isGenerating) {
+    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw cbError('CONVERSATION_BUSY', 'Generation became active before edit could be submitted');
+  }
+
+  return sendBtn;
 }
 
 async function waitForEditedTurnAccepted(page, sourceUserTurn, editedHash, expectedSessionId, timeoutMs = 15000) {
@@ -6126,26 +6143,55 @@ async function waitForEditedTurnAccepted(page, sourceUserTurn, editedHash, expec
       text: e.textContent || ''
     })));
 
-    for (let i = turns.length - 1; i >= 0; i--) {
+    const matchingTurns = [];
+    for (let i = 0; i < turns.length; i++) {
       const turn = turns[i];
       const h = messageHash(normalizeTurnText(turn.text));
       if (h === editedHash) {
-        let method = 'unknown';
-        if (turn.id && turn.id === sourceUserTurn.id) {
-          method = 'same_message_id_edited_hash';
-        } else if (turn.testid && turn.testid === sourceUserTurn.testid) {
-          method = 'same_testid_edited_hash';
-        } else {
-          method = 'structural_latest_edited_hash';
-        }
+        matchingTurns.push({ turn, index: i });
+      }
+    }
+
+    if (matchingTurns.length > 0) {
+      // 1. Same messageId match
+      const sameId = matchingTurns.find(m => m.turn.id && m.turn.id === sourceUserTurn.id);
+      if (sameId) {
         return {
           acceptedTurn: {
-            messageId: turn.id,
-            testid: turn.testid,
+            messageId: sameId.turn.id,
+            testid: sameId.turn.testid,
             role: 'user',
-            textHash: h,
+            textHash: editedHash,
           },
-          attestationMethod: method,
+          attestationMethod: 'same_message_id_edited_hash',
+        };
+      }
+
+      // 2. Same testid match
+      const sameTestid = matchingTurns.find(m => m.turn.testid && m.turn.testid === sourceUserTurn.testid);
+      if (sameTestid) {
+        return {
+          acceptedTurn: {
+            messageId: sameTestid.turn.id,
+            testid: sameTestid.turn.testid,
+            role: 'user',
+            textHash: editedHash,
+          },
+          attestationMethod: 'same_testid_edited_hash',
+        };
+      }
+
+      // 3. Structural fallback: requires exactly ONE candidate and it MUST be the latest user turn
+      if (matchingTurns.length === 1 && matchingTurns[0].index === turns.length - 1) {
+        const candidate = matchingTurns[0].turn;
+        return {
+          acceptedTurn: {
+            messageId: candidate.id,
+            testid: candidate.testid,
+            role: 'user',
+            textHash: editedHash,
+          },
+          attestationMethod: 'structural_latest_edited_hash',
         };
       }
     }
@@ -6168,63 +6214,78 @@ async function retryEditTurn(page, args) {
       await openConversationBySessionId(page, expectedSessionId);
     }
     await reloadExactConversation(page, expectedSessionId, 'stage1-edit-reload');
-    await assertThreadIdentity(page, expectedSessionId, 'before stage1 edit preparation');
 
-    const state = await getTargetAppState(page);
-    if (state.generating) {
-      throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 1 edit retry while generation is active');
-    }
+    const provisionalRoundId = randomId('round-edit');
+    const leaseHandle = await acquireConversationLease(expectedSessionId, provisionalRoundId);
 
-    const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
-    const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
-
-    const roundExtra = {
-      expectedSessionId,
-      operationKind: 'edit_retry',
-      recoveryStage: 1,
-      recoveryIncidentId: args.recoveryIncidentId || '',
-      sourceUserTurn: sourceUser,
-      sourceAssistantTurn: sourceAssistant,
-      originalMessageHash: originalHash,
-      editedMessageHash: editedHash,
-      editSuffix: args.editSuffix || '.',
-      dispatchState: 'prepared',
-    };
-    const round = registerPendingRound(args, page, editedText, sourceUser.testid, roundExtra);
-    const leaseHandle = await acquireConversationLease(expectedSessionId, round.id);
-
+    let round = null;
     try {
+      await assertThreadIdentity(page, expectedSessionId, 'before stage1 edit preparation');
+
+      const preState = await getTargetAppState(page);
+      const generation = await getCombinedGenerationState(page, preState);
+      if (generation.isGenerating) {
+        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 1 edit retry while generation is active');
+      }
+
+      await syncTranscriptFromPage(page, args);
+
+      const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
+      const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
+
+      const roundExtra = {
+        expectedSessionId,
+        operationKind: 'edit_retry',
+        recoveryStage: 1,
+        recoveryIncidentId: args.recoveryIncidentId || '',
+        sourceUserTurn: sourceUser,
+        sourceAssistantTurn: sourceAssistant,
+        originalMessageHash: originalHash,
+        editedMessageHash: editedHash,
+        editSuffix: args.editSuffix || '.',
+        dispatchState: 'prepared',
+      };
+      round = registerPendingRound(args, page, editedText, sourceUser.testid, roundExtra);
+
       const { editor } = await openUserTurnEditor(page, sourceUser);
       await populateAndVerifyEditor(page, editor, sourceUser, originalText, editedText);
 
-      round.dispatchState = 'dispatching';
-      round.dispatchStartedAt = new Date().toISOString();
-      recordRoundEvent('round_dispatch_started', round);
+      const sendBtn = await submitEditedUserTurn(page, editor, expectedSessionId);
+
+      updateRound(round.id, {
+        dispatchState: 'dispatching',
+        dispatchStartedAt: nowIso(),
+      }, 'round_dispatching');
 
       try {
-        await submitEditedUserTurn(page, editor, expectedSessionId);
+        await sendBtn.click();
       } catch (submitErr) {
-        round.dispatchState = 'uncertain';
-        round.lastError = submitErr.message;
-        recordRoundEvent('round_dispatch_uncertain', round);
-        throw cbError('EDIT_DISPATCH_UNCERTAIN', `Stage 1 edit submit uncertainty: ${submitErr.message}`);
+        updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: submitErr.message || String(submitErr),
+        }, 'round_dispatch_uncertain');
+        throw cbError('EDIT_DISPATCH_UNCERTAIN', `Stage 1 edit submit uncertainty: ${submitErr.message || submitErr}`);
       }
 
       let attestation;
       try {
         attestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId);
       } catch (attestErr) {
-        round.dispatchState = 'uncertain';
-        round.lastError = attestErr.message;
-        recordRoundEvent('round_dispatch_uncertain', round);
+        updateRound(round.id, {
+          status: 'pending',
+          dispatchState: 'uncertain',
+          lastError: attestErr.message || String(attestErr),
+        }, 'round_dispatch_uncertain');
         throw attestErr;
       }
 
-      round.dispatchState = 'accepted';
-      round.dispatchAcceptedAt = new Date().toISOString();
-      round.acceptedUserTurn = attestation.acceptedTurn;
-      round.editAttestation = { method: attestation.attestationMethod };
-      recordRoundEvent('round_dispatch_accepted', round);
+      updateRound(round.id, {
+        dispatchState: 'accepted',
+        dispatchAcceptedAt: nowIso(),
+        acceptedUserTurn: attestation.acceptedTurn,
+        editAttestation: { method: attestation.attestationMethod },
+      }, 'round_dispatch_accepted');
 
       const authoritativeSessionId = expectedSessionId || round.sessionId;
       args.transcript = args.transcriptOverride ? args.transcript : transcriptPathForSession(authoritativeSessionId);
@@ -6244,7 +6305,8 @@ async function retryEditTurn(page, args) {
           streamer ? (event) => streamer.update(event) : null,
           {
             expectedSessionId: authoritativeSessionId,
-            acceptedUserTurnRef: round.acceptedUserTurn,
+            acceptedUserTurnRef: attestation.acceptedTurn,
+            priorAssistantTurnRef: sourceAssistant,
           }
         );
       } catch (error) {
@@ -6274,6 +6336,15 @@ async function retryEditTurn(page, args) {
 
       info(`[stage1] Successfully completed Stage 1 recovery edit for ${expectedSessionId}`);
       return { response, round };
+    } catch (err) {
+      if (round && round.dispatchState === 'prepared') {
+        updateRound(round.id, {
+          status: 'failed',
+          dispatchState: 'aborted_precommit',
+          lastError: err.message || String(err),
+        }, 'round_aborted');
+      }
+      throw err;
     } finally {
       if (leaseHandle) {
         await releaseConversationLease(leaseHandle);
@@ -7017,7 +7088,7 @@ function createStreamPrinter(args, baseline = null) {
 }
 
 async function waitForAssistantResponse(page, message, baselineLastTurnId, timeout, onUpdate = null, options = {}) {
-  const { expectedSessionId = '', acceptedUserTurnRef = null } = options;
+  const { expectedSessionId = '', acceptedUserTurnRef = null, priorAssistantTurnRef = null } = options;
   const start = Date.now();
   const noTimeout = timeout === 0 || timeout === Infinity;
   let lastText = '';
@@ -7041,6 +7112,15 @@ async function waitForAssistantResponse(page, message, baselineLastTurnId, timeo
           expectedSessionId,
           concurrentUserTurn: outcome.concurrentUserTurn,
         });
+      }
+      if (priorAssistantTurnRef && outcome.assistantTurn) {
+        const isSameTurnId = (priorAssistantTurnRef.id && outcome.assistantTurn.id === priorAssistantTurnRef.id) ||
+                             (priorAssistantTurnRef.testid && outcome.assistantTurn.testid === priorAssistantTurnRef.testid);
+        const isSameHash = messageHash(normalizeTurnText(outcome.assistantTurn.text)) === priorAssistantTurnRef.textHash;
+        if (isSameTurnId && isSameHash) {
+          outcome.assistantTurn = null;
+          outcome.text = '';
+        }
       }
       text = outcome.text;
     } else {
@@ -8487,6 +8567,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseArgs,
   validateStage1Mode,
   resolveEditableUserTurn,
   openUserTurnEditor,
