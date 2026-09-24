@@ -1557,6 +1557,10 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
 
       if (round.dispatchState === 'prepared' || round.dispatchState === 'preparing') {
         if (!processExists(round.pid)) {
+          if (round.dispatchState === 'preparing' && round.versionProbe) {
+            // Leave probed preparing round for dedicated reconcileStage1EditTurn to restore active branch!
+            continue;
+          }
           Object.assign(round, {
             status: 'failed',
             dispatchState: 'aborted_precommit',
@@ -6758,52 +6762,61 @@ async function reconcileStage1EditTurn(page, args, round) {
           await page.waitForTimeout(300);
 
           const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
-          if ((await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false))) {
-            await variantsBtn.click().catch(() => {});
-            await page.waitForTimeout(400);
+          const hasVariants = (await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false));
+          if (!hasVariants) {
+            throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Variants action button absent or invisible after reload during preparing restoration');
+          }
 
-            const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
-            const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
-            if (!(await closeBtn.count().catch(() => 0))) {
-              throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Version viewer close button not found during preparing restoration');
+          await variantsBtn.click().catch(() => {});
+          await page.waitForTimeout(400);
+
+          const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
+          const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+          if (!(await closeBtn.count().catch(() => 0))) {
+            throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Version viewer close button not found during preparing restoration');
+          }
+
+          const targetKind = round.versionProbe.initialLabelKind || 'current';
+          const targetIndex = round.versionProbe.initialActiveIndex;
+
+          if (targetKind === 'current') {
+            const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+            while ((await nextBtn.count().catch(() => 0)) > 0 && !(await nextBtn.isDisabled().catch(() => true))) {
+              await nextBtn.click().catch(() => {});
+              await page.waitForTimeout(200);
             }
-
-            const targetKind = round.versionProbe.initialLabelKind || 'current';
-            const targetIndex = round.versionProbe.initialActiveIndex;
-
-            if (targetKind === 'current') {
-              const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
-              while ((await nextBtn.count().catch(() => 0)) > 0 && !(await nextBtn.isDisabled().catch(() => true))) {
-                await nextBtn.click().catch(() => {});
-                await page.waitForTimeout(200);
-              }
-            } else if (typeof targetIndex === 'number') {
-              let cur = await resolveNumericVersionIndex(page, viewerHeader);
-              const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
-              const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
-              while (cur.numericIndex > targetIndex && !(await prevBtn.isDisabled().catch(() => true))) {
-                await prevBtn.click();
-                await page.waitForTimeout(200);
-                cur = await resolveNumericVersionIndex(page, viewerHeader);
-              }
-              while (cur.numericIndex < targetIndex && !(await nextBtn.isDisabled().catch(() => true))) {
-                await nextBtn.click();
-                await page.waitForTimeout(200);
-                cur = await resolveNumericVersionIndex(page, viewerHeader);
-              }
-              if (cur.numericIndex !== targetIndex) {
-                throw cbError('EDIT_VERSION_RESTORE_FAILED', `Failed to restore numeric version ${targetIndex}, ended at ${cur.numericIndex}`);
-              }
+          } else if (typeof targetIndex === 'number') {
+            let cur = await resolveNumericVersionIndex(page, viewerHeader);
+            const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
+            const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+            while (cur.numericIndex > targetIndex && !(await prevBtn.isDisabled().catch(() => true))) {
+              await prevBtn.click();
+              await page.waitForTimeout(200);
+              cur = await resolveNumericVersionIndex(page, viewerHeader);
             }
+            while (cur.numericIndex < targetIndex && !(await nextBtn.isDisabled().catch(() => true))) {
+              await nextBtn.click();
+              await page.waitForTimeout(200);
+              cur = await resolveNumericVersionIndex(page, viewerHeader);
+            }
+            if (cur.numericIndex !== targetIndex) {
+              throw cbError('EDIT_VERSION_RESTORE_FAILED', `Failed to restore numeric version ${targetIndex}, ended at ${cur.numericIndex}`);
+            }
+          }
 
-            await closeBtn.click().catch(() => {});
-            await page.waitForTimeout(300);
+          await closeBtn.click().catch(() => {});
+          await page.waitForTimeout(300);
 
-            // Re-attest user turn hash matches initialUserHash
-            const turns = await getConversationTurns(page);
-            const restoredUser = turns.find(t => t.role === 'user' && sameTurnRevision(t, sourceUser));
-            if (!restoredUser || !turnRevisionMatchesRef(restoredUser, sourceUser)) {
-              throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Restored user turn does not match initial user revision');
+          // Re-attest user turn hash matches initialUserHash
+          const turns = await getConversationTurns(page);
+          const restoredUser = turns.find(t => t.role === 'user' && sameTurnRevision(t, sourceUser));
+          if (!restoredUser || !turnRevisionMatchesRef(restoredUser, sourceUser)) {
+            throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Restored user turn does not match initial user revision');
+          }
+          if (round.versionProbe.initialAssistantRef) {
+            const restoredAssistant = turns.find(t => t.role === 'assistant' && sameTurnRevision(t, round.versionProbe.initialAssistantRef));
+            if (!restoredAssistant || !turnRevisionMatchesRef(restoredAssistant, round.versionProbe.initialAssistantRef)) {
+              throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Restored assistant turn does not match initial assistant revision');
             }
           }
 
@@ -7060,7 +7073,7 @@ async function retryEditTurn(page, args) {
 
       // Preliminary non-authoritative observation to allow in-flight network dispatch
       try {
-        await page.waitForSelector('textarea[data-id="root"]', { state: 'detached', timeout: 3000 });
+        await page.locator('#prompt-textarea, [data-testid="composer-input"], div[contenteditable="true"]').first().waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
       } catch {}
       await page.waitForTimeout(500);
 

@@ -3571,6 +3571,99 @@ test('reconcileStage1EditTurn: recovers crashed preparing round by positively re
   const resPre = await reconcileStage1EditTurn({}, {}, preProbeRound);
   assert.equal(resPre.outcome, 'aborted_precommit');
   assert.equal(resPre.round.dispatchState, 'aborted_precommit');
+
+  // 3. Positive branch restoration succeeds and re-attests source revision
+  let closeClicked = false;
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isDisabled: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakeTurnRoot = {
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePageSuccess = {
+    url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    bringToFront: async () => {},
+    reload: async () => {},
+    waitForLoadState: async () => {},
+    waitForSelector: async () => ({}),
+    waitForTimeout: async () => {},
+    evaluate: async (fn) => {
+      if (typeof fn === 'function' && fn.toString().includes('sessionIdFromLocation')) {
+        return { hydrated: true, sessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', turnCount: 1, roleNodeCount: 1, composerVisible: true };
+      }
+      return [
+        { role: 'user', testid: 'turn-u1', text: 'Original text' },
+      ];
+    },
+    locator: (sel) => {
+      if (sel.includes('turn-u1')) {
+        return { first: () => fakeTurnRoot };
+      }
+      if (sel.includes('Previous version')) {
+        return { last: () => fakeHeader };
+      }
+      if (sel.includes('close-button')) {
+        return {
+          last: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => { closeClicked = true; },
+          }),
+        };
+      }
+      return {
+        first: () => ({ count: async () => 0, waitFor: async () => {} }),
+        last: () => ({ count: async () => 0, waitFor: async () => {} }),
+      };
+    },
+  };
+
+  const origHash = messageHash(normalizeTurnText('Original text'));
+  const successRound = {
+    id: 'round-prep-succ',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'preparing',
+    status: 'pending',
+    expectedSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    sourceUserTurn: { testid: 'turn-u1', text: 'Original text', textHash: origHash },
+    versionProbe: {
+      initialActiveIndex: 2,
+      initialLabelKind: 'current',
+    },
+  };
+
+  const resSucc = await reconcileStage1EditTurn(fakePageSuccess, {}, successRound);
+  assert.equal(resSucc.outcome, 'aborted_precommit');
+  assert.equal(resSucc.round.dispatchState, 'aborted_precommit');
+  assert.equal(closeClicked, true);
 });
 
 test('reconcileStage1EditTurn: proves numeric K+1 under Current version via predecessor probe', async () => {
