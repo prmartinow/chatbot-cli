@@ -1533,7 +1533,7 @@ test('sameTurnRevision: enforces messageId precedence over testid and requires h
   assert.strictEqual(sameTurnRevision({ testid: 'conversation-turn-2', text: 'Stopped response text' }, { testid: 'conversation-turn-2', textHash: hash }), true);
 });
 
-test('retryEditTurn orchestrator validations and WAL state transitions', async () => {
+test('Stage-1 local dispatch-state and validation invariants', async () => {
   // 1. Rejects missing target session
   await assert.rejects(
     () => retryEditTurn({}, { retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1' }),
