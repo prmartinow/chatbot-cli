@@ -3349,3 +3349,195 @@ test('stage1CommitIsAttested: validates complete dual-vector attestation and rej
     versionAttestation: { ...validRound.versionAttestation, nextDisabled: false },
   }), false);
 });
+
+test('resolveBranchableTurn: rejects mutation if anchor revision hash drifts with ANCHOR_REVISION_DRIFT', async () => {
+  const fakePage = {
+    evaluate: async () => [
+      { role: 'user', messageId: 'u1', text: 'Prompt 1' },
+      { role: 'assistant', messageId: 'a1', text: 'Original Assistant Response' },
+    ],
+  };
+
+  // Correct anchor hash succeeds
+  const expectedHash = messageHash(normalizeTurnText('Original Assistant Response'));
+  const res = await resolveBranchableTurn(fakePage, 'latest', expectedHash);
+  assert.equal(res.messageId, 'a1');
+  assert.equal(res.textHash, expectedHash);
+
+  // Drifted anchor hash throws ANCHOR_REVISION_DRIFT
+  await assert.rejects(
+    async () => resolveBranchableTurn(fakePage, 'latest', 'frozen-stale-hash-99999'),
+    (err) => err.code === 'ANCHOR_REVISION_DRIFT'
+  );
+});
+
+test('attestEditedUserTurnVersion: resolves numeric K+1 when active version label is Current version via predecessor probe', async () => {
+  let closeClicked = false;
+  const baseline = { count: 2, activeIndex: 2 };
+  const editedText = 'Rendered edited content for current version test';
+  const expectedHash = messageHash(normalizeTurnText(editedText));
+
+  let currentLabel = 'Current version';
+  let nextDisabled = true;
+  let prevDisabled = false;
+
+  const fakeHeader = {
+    locator: (sel) => {
+      if (sel.includes('Version') || sel.includes('Current version')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            innerText: async () => currentLabel,
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => prevDisabled,
+            click: async () => {
+              currentLabel = 'Version 2';
+              nextDisabled = false;
+            },
+          }),
+        };
+      }
+      if (sel.includes('Next version')) {
+        return {
+          first: () => ({
+            isDisabled: async () => nextDisabled,
+            click: async () => {
+              currentLabel = 'Current version';
+              nextDisabled = true;
+            },
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0 }) };
+    },
+  };
+
+  const fakePage = {
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('Previous version')) {
+        return {
+          last: () => fakeHeader,
+        };
+      }
+      if (sel.includes('close-button')) {
+        return {
+          last: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => { closeClicked = true; },
+          }),
+        };
+      }
+      return {
+        first: () => ({ count: async () => 0, isVisible: async () => false }),
+        last: () => ({ count: async () => 0, isVisible: async () => false }),
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const fakeTurnRoot = {
+    count: async () => 1,
+    scrollIntoViewIfNeeded: async () => {},
+    hover: async () => {},
+    locator: (sel) => {
+      if (sel.includes('variants-turn-action-button')) {
+        return {
+          first: () => ({
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {},
+          }),
+        };
+      }
+      if (sel.includes('user')) {
+        return {
+          first: () => ({
+            innerText: async () => editedText,
+          }),
+        };
+      }
+      return { first: () => ({ count: async () => 0, isVisible: async () => false }) };
+    },
+  };
+
+  const sourceUser = {
+    testid: 'turn-u-curr',
+    text: editedText,
+    textHash: expectedHash,
+  };
+
+  // Mock resolveUserTurnRoot
+  fakePage.locator = (sel) => {
+    if (sel.includes('turn-u-curr')) {
+      return {
+        first: () => fakeTurnRoot,
+      };
+    }
+    if (sel.includes('Previous version')) {
+      return {
+        last: () => fakeHeader,
+      };
+    }
+    if (sel.includes('close-button')) {
+      return {
+        last: () => ({
+          count: async () => 1,
+          isVisible: async () => true,
+          click: async () => { closeClicked = true; },
+        }),
+      };
+    }
+    return {
+      first: () => ({ count: async () => 0 }),
+      last: () => ({ count: async () => 0 }),
+    };
+  };
+
+  const attestation = await attestEditedUserTurnVersion(fakePage, sourceUser, baseline, expectedHash);
+  assert.equal(attestation.acceptedCount, 3);
+  assert.equal(attestation.baselineCount, 2);
+  assert.equal(attestation.labelKind, 'current');
+  assert.equal(attestation.nextDisabled, true);
+  assert.equal(attestation.contentHash, expectedHash);
+  assert.equal(closeClicked, true);
+});
+
+test('reconcileStage1EditTurn: recovers crashed preparing round by marking aborted_precommit', async () => {
+  const preparingRound = {
+    id: 'round-prep-1',
+    operationKind: 'edit_retry',
+    recoveryStage: 1,
+    dispatchState: 'preparing',
+    status: 'pending',
+    expectedSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    versionProbe: {
+      initialActiveIndex: 2,
+      initialLabelKind: 'current',
+    },
+  };
+
+  const fakePage = {
+    url: () => 'https://chatgpt.com/c/6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    reload: async () => {},
+  };
+
+  const res = await reconcileStage1EditTurn(fakePage, {}, preparingRound);
+  assert.equal(res.outcome, 'aborted_precommit');
+  assert.equal(res.round.dispatchState, 'aborted_precommit');
+  assert.equal(res.round.status, 'failed');
+});

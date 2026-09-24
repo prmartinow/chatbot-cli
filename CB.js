@@ -1555,7 +1555,7 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
     for (const round of state.rounds) {
       if (round.status !== 'pending') continue;
 
-      if (round.dispatchState === 'prepared') {
+      if (round.dispatchState === 'prepared' || round.dispatchState === 'preparing') {
         if (!processExists(round.pid)) {
           Object.assign(round, {
             status: 'failed',
@@ -6504,7 +6504,7 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header');
   }
 
-  async function readVersionIndex() {
+  async function resolveNumericVersionIndex() {
     let labelEl = viewerHeader.locator('div:has-text("Version")').first();
     if (!(await labelEl.count().catch(() => 0))) {
       labelEl = viewerHeader.locator('div:has-text("Current version")').first();
@@ -6516,22 +6516,44 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
     }
     const text = await labelEl.innerText().catch(() => '');
-    if (/Current version/i.test(text)) {
-      return 'current';
-    }
     const m = text.match(/Version\s*(\d+)/i);
-    if (!m) {
-      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
+    if (m) {
+      return { numericIndex: parseInt(m[1], 10), labelKind: 'numeric' };
     }
-    return parseInt(m[1], 10);
+    if (/Current version/i.test(text)) {
+      const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
+      const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+      const isPrevDisabled = await prevBtn.isDisabled().catch(() => false);
+      if (isPrevDisabled) {
+        return { numericIndex: 1, labelKind: 'current' };
+      }
+      await prevBtn.click();
+      await page.waitForTimeout(250);
+      let predLabelEl = viewerHeader.locator('div:has-text("Version")').first();
+      if (!(await predLabelEl.count().catch(() => 0))) {
+        predLabelEl = viewerHeader.locator('div.font-semibold').first();
+      }
+      const predText = await predLabelEl.innerText().catch(() => '');
+      const predM = predText.match(/Version\s*(\d+)/i);
+      if (!predM) {
+        throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Failed to resolve predecessor numeric version from label "${predText}"`);
+      }
+      const predIndex = parseInt(predM[1], 10);
+      await nextBtn.click();
+      await page.waitForTimeout(250);
+      return { numericIndex: predIndex + 1, labelKind: 'current' };
+    }
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
   }
 
-  const initialIndex = await readVersionIndex();
+  const initialResolution = await resolveNumericVersionIndex();
+  const initialIndex = initialResolution.numericIndex;
 
   if (roundId) {
     updateRound(roundId, {
       versionProbe: {
-        initialActiveIndex: initialIndex,
+        initialLabelKind: initialResolution.labelKind,
+        initialActiveIndex: initialResolution.numericIndex,
         initialUserHash: sourceUserTurn.textHash || messageHash(normalizeTurnText(sourceUserTurn.text)),
         initialAssistantRef: sourceAssistantTurn,
         probedAt: nowIso(),
@@ -6553,11 +6575,11 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     }
     if (isNextDisabled) break;
     traversalSteps++;
-    const before = typeof currentIndex === 'number' ? currentIndex : 1;
+    const before = currentIndex;
     await nextBtn.click();
     await page.waitForTimeout(250);
-    const readVal = await readVersionIndex();
-    currentIndex = readVal === 'current' ? before + 1 : readVal;
+    const readVal = await resolveNumericVersionIndex();
+    currentIndex = readVal.numericIndex;
     if (currentIndex !== before + 1) {
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Next version step failed: expected ${before + 1}, got ${currentIndex}`);
     }
@@ -6579,8 +6601,8 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     const before = currentIndex;
     await prevBtn.click();
     await page.waitForTimeout(250);
-    const readVal = await readVersionIndex();
-    currentIndex = readVal === 'current' ? before - 1 : readVal;
+    const readVal = await resolveNumericVersionIndex();
+    currentIndex = readVal.numericIndex;
     if (currentIndex !== before - 1) {
       throw cbError('EDIT_VERSION_RESTORE_FAILED', `Previous version step failed: expected ${before - 1}, got ${currentIndex}`);
     }
@@ -6610,6 +6632,7 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
   return {
     count: totalCount,
     activeIndex: initialIndex,
+    labelKind: initialResolution.labelKind,
     activeRenderedHash: sourceUserTurn.textHash || messageHash(normalizeTurnText(sourceUserTurn.text)),
     method: 'variants_ui_traversal',
     capturedAt: nowIso(),
@@ -6642,7 +6665,7 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
     throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header after edit');
   }
 
-  async function readVersionIndex() {
+  async function resolveNumericVersionIndex() {
     let labelEl = viewerHeader.locator('div:has-text("Version")').first();
     if (!(await labelEl.count().catch(() => 0))) {
       labelEl = viewerHeader.locator('div:has-text("Current version")').first();
@@ -6654,17 +6677,38 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
       throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Version indicator label element not found in viewer header');
     }
     const text = await labelEl.innerText().catch(() => '');
-    if (/Current version/i.test(text)) {
-      return 'current';
-    }
     const m = text.match(/Version\s*(\d+)/i);
-    if (!m) {
-      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
+    if (m) {
+      return { numericIndex: parseInt(m[1], 10), labelKind: 'numeric' };
     }
-    return parseInt(m[1], 10);
+    if (/Current version/i.test(text)) {
+      const prevBtn = viewerHeader.locator('button[aria-label="Previous version"]').first();
+      const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
+      const isPrevDisabled = await prevBtn.isDisabled().catch(() => false);
+      if (isPrevDisabled) {
+        return { numericIndex: 1, labelKind: 'current' };
+      }
+      await prevBtn.click();
+      await page.waitForTimeout(250);
+      let predLabelEl = viewerHeader.locator('div:has-text("Version")').first();
+      if (!(await predLabelEl.count().catch(() => 0))) {
+        predLabelEl = viewerHeader.locator('div.font-semibold').first();
+      }
+      const predText = await predLabelEl.innerText().catch(() => '');
+      const predM = predText.match(/Version\s*(\d+)/i);
+      if (!predM) {
+        throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Failed to resolve predecessor numeric version from label "${predText}"`);
+      }
+      const predIndex = parseInt(predM[1], 10);
+      await nextBtn.click();
+      await page.waitForTimeout(250);
+      return { numericIndex: predIndex + 1, labelKind: 'current' };
+    }
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
   }
 
-  const activeVersion = await readVersionIndex();
+  const activeResolution = await resolveNumericVersionIndex();
+  const activeVersion = activeResolution.numericIndex;
   const nextBtn = viewerHeader.locator('button[aria-label="Next version"]').first();
   let isNextDisabled;
   try {
@@ -6675,10 +6719,9 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
   }
 
   const expectedVersion = baseline.count + 1;
-  const isExpectedVersion = (activeVersion === expectedVersion || (activeVersion === 'current' && isNextDisabled));
-  if (!isExpectedVersion || !isNextDisabled) {
+  if (activeVersion !== expectedVersion || !isNextDisabled) {
     await closeBtn.click().catch(() => {});
-    throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt Version ${expectedVersion} with Next disabled, got Version ${activeVersion} (nextDisabled: ${isNextDisabled})`);
+    throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt Version ${expectedVersion} with Next disabled, got numeric Version ${activeVersion} (labelKind: ${activeResolution.labelKind}, nextDisabled: ${isNextDisabled})`);
   }
 
   const userMessageEl = turnRoot.locator('[data-message-author-role="user"]').first();
@@ -6697,6 +6740,7 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
     baselineCount: baseline.count,
     acceptedCount: expectedVersion,
     acceptedIndex: activeVersion,
+    labelKind: activeResolution.labelKind,
     contentHash: displayedHash,
     nextDisabled: true,
     method: 'variants_ui',
@@ -6722,13 +6766,47 @@ async function reconcileStage1EditTurn(page, args, round) {
   if (!round || round.operationKind !== 'edit_retry' || round.recoveryStage !== 1) {
     return { outcome: 'not_applicable', round };
   }
+  if (round.dispatchState === 'preparing') {
+    if (round.versionProbe) {
+      const sessionId = round.expectedSessionId || round.sessionId;
+      if (sessionId && typeof page.reload === 'function') {
+        try {
+          await reloadExactConversation(page, sessionId, 'stage1-reconcile-preparing-reload');
+          const sourceUser = round.sourceUserTurn;
+          if (sourceUser) {
+            const turnRoot = await resolveUserTurnRoot(page, sourceUser).catch(() => null);
+            if (turnRoot) {
+              const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
+              if ((await variantsBtn.count().catch(() => 0)) > 0 && (await variantsBtn.isVisible().catch(() => false))) {
+                await variantsBtn.click().catch(() => {});
+                await page.waitForTimeout(300);
+                const nextBtn = page.locator('button[aria-label="Next version"]').last();
+                while ((await nextBtn.count().catch(() => 0)) > 0 && !(await nextBtn.isDisabled().catch(() => true))) {
+                  await nextBtn.click().catch(() => {});
+                  await page.waitForTimeout(200);
+                }
+                const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
+                await closeBtn.click().catch(() => {});
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+    const updated = updateRound(round.id, {
+      status: 'failed',
+      dispatchState: 'aborted_precommit',
+      lastError: 'Process crashed during Stage 1 version baseline preparation; active branch restored',
+    }, 'round_aborted_precommit');
+    return { outcome: 'aborted_precommit', round: updated || Object.assign(round, { status: 'failed', dispatchState: 'aborted_precommit' }) };
+  }
   if (round.dispatchState === 'prepared') {
     const updated = updateRound(round.id, {
       status: 'failed',
       dispatchState: 'aborted_precommit',
       lastError: 'Process exited before Stage 1 edit submission',
     }, 'round_aborted_precommit');
-    return { outcome: 'aborted_precommit', round: updated || round };
+    return { outcome: 'aborted_precommit', round: updated || Object.assign(round, { status: 'failed', dispatchState: 'aborted_precommit' }) };
   }
   if (round.dispatchState === 'accepted') {
     if (stage1CommitIsAttested(round)) {
@@ -6950,6 +7028,12 @@ async function retryEditTurn(page, args) {
           lastError: submitErr.message || String(submitErr),
         }, 'round_dispatch_uncertain') || round;
         throw cbError('EDIT_DISPATCH_UNCERTAIN', `Stage 1 edit submit uncertainty: ${submitErr.message || submitErr}`);
+      }
+
+      // Exact Thread Reload as a Commit Barrier against frontend pretense:
+      // Wipes optimistic frontend memory; forces hydration from ChatGPT backend database.
+      if (typeof page.reload === 'function') {
+        await reloadExactConversation(page, expectedSessionId, 'stage1-post-submit-rehydration');
       }
 
       let attestation;
@@ -7705,7 +7789,7 @@ function validateStage3Mode(args) {
   }
 }
 
-async function resolveBranchableTurn(page, selection = 'latest') {
+async function resolveBranchableTurn(page, selection = 'latest', expectedAnchorRevisionHash = null) {
   const canonicalTurns = await getConversationTurns(page).catch(() => []);
   if (!canonicalTurns || !canonicalTurns.length) {
     throw cbError('BRANCH_SOURCE_UNVERIFIED', 'Could not extract canonical conversation turns from page');
@@ -7744,13 +7828,21 @@ async function resolveBranchableTurn(page, selection = 'latest') {
     }
   }
 
+  const computedHash = messageHash(normalizeTurnText(targetTurn.text));
+  if (expectedAnchorRevisionHash && computedHash !== expectedAnchorRevisionHash) {
+    throw cbError(
+      'ANCHOR_REVISION_DRIFT',
+      `Resolved anchor turn ${targetTurn.messageId || targetTurn.testid} text hash ${computedHash} does not match expected frozen anchor hash ${expectedAnchorRevisionHash}`
+    );
+  }
+
   return {
     messageId: targetTurn.messageId || targetTurn.id || '',
     id: targetTurn.messageId || targetTurn.id || '',
     testid: targetTurn.testid || '',
     role: 'assistant',
     text: targetTurn.text,
-    textHash: messageHash(normalizeTurnText(targetTurn.text)),
+    textHash: computedHash,
   };
 }
 
@@ -7982,7 +8074,7 @@ async function branchConversationTurn(page, args) {
 
       await syncTranscriptFromPage(page, args);
 
-      const sourceAssistant = await resolveBranchableTurn(page, args.branchTurn || 'latest');
+      const sourceAssistant = await resolveBranchableTurn(page, args.branchTurn || 'latest', args.expectedAnchorRevisionHash);
       branchRecord = registerPendingBranch(args, page, sourceAssistant, {
         parentSessionId: expectedParentSessionId,
       });
