@@ -32,6 +32,13 @@ const {
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
+  validateStage1Mode,
+  resolveEditableUserTurn,
+  openUserTurnEditor,
+  populateAndVerifyEditor,
+  submitEditedUserTurn,
+  waitForEditedTurnAccepted,
+  retryEditTurn,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,
@@ -1108,4 +1115,144 @@ test('validateRecoveryMode: rejects combination with conflicting primary operati
     () => validateRecoveryMode({ recoveryResend: true, message: 'hi', recoveryIncidentId: 'INC-1', syncTranscript: true }),
     (err) => err.code === 'INVALID_RECOVERY_MODE'
   );
+});
+
+test('validateStage1Mode: enforces mandatory incident id, distinct suffix, and mode exclusions', () => {
+  // Requires recovery-incident
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: '' }),
+    (err) => err.code === 'RECOVERY_INCIDENT_REQUIRED'
+  );
+
+  // Requires non-empty editSuffix
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '', recoveryIncidentId: 'INC-1' }),
+    (err) => err.code === 'EDIT_SUFFIX_REQUIRED'
+  );
+
+  // Rejects --message
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', message: 'hello' }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+
+  // Rejects --recovery-resend
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', recoveryResend: true }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+
+  // Rejects --new-conversation
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', newConversation: true }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+
+  // Rejects scheduling
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', schedule: true }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+
+  // Rejects conflicting primary actions
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', stop: true }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+
+  assert.throws(
+    () => validateStage1Mode({ retryEdit: 'latest', editSuffix: '.', recoveryIncidentId: 'INC-1', status: true }),
+    (err) => err.code === 'INVALID_STAGE1_MODE'
+  );
+});
+
+test('resolveEditableUserTurn: extracts latest user turn, validates distinct mutation, and rejects whitespace-only suffixes', async () => {
+  const mockPage = {
+    $$eval: async (selector, fn) => {
+      const mockElements = [
+        {
+          getAttribute: (name) => name === 'data-message-author-role' ? 'user' : (name === 'data-message-id' ? 'msg-u1' : null),
+          closest: () => ({ getAttribute: () => 'conversation-turn-1' }),
+          textContent: 'First prompt'
+        },
+        {
+          getAttribute: (name) => name === 'data-message-author-role' ? 'assistant' : (name === 'data-message-id' ? 'msg-a1' : null),
+          closest: () => ({ getAttribute: () => 'conversation-turn-2' }),
+          textContent: 'First answer'
+        },
+        {
+          getAttribute: (name) => name === 'data-message-author-role' ? 'user' : (name === 'data-message-id' ? 'msg-u2' : null),
+          closest: () => ({ getAttribute: () => 'conversation-turn-3' }),
+          textContent: 'Failed request prompt'
+        },
+        {
+          getAttribute: (name) => name === 'data-message-author-role' ? 'assistant' : (name === 'data-message-id' ? 'msg-a2' : null),
+          closest: () => ({ getAttribute: () => 'conversation-turn-4' }),
+          textContent: 'Stopped thinking'
+        },
+      ];
+      return fn(mockElements);
+    }
+  };
+
+  // Trailing space fails EDIT_MUTATION_NOT_DISTINCT due to whitespace normalization
+  await assert.rejects(
+    async () => resolveEditableUserTurn(mockPage, 'latest', '   '),
+    (err) => err.code === 'EDIT_MUTATION_NOT_DISTINCT'
+  );
+
+  // Distinct visible punctuation succeeds
+  const res = await resolveEditableUserTurn(mockPage, 'latest', '.');
+  assert.equal(res.sourceUser.id, 'msg-u2');
+  assert.equal(res.sourceUser.testid, 'conversation-turn-3');
+  assert.equal(res.sourceAssistant.id, 'msg-a2');
+  assert.equal(res.editedText, 'Failed request prompt.');
+  assert.notEqual(res.originalHash, res.editedHash);
+});
+
+test('populateAndVerifyEditor: fails closed with EDIT_EDITOR_MISMATCH if initial content mismatches source text', async () => {
+  let cancelClicked = false;
+  const mockCancel = {
+    isVisible: async () => true,
+    click: async () => { cancelClicked = true; },
+  };
+  const mockContainer = {
+    locator: () => ({ first: () => mockCancel }),
+  };
+  const mockEditor = {
+    textContent: async () => 'Completely unrelated draft text',
+    locator: () => mockContainer,
+  };
+
+  await assert.rejects(
+    async () => populateAndVerifyEditor({}, mockEditor, { id: 'msg-1' }, 'Expected prompt text', 'Expected prompt text.'),
+    (err) => err.code === 'EDIT_EDITOR_MISMATCH'
+  );
+  assert.equal(cancelClicked, true);
+});
+
+test('waitForEditedTurnAccepted: attests revised user turn in DOM by edited hash', async () => {
+  const targetId = '99999999-9999-4999-8999-999999999999';
+  const editedText = 'Prompt with suffix.';
+  const editedHash = messageHash(normalizeTurnText(editedText));
+
+  const mockPage = {
+    url: () => `https://chatgpt.com/c/${targetId}`,
+    $$eval: async (selector, fn) => {
+      const mockElements = [
+        {
+          getAttribute: (name) => name === 'data-message-id' ? 'msg-u2' : null,
+          closest: () => ({ getAttribute: () => 'conversation-turn-3' }),
+          textContent: editedText
+        }
+      ];
+      return fn(mockElements);
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const attestation = await waitForEditedTurnAccepted(mockPage, { id: 'msg-u2', testid: 'conversation-turn-3' }, editedHash, targetId, 2000);
+  assert.equal(attestation.acceptedTurn.messageId, 'msg-u2');
+  assert.equal(attestation.acceptedTurn.textHash, editedHash);
+  assert.equal(attestation.attestationMethod, 'same_message_id_edited_hash');
 });

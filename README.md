@@ -62,6 +62,8 @@ node CB.js --search "project name" --search-all
 node CB.js --search "project name" --search-open 1
 node CB.js --dismiss-blocker
 node CB.js --export-context-summary
+node CB.js --retry-edit latest --recovery-incident <incident-id> --conversation <id>
+node CB.js --retry-edit latest --recovery-incident <incident-id> --edit-suffix "." --conversation <id>
 node CB.js --recovery-resend --recovery-incident <incident-id> --conversation <id> --message "..."
 node CB.js --recover-interrupted
 ```
@@ -110,6 +112,15 @@ If generation is actively in progress, it refuses destructive action and leaves
 the active answer stream intact. If generation has finished and the UI has settled,
 it hydrates the target conversation and verifies the composer is editable without
 performing destructive reloads or clicking Stop.
+
+`--retry-edit [latest]` executes Stage 1 of the in-session recovery hierarchy. It performs
+a mandatory exact-thread clean reload (`reloadExactConversation`), locates the latest
+rendered user turn, verifies that appending `--edit-suffix` (default: `.`) produces a distinct
+turn hash (`EDIT_MUTATION_NOT_DISTINCT` check), opens the turn-scoped inline editor, asserts
+initial content matches the source prompt (`EDIT_EDITOR_MISMATCH`), populates the editor with
+the edited text, registers a pre-send WAL round (`operationKind: 'edit_retry'`), clicks the scoped
+Send button, attests the revised user turn, and passively monitors the regenerated assistant
+descendant until completion. Stage 1 is a one-shot operation requiring `--recovery-incident <id>`.
 
 `--recovery-resend` executes Stage 2 of the in-session recovery hierarchy. It performs
 a mandatory exact-thread clean reload (`reloadExactConversation`) and asserts thread

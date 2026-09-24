@@ -298,6 +298,8 @@ function parseArgs(argv) {
     recoverInterrupted: false,
     recoveryResend: false,
     recoveryIncidentId: '',
+    retryEdit: '',
+    editSuffix: '.',
     downloadArtifacts: false,
     showArtifacts: false,
     stream: true,
@@ -357,6 +359,15 @@ function parseArgs(argv) {
     else if (arg === '--handoff-new-session' || arg === '--compact-handoff' || arg === '--handoff') args.handoffNewSession = true;
     else if (arg === '--recovery-resend') args.recoveryResend = true;
     else if (arg === '--recovery-incident') args.recoveryIncidentId = next();
+    else if (arg === '--retry-edit') {
+      const val = peek();
+      if (val && !val.startsWith('-')) {
+        args.retryEdit = next();
+      } else {
+        args.retryEdit = 'latest';
+      }
+    }
+    else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
     else if (arg === '--show-artifacts') args.showArtifacts = true;
@@ -5923,6 +5934,356 @@ async function openConversationBySessionId(page, sessionId) {
   return hydration;
 }
 
+function validateStage1Mode(args) {
+  if (!args.retryEdit) return;
+
+  if (args.retryEdit !== 'latest') {
+    throw cbError('INVALID_STAGE1_MODE', `--retry-edit currently only supports "latest", got "${args.retryEdit}"`);
+  }
+  if (!args.recoveryIncidentId || !args.recoveryIncidentId.trim()) {
+    throw cbError('RECOVERY_INCIDENT_REQUIRED', '--retry-edit requires --recovery-incident <id>');
+  }
+  if (typeof args.editSuffix !== 'string' || !args.editSuffix.length) {
+    throw cbError('EDIT_SUFFIX_REQUIRED', '--edit-suffix cannot be empty');
+  }
+  if (typeof args.message === 'string' && args.message.length > 0) {
+    throw cbError('INVALID_STAGE1_MODE', '--retry-edit cannot be combined with --message');
+  }
+  if (args.recoveryResend) {
+    throw cbError('INVALID_STAGE1_MODE', '--retry-edit cannot be combined with --recovery-resend');
+  }
+  if (args.newConversation) {
+    throw cbError('INVALID_STAGE1_MODE', '--retry-edit cannot be combined with --new-conversation');
+  }
+  if (args.schedule || args.runQueue || args.queueWatch || args.queueStatus || args.recoverQueue) {
+    throw cbError('INVALID_STAGE1_MODE', '--retry-edit cannot be combined with scheduling or queue operations');
+  }
+  const conflictingStage1Actions = [
+    args.status,
+    args.watchState,
+    args.waitReady,
+    args.syncTranscript,
+    args.latestAssistant,
+    args.dismissBlocker,
+    Boolean(args.searchQuery),
+    args.models,
+    args.stop,
+    args.compactConversation,
+    args.handoffNewSession,
+    args.recoverInterrupted,
+    args.downloadArtifacts,
+  ];
+  if (conflictingStage1Actions.some(Boolean)) {
+    throw cbError('INVALID_STAGE1_MODE', '--retry-edit cannot be combined with another primary operation');
+  }
+}
+
+async function resolveEditableUserTurn(page, selection = 'latest', editSuffix = '.') {
+  const turns = await page.$$eval('[data-message-author-role]', els => els.map(e => ({
+    role: e.getAttribute('data-message-author-role'),
+    id: e.getAttribute('data-message-id') || '',
+    testid: e.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '',
+    text: e.textContent || ''
+  })));
+
+  const userTurns = turns.filter(t => t.role === 'user');
+  if (!userTurns.length) {
+    throw cbError('EDIT_SOURCE_UNVERIFIED', 'No user turns found on active conversation page');
+  }
+
+  const sourceUser = userTurns[userTurns.length - 1];
+  const originalText = sourceUser.text;
+  const originalHash = messageHash(normalizeTurnText(originalText));
+
+  const editedText = `${originalText.trimEnd()}${editSuffix}`;
+  const editedHash = messageHash(normalizeTurnText(editedText));
+
+  if (originalHash === editedHash) {
+    throw cbError('EDIT_MUTATION_NOT_DISTINCT', `Suffix "${editSuffix}" does not produce a distinct turn hash after text normalization`);
+  }
+
+  const sourceUserIdx = turns.findIndex(t => (sourceUser.id && t.id === sourceUser.id) || (sourceUser.testid && t.testid === sourceUser.testid));
+  let sourceAssistant = null;
+  if (sourceUserIdx !== -1 && sourceUserIdx + 1 < turns.length) {
+    const nextTurn = turns[sourceUserIdx + 1];
+    if (nextTurn.role === 'assistant') {
+      sourceAssistant = nextTurn;
+    }
+  }
+
+  return {
+    sourceUser: {
+      id: sourceUser.id,
+      testid: sourceUser.testid,
+      role: 'user',
+      text: originalText,
+      textHash: originalHash,
+    },
+    sourceAssistant: sourceAssistant ? {
+      id: sourceAssistant.id,
+      testid: sourceAssistant.testid,
+      role: 'assistant',
+      textHash: messageHash(normalizeTurnText(sourceAssistant.text)),
+    } : null,
+    originalText,
+    editedText,
+    originalHash,
+    editedHash,
+  };
+}
+
+async function openUserTurnEditor(page, sourceUserTurn) {
+  let turnRoot = null;
+  if (sourceUserTurn.testid) {
+    turnRoot = page.locator(`[data-testid="${sourceUserTurn.testid}"]`).first();
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    if (sourceUserTurn.id) {
+      turnRoot = page.locator(`[data-message-id="${sourceUserTurn.id}"]`).first();
+    }
+  }
+  if (!turnRoot || !(await turnRoot.count().catch(() => 0))) {
+    throw cbError('EDIT_SOURCE_UNVERIFIED', `Could not locate turn root for user turn ${sourceUserTurn.id || sourceUserTurn.testid}`);
+  }
+
+  await turnRoot.scrollIntoViewIfNeeded().catch(() => {});
+  await turnRoot.hover().catch(() => {});
+  await page.waitForTimeout(300);
+
+  const editBtn = turnRoot.locator('button[aria-label="Edit message"], button[aria-label*="Edit"]').first();
+  if (!(await editBtn.count().catch(() => 0)) || !(await editBtn.isVisible().catch(() => false))) {
+    throw cbError('EDIT_CONTROL_NOT_FOUND', `Could not find visible Edit button on user turn ${sourceUserTurn.id || sourceUserTurn.testid}`);
+  }
+
+  await editBtn.click();
+  await page.waitForTimeout(500);
+
+  let editor = null;
+  if (sourceUserTurn.id) {
+    editor = page.locator(`div[id="message-edit-${sourceUserTurn.id}"][contenteditable="true"]`).first();
+  }
+  if (!editor || !(await editor.count().catch(() => 0))) {
+    editor = turnRoot.locator('div[contenteditable="true"].ProseMirror').first();
+  }
+  if (!editor || !(await editor.count().catch(() => 0)) || !(await editor.isVisible().catch(() => false))) {
+    throw cbError('EDIT_EDITOR_NOT_FOUND', `Could not find visible inline editor for user turn ${sourceUserTurn.id || sourceUserTurn.testid}`);
+  }
+
+  return { turnRoot, editor };
+}
+
+async function populateAndVerifyEditor(page, editor, sourceUserTurn, originalText, editedText) {
+  const initialText = await editor.textContent().catch(() => '');
+  if (normalizePromptForRenderedComparison(initialText) !== normalizePromptForRenderedComparison(originalText)) {
+    const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw cbError('EDIT_EDITOR_MISMATCH', 'Initial inline editor text does not match captured source message');
+  }
+
+  await editor.focus();
+  await page.keyboard.press('Control+A').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
+  await page.keyboard.insertText(editedText);
+  await page.waitForTimeout(300);
+
+  const populatedText = await editor.textContent().catch(() => '');
+  if (normalizeTurnText(populatedText) !== normalizeTurnText(editedText)) {
+    const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw cbError('EDIT_EDITOR_POPULATION_FAILED', 'Inline editor content verification failed after text insertion');
+  }
+}
+
+async function submitEditedUserTurn(page, editor, expectedSessionId) {
+  const container = editor.locator('xpath=ancestor::*[.//button[text()="Cancel"] or .//button[text()="Send"]][1]');
+  const sendBtn = container.locator('button:has-text("Send"), button[aria-label="Send"]').first();
+  if (!(await sendBtn.count().catch(() => 0)) || !(await sendBtn.isVisible().catch(() => false))) {
+    const cancelBtn = container.locator('button:has-text("Cancel"), button[aria-label="Cancel"]').first();
+    if (await cancelBtn.isVisible().catch(() => false)) {
+      await cancelBtn.click().catch(() => {});
+    }
+    throw cbError('EDIT_SUBMIT_CONTROL_UNVERIFIED', 'Could not locate scoped Send button for inline editor');
+  }
+
+  await assertThreadIdentity(page, expectedSessionId, 'immediately before edit submission');
+  await sendBtn.click();
+}
+
+async function waitForEditedTurnAccepted(page, sourceUserTurn, editedHash, expectedSessionId, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await assertThreadIdentity(page, expectedSessionId, 'while waiting for edited turn acceptance');
+
+    const turns = await page.$$eval('[data-message-author-role="user"]', els => els.map(e => ({
+      id: e.getAttribute('data-message-id') || '',
+      testid: e.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid') || '',
+      text: e.textContent || ''
+    })));
+
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const turn = turns[i];
+      const h = messageHash(normalizeTurnText(turn.text));
+      if (h === editedHash) {
+        let method = 'unknown';
+        if (turn.id && turn.id === sourceUserTurn.id) {
+          method = 'same_message_id_edited_hash';
+        } else if (turn.testid && turn.testid === sourceUserTurn.testid) {
+          method = 'same_testid_edited_hash';
+        } else {
+          method = 'structural_latest_edited_hash';
+        }
+        return {
+          acceptedTurn: {
+            messageId: turn.id,
+            testid: turn.testid,
+            role: 'user',
+            textHash: h,
+          },
+          attestationMethod: method,
+        };
+      }
+    }
+
+    await page.waitForTimeout(300);
+  }
+
+  throw cbError('EDIT_ATTRIBUTION_UNVERIFIED', 'Timed out waiting for edited user turn to be accepted in DOM');
+}
+
+async function retryEditTurn(page, args) {
+  await prepareConversationForRead(page, args);
+  const expectedSessionId = args.expectedSessionId;
+  if (!expectedSessionId) {
+    throw cbError('EDIT_TARGET_REQUIRED', 'Stage 1 recovery requires an existing stable conversation');
+  }
+
+  const action = async () => {
+    if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+      await openConversationBySessionId(page, expectedSessionId);
+    }
+    await reloadExactConversation(page, expectedSessionId, 'stage1-edit-reload');
+    await assertThreadIdentity(page, expectedSessionId, 'before stage1 edit preparation');
+
+    const state = await getTargetAppState(page);
+    if (state.generating) {
+      throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 1 edit retry while generation is active');
+    }
+
+    const resolution = await resolveEditableUserTurn(page, args.retryEdit || 'latest', args.editSuffix || '.');
+    const { sourceUser, sourceAssistant, originalText, editedText, originalHash, editedHash } = resolution;
+
+    const roundExtra = {
+      expectedSessionId,
+      operationKind: 'edit_retry',
+      recoveryStage: 1,
+      recoveryIncidentId: args.recoveryIncidentId || '',
+      sourceUserTurn: sourceUser,
+      sourceAssistantTurn: sourceAssistant,
+      originalMessageHash: originalHash,
+      editedMessageHash: editedHash,
+      editSuffix: args.editSuffix || '.',
+      dispatchState: 'prepared',
+    };
+    const round = registerPendingRound(args, page, editedText, sourceUser.testid, roundExtra);
+    const leaseHandle = await acquireConversationLease(expectedSessionId, round.id);
+
+    try {
+      const { editor } = await openUserTurnEditor(page, sourceUser);
+      await populateAndVerifyEditor(page, editor, sourceUser, originalText, editedText);
+
+      round.dispatchState = 'dispatching';
+      round.dispatchStartedAt = new Date().toISOString();
+      recordRoundEvent('round_dispatch_started', round);
+
+      try {
+        await submitEditedUserTurn(page, editor, expectedSessionId);
+      } catch (submitErr) {
+        round.dispatchState = 'uncertain';
+        round.lastError = submitErr.message;
+        recordRoundEvent('round_dispatch_uncertain', round);
+        throw cbError('EDIT_DISPATCH_UNCERTAIN', `Stage 1 edit submit uncertainty: ${submitErr.message}`);
+      }
+
+      let attestation;
+      try {
+        attestation = await waitForEditedTurnAccepted(page, sourceUser, editedHash, expectedSessionId);
+      } catch (attestErr) {
+        round.dispatchState = 'uncertain';
+        round.lastError = attestErr.message;
+        recordRoundEvent('round_dispatch_uncertain', round);
+        throw attestErr;
+      }
+
+      round.dispatchState = 'accepted';
+      round.dispatchAcceptedAt = new Date().toISOString();
+      round.acceptedUserTurn = attestation.acceptedTurn;
+      round.editAttestation = { method: attestation.attestationMethod };
+      recordRoundEvent('round_dispatch_accepted', round);
+
+      const authoritativeSessionId = expectedSessionId || round.sessionId;
+      args.transcript = args.transcriptOverride ? args.transcript : transcriptPathForSession(authoritativeSessionId);
+      if (args.transcript) {
+        appendTranscript(args.transcript, 'user', editedText);
+      }
+
+      const watchBaseline = stateBaseline(await getTargetAppState(page));
+      const streamer = (args.stream || args.stateJsonl) ? createStreamPrinter(args, watchBaseline) : null;
+      let response = '';
+      try {
+        response = await waitForAssistantResponse(
+          page,
+          editedText,
+          sourceUser.testid,
+          args.timeout,
+          streamer ? (event) => streamer.update(event) : null,
+          {
+            expectedSessionId: authoritativeSessionId,
+            acceptedUserTurnRef: round.acceptedUserTurn,
+          }
+        );
+      } catch (error) {
+        const observedSessionId = sessionIdFromUrl(page.url());
+        updateRound(round.id, {
+          status: 'pending',
+          lastError: error.message || String(error),
+          observedSessionId,
+          observedUrl: page.url(),
+        }, 'round_waiting_for_recovery');
+        throw error;
+      }
+      if (streamer) streamer.finish();
+
+      if (args.transcript) {
+        appendTranscript(args.transcript, 'assistant', response);
+      }
+
+      updateRound(round.id, {
+        status: 'done',
+        sessionId: authoritativeSessionId,
+        responseChars: response.length,
+        lastError: '',
+        url: authoritativeSessionId ? targetConversationUrl(authoritativeSessionId) : page.url(),
+        transcript: args.transcript,
+      }, 'round_completed');
+
+      info(`[stage1] Successfully completed Stage 1 recovery edit for ${expectedSessionId}`);
+      return { response, round };
+    } finally {
+      if (leaseHandle) {
+        await releaseConversationLease(leaseHandle);
+      }
+    }
+  };
+
+  return await withBrowserLaneLease(args, randomId('stage1-edit-op'), action);
+}
+
 function validateRecoveryMode(args) {
   if (!args.recoveryResend) return;
 
@@ -7859,6 +8220,7 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  validateStage1Mode(args);
   validateRecoveryMode(args);
 
   if (args.queueStatus) {
@@ -7975,6 +8337,11 @@ async function main() {
         : await action();
       if (!text) throw new Error('No completed assistant response found in the live target app DOM');
       console.log(text);
+      return;
+    }
+
+    if (args.retryEdit) {
+      await retryEditTurn(page, args);
       return;
     }
 
@@ -8120,6 +8487,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+  validateStage1Mode,
+  resolveEditableUserTurn,
+  openUserTurnEditor,
+  populateAndVerifyEditor,
+  submitEditedUserTurn,
+  waitForEditedTurnAccepted,
+  retryEditTurn,
   validateRecoveryMode,
   prepareRecoveryResendTarget,
   registerPendingRound,
