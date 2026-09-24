@@ -1076,9 +1076,12 @@ async function getPageTargetId(page) {
   if (typeof page?.context?.newCDPSession === 'function') {
     try {
       const session = await page.context().newCDPSession(page);
-      const { targetInfo } = await session.send('Target.getTargetInfo');
-      await session.detach().catch(() => {});
-      if (targetInfo?.targetId) return targetInfo.targetId;
+      try {
+        const { targetInfo } = await session.send('Target.getTargetInfo');
+        if (targetInfo?.targetId) return targetInfo.targetId;
+      } finally {
+        await session.detach().catch(() => {});
+      }
     } catch {}
   }
   if (typeof page?._targetId === 'string') return page._targetId;
@@ -1122,15 +1125,15 @@ async function withTopologyLease(args, transactionId, fn) {
 function browserLaneLeasePath(args) {
   const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
   let laneScope;
-  if (args?.lane) {
-    laneScope = ['explicit-lane', args.lane, normalizedCdp].join('|');
-  } else if (args?.conversation || args?.expectedSessionId) {
-    const rawConv = args.conversation || args.expectedSessionId;
+  if (args?.pageTargetId || args?.targetId) {
+    const tid = args.pageTargetId || args.targetId;
+    laneScope = ['page-lane', TARGET_APP_BASE.origin, normalizedCdp, tid].join('|');
+  } else if (args?.expectedSessionId || args?.conversation) {
+    const rawConv = args.expectedSessionId || args.conversation;
     const convId = extractConversationId(rawConv);
     laneScope = ['conversation-lane', TARGET_APP_BASE.origin, normalizedCdp, convId].join('|');
-  } else if (args?.targetId || args?.pageTargetId) {
-    const tid = args.targetId || args.pageTargetId;
-    laneScope = ['page-lane', TARGET_APP_BASE.origin, normalizedCdp, tid].join('|');
+  } else if (args?.lane) {
+    laneScope = ['explicit-lane', args.lane, normalizedCdp].join('|');
   } else {
     laneScope = ['bootstrap-lane', TARGET_APP_BASE.origin, normalizedCdp].join('|');
   }
@@ -1146,7 +1149,8 @@ function browserLaneLeasePath(args) {
 
 function acquireBrowserLaneLease(args, transactionId) {
   const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
-  const convId = (args?.conversation || args?.expectedSessionId) ? extractConversationId(args.conversation || args.expectedSessionId) : '';
+  const convId = (args?.expectedSessionId || args?.conversation) ? extractConversationId(args.expectedSessionId || args.conversation) : '';
+  const targetId = args?.pageTargetId || args?.targetId || '';
   return acquireNamedLease(
     browserLaneLeasePath(args),
     {
@@ -1155,7 +1159,7 @@ function acquireBrowserLaneLease(args, transactionId) {
       cdp: normalizedCdp,
       conversationId: convId,
       lane: args?.lane || '',
-      targetId: args?.targetId || args?.pageTargetId || '',
+      targetId,
       targetOrigin: TARGET_APP_BASE.origin,
     },
     'BROWSER_LANE_BUSY',
@@ -1961,6 +1965,16 @@ function printQueueStatus(args) {
 }
 
 async function findTargetAppPage(browser, args = {}) {
+  const assignPage = async (page) => {
+    if (page) {
+      const tid = await getPageTargetId(page);
+      if (tid) {
+        args.pageTargetId = tid;
+      }
+    }
+    return page;
+  };
+
   if (args.targetId || args.pageTargetId) {
     const requestedTid = args.targetId || args.pageTargetId;
     let foundPage = null;
@@ -1977,11 +1991,11 @@ async function findTargetAppPage(browser, args = {}) {
     if (!foundPage) {
       throw cbError('PAGE_TARGET_NOT_FOUND', `No page matches target ID "${requestedTid}"`);
     }
-    return foundPage;
+    return await assignPage(foundPage);
   }
 
   if (args.newTab) {
-    return await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
+    return await assignPage(await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
       if (!args._laneLease) {
         args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
       }
@@ -1989,7 +2003,7 @@ async function findTargetAppPage(browser, args = {}) {
       const page = await context.newPage();
       await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       return page;
-    });
+    }));
   }
 
   const expectedId = args.expectedSessionId || args.conversation;
@@ -2008,28 +2022,38 @@ async function findTargetAppPage(browser, args = {}) {
       throw cbError('PAGE_TARGET_AMBIGUOUS', `Multiple open pages match conversation "${normalizedExpectedId}". Disambiguate with --target-id.`);
     }
     if (matchingPages.length === 1) {
-      return matchingPages[0];
+      return await assignPage(matchingPages[0]);
     }
     // Dedicated page under topology lease — NEVER hijack another conversation's tab!
-    return await withTopologyLease(args, randomId('dedicated-page-alloc'), async () => {
-      // Re-scan under topology lock (TOCTOU protection)
+    return await assignPage(await withTopologyLease(args, randomId('dedicated-page-alloc'), async () => {
+      // Re-scan under topology lock using full count check (TOCTOU protection)
+      const matchingUnderLock = [];
       for (const candidateContext of browser.contexts()) {
-        const match = candidateContext.pages().find((candidate) => sessionIdFromUrl(candidate.url()) === normalizedExpectedId);
-        if (match) return match;
+        for (const p of candidateContext.pages()) {
+          if (sessionIdFromUrl(p.url()) === normalizedExpectedId) {
+            matchingUnderLock.push(p);
+          }
+        }
+      }
+      if (matchingUnderLock.length > 1) {
+        throw cbError('PAGE_TARGET_AMBIGUOUS', `Multiple open pages match conversation "${normalizedExpectedId}". Disambiguate with --target-id.`);
+      }
+      if (matchingUnderLock.length === 1) {
+        return matchingUnderLock[0];
       }
       const context = browser.contexts()[0] || await browser.newContext();
       const page = await context.newPage();
       await page.goto(`${TARGET_APP_BASE.origin}/c/${normalizedExpectedId}`, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       return page;
-    });
+    }));
   }
 
   for (const candidateContext of browser.contexts()) {
     const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
-    if (page) return page;
+    if (page) return await assignPage(page);
   }
 
-  return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
+  return await assignPage(await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
     if (!args._laneLease) {
       args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
     }
@@ -2037,7 +2061,7 @@ async function findTargetAppPage(browser, args = {}) {
     const page = await context.newPage();
     await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     return page;
-  });
+  }));
 }
 
 async function getConversationTurns(page) {
@@ -6815,6 +6839,77 @@ async function resolveNumericVersionIndex(page, viewerHeader) {
   throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', `Malformed version label in viewer header: "${text}"`);
 }
 
+async function openAndResolveVersionViewer(page, turnRoot) {
+  const variantsBtn = turnRoot.locator('button[data-testid="variants-turn-action-button"]').first();
+  if (!(await variantsBtn.count().catch(() => 0))) {
+    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Variants action button is absent on turn root');
+  }
+
+  if (typeof variantsBtn.scrollIntoViewIfNeeded === 'function') {
+    await variantsBtn.scrollIntoViewIfNeeded().catch(() => {});
+  }
+  await page.waitForTimeout(200);
+
+  try {
+    await variantsBtn.click({ timeout: 2000 });
+  } catch {
+    await variantsBtn.click({ force: true });
+  }
+
+  let viewerHeader = null;
+  let closeBtn = null;
+
+  const prevLoc = page.locator('button[aria-label="Previous version"]');
+  const prevAnchor = typeof prevLoc.first === 'function' ? prevLoc.first() : (typeof prevLoc.last === 'function' ? prevLoc.last() : prevLoc);
+
+  if (prevAnchor && typeof prevAnchor.waitFor === 'function') {
+    await prevAnchor.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+
+  if (prevAnchor && typeof prevAnchor.locator === 'function') {
+    try {
+      const candidateRoot = prevAnchor.locator(
+        'xpath=ancestor::*[' +
+          './/button[@aria-label="Next version"] and ' +
+          './/button[@data-testid="close-button"]' +
+        '][1]'
+      );
+      if (candidateRoot && typeof candidateRoot.locator === 'function') {
+        const h = candidateRoot.locator('div:has(> button[aria-label="Previous version"])');
+        const c = candidateRoot.locator('button[data-testid="close-button"][aria-label="Close"]');
+        if (h && typeof h.first === 'function' && (await h.first().count().catch(() => 0))) {
+          viewerHeader = h.first();
+          closeBtn = c.first();
+        }
+      }
+    } catch {}
+  }
+
+  if (!viewerHeader) {
+    const headerLoc = page.locator('div:has(> button[aria-label="Previous version"])');
+    viewerHeader = typeof headerLoc.last === 'function' ? headerLoc.last() : headerLoc;
+  }
+  if (!closeBtn) {
+    const closeLoc = page.locator('button[data-testid="close-button"][aria-label="Close"]');
+    closeBtn = typeof closeLoc.last === 'function' ? closeLoc.last() : closeLoc;
+  }
+
+  if (typeof closeBtn?.waitFor === 'function') {
+    await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+  if (typeof viewerHeader?.waitFor === 'function') {
+    await viewerHeader.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+
+  if (closeBtn && typeof closeBtn.count === 'function') {
+    if (!(await closeBtn.count().catch(() => 0)) || (typeof closeBtn.isVisible === 'function' && !(await closeBtn.isVisible().catch(() => false)))) {
+      throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header or close button');
+    }
+  }
+
+  return { viewerHeader, closeBtn };
+}
+
 async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssistantTurn = null, roundId = null) {
   const turnRoot = await resolveUserTurnRoot(page, sourceUserTurn);
 
@@ -6841,64 +6936,7 @@ async function captureUserTurnVersionBaseline(page, sourceUserTurn, sourceAssist
     };
   }
 
-  if (typeof variantsBtn.scrollIntoViewIfNeeded === 'function') { await variantsBtn.scrollIntoViewIfNeeded().catch(() => {}); }
-  await page.waitForTimeout(200);
-  try {
-    await variantsBtn.click({ timeout: 2000 });
-  } catch {
-    await variantsBtn.click({ force: true });
-  }
-
-  let viewerHeader = null;
-  let closeBtn = null;
-
-  const prevLoc = page.locator('button[aria-label="Previous version"]');
-  const prevAnchor = typeof prevLoc.first === 'function' ? prevLoc.first() : (typeof prevLoc.last === 'function' ? prevLoc.last() : prevLoc);
-
-  if (prevAnchor && typeof prevAnchor.waitFor === 'function') {
-    await prevAnchor.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  }
-
-  if (prevAnchor && typeof prevAnchor.locator === 'function') {
-    try {
-      const viewerRoot = prevAnchor.locator(
-        'xpath=ancestor::*[' +
-          './/button[@aria-label="Next version"] and ' +
-          './/button[@data-testid="close-button"]' +
-        '][1]'
-      );
-      if (viewerRoot && typeof viewerRoot.locator === 'function') {
-        const candidateHeader = viewerRoot.locator('div:has(> button[aria-label="Previous version"])');
-        const candidateClose = viewerRoot.locator('button[data-testid="close-button"][aria-label="Close"]');
-        if (candidateHeader && typeof candidateHeader.first === 'function' && (await candidateHeader.first().count().catch(() => 0))) {
-          viewerHeader = candidateHeader.first();
-        }
-        if (candidateClose && typeof candidateClose.first === 'function' && (await candidateClose.first().count().catch(() => 0))) {
-          closeBtn = candidateClose.first();
-        }
-      }
-    } catch {}
-  }
-
-  if (!viewerHeader) {
-    const headerLoc = page.locator('div:has(> button[aria-label="Previous version"])');
-    viewerHeader = typeof headerLoc.last === 'function' ? headerLoc.last() : headerLoc;
-  }
-  if (!closeBtn) {
-    const closeLoc = page.locator('button[data-testid="close-button"][aria-label="Close"]');
-    closeBtn = typeof closeLoc.last === 'function' ? closeLoc.last() : closeLoc;
-  }
-
-  if (typeof closeBtn.waitFor === 'function') {
-    await closeBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  }
-  if (typeof viewerHeader.waitFor === 'function') {
-    await viewerHeader.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  }
-
-  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
-    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header');
-  }
+  const { viewerHeader, closeBtn } = await openAndResolveVersionViewer(page, turnRoot);
 
 
 
@@ -7008,18 +7046,7 @@ async function attestEditedUserTurnVersion(page, sourceUserTurn, baseline, edite
     throw cbError('EDIT_VERSION_COUNT_MISMATCH', `Expected prompt version count ${baseline.count + 1}, but "See versions" button is absent`);
   }
 
-  try {
-    await variantsBtn.click({ timeout: 2000 });
-  } catch {
-    await variantsBtn.click({ force: true });
-  }
-  await page.waitForTimeout(400);
-
-  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
-  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
-  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
-    throw cbError('EDIT_VERSION_VIEWER_UNVERIFIED', 'Failed to open prompt version viewer header after edit');
-  }
+  const { viewerHeader, closeBtn } = await openAndResolveVersionViewer(page, turnRoot);
 
 
 
@@ -7113,14 +7140,7 @@ async function reconcileStage1EditTurn(page, args, round) {
             throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Variants action button absent or invisible after reload during preparing restoration');
           }
 
-          await variantsBtn.click().catch(() => {});
-          await page.waitForTimeout(400);
-
-          const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
-          const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
-          if (!(await closeBtn.count().catch(() => 0))) {
-            throw cbError('EDIT_VERSION_RESTORE_FAILED', 'Version viewer close button not found during preparing restoration');
-          }
+          const { viewerHeader, closeBtn } = await openAndResolveVersionViewer(page, turnRoot);
 
           const targetKind = round.versionProbe.initialLabelKind || 'current';
           const targetIndex = round.versionProbe.initialActiveIndex;
@@ -7273,18 +7293,13 @@ async function reconcileStage1EditTurn(page, args, round) {
     return { outcome: 'uncertain', round };
   }
 
+  let viewerObj;
   try {
-    await variantsBtn.click({ timeout: 2000 });
+    viewerObj = await openAndResolveVersionViewer(page, turnRoot);
   } catch {
-    try { await variantsBtn.click({ force: true }); } catch { return { outcome: 'uncertain', round }; }
-  }
-  await page.waitForTimeout(400);
-
-  const viewerHeader = page.locator('div:has(> button[aria-label="Previous version"])').last();
-  const closeBtn = page.locator('button[data-testid="close-button"][aria-label="Close"]').last();
-  if (!(await closeBtn.count().catch(() => 0)) || !(await closeBtn.isVisible().catch(() => false))) {
     return { outcome: 'uncertain', round };
   }
+  const { viewerHeader, closeBtn } = viewerObj;
 
   let activeResolution;
   try {
@@ -8649,60 +8664,62 @@ async function branchConversationTurn(page, args) {
         dispatchStartedAt: nowIso(),
       }, 'branch_dispatching') || branchRecord;
 
-      const parentUrlBefore = page.url();
-      const pagesBefore = new Set(page.context().pages());
-      try {
-        await branchInNewChatItem.click();
-      } catch (clickErr) {
-        localDispatchState = 'uncertain';
-        branchRecord = updateBranchLineage(branchRecord.id, {
-          status: 'pending',
-          dispatchState: 'dispatch_uncertain',
-          lastError: clickErr.message || String(clickErr),
-        }, 'branch_dispatch_uncertain') || branchRecord;
-        throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
-      }
-
-      // Discover destination page fail-closed against destination ambiguity
       let destinationPage = null;
-      const startWait = Date.now();
-      while (Date.now() - startWait < 15000) {
-        const currentPages = page.context().pages();
-        const newPages = currentPages.filter((p) => !pagesBefore.has(p));
-        const parentNavigated = page.url() !== parentUrlBefore;
-
-        if (newPages.length > 0 && parentNavigated) {
-          localDispatchState = 'destination_unverified';
+      await withTopologyLease(args, randomId('branch-destination-alloc'), async () => {
+        const parentUrlBefore = page.url();
+        const pagesBefore = new Set(page.context().pages());
+        try {
+          await branchInNewChatItem.click();
+        } catch (clickErr) {
+          localDispatchState = 'uncertain';
           branchRecord = updateBranchLineage(branchRecord.id, {
             status: 'pending',
-            dispatchState: 'destination_unverified',
-            lastError: 'Ambiguous destination: newly opened page detected and source page also navigated',
-          }, 'branch_destination_unverified') || branchRecord;
-          throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Ambiguous destination: newly opened page detected and source page also navigated');
+            dispatchState: 'dispatch_uncertain',
+            lastError: clickErr.message || String(clickErr),
+          }, 'branch_dispatch_uncertain') || branchRecord;
+          throw cbError('BRANCH_DISPATCH_UNCERTAIN', `Stage 3 branch click uncertainty: ${clickErr.message || clickErr}`);
         }
 
-        if (newPages.length > 1) {
-          localDispatchState = 'destination_unverified';
-          branchRecord = updateBranchLineage(branchRecord.id, {
-            status: 'pending',
-            dispatchState: 'destination_unverified',
-            lastError: 'Multiple newly opened pages detected after branch click',
-          }, 'branch_destination_unverified') || branchRecord;
-          throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Multiple newly opened pages detected after branch click');
-        }
+        // Discover destination page fail-closed against destination ambiguity
+        const startWait = Date.now();
+        while (Date.now() - startWait < 15000) {
+          const currentPages = page.context().pages();
+          const newPages = currentPages.filter((p) => !pagesBefore.has(p));
+          const parentNavigated = page.url() !== parentUrlBefore;
 
-        if (newPages.length === 1 && !parentNavigated) {
-          destinationPage = newPages[0];
-          break;
-        }
+          if (newPages.length > 0 && parentNavigated) {
+            localDispatchState = 'destination_unverified';
+            branchRecord = updateBranchLineage(branchRecord.id, {
+              status: 'pending',
+              dispatchState: 'destination_unverified',
+              lastError: 'Ambiguous destination: newly opened page detected and source page also navigated',
+            }, 'branch_destination_unverified') || branchRecord;
+            throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Ambiguous destination: newly opened page detected and source page also navigated');
+          }
 
-        if (newPages.length === 0 && parentNavigated) {
-          destinationPage = page;
-          break;
-        }
+          if (newPages.length > 1) {
+            localDispatchState = 'destination_unverified';
+            branchRecord = updateBranchLineage(branchRecord.id, {
+              status: 'pending',
+              dispatchState: 'destination_unverified',
+              lastError: 'Multiple newly opened pages detected after branch click',
+            }, 'branch_destination_unverified') || branchRecord;
+            throw cbError('BRANCH_DESTINATION_UNVERIFIED', 'Multiple newly opened pages detected after branch click');
+          }
 
-        await page.waitForTimeout(300);
-      }
+          if (newPages.length === 1 && !parentNavigated) {
+            destinationPage = newPages[0];
+            break;
+          }
+
+          if (newPages.length === 0 && parentNavigated) {
+            destinationPage = page;
+            break;
+          }
+
+          await page.waitForTimeout(300);
+        }
+      });
 
       if (!destinationPage) {
         localDispatchState = 'destination_unverified';
@@ -11265,6 +11282,7 @@ module.exports = {
   releaseTopologyLease,
   withTopologyLease,
   getPageTargetId,
+  openAndResolveVersionViewer,
   takeBrowserLaneLease,
   releaseBrowserLaneLease,
   withBrowserLaneLease,

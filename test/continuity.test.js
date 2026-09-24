@@ -4183,3 +4183,48 @@ test('findTargetAppPage: fails closed with PAGE_TARGET_AMBIGUOUS when multiple o
     (err) => err.code === 'PAGE_TARGET_AMBIGUOUS'
   );
 });
+
+test('browserLaneLeasePath: prioritizes pageTargetId over conversation and explicit lane', () => {
+  const pageOnly = browserLaneLeasePath({ cdp: 'http://127.0.0.1:9241', pageTargetId: 'TARGET-X' });
+  const pageWithConvAndLane = browserLaneLeasePath({
+    cdp: 'http://127.0.0.1:9241',
+    pageTargetId: 'TARGET-X',
+    conversation: '11111111-1111-4111-8111-111111111111',
+    lane: 'worker-1',
+  });
+  // Must match because pageTargetId is #1 priority
+  assert.equal(pageOnly, pageWithConvAndLane);
+});
+
+test('browserLaneLeasePath: computes identical lock for alias and resolved expectedSessionId', () => {
+  const directUuid = browserLaneLeasePath({
+    cdp: 'http://127.0.0.1:9241',
+    conversation: '11111111-1111-4111-8111-111111111111',
+  });
+  const aliasWithResolvedUuid = browserLaneLeasePath({
+    cdp: 'http://127.0.0.1:9241',
+    conversation: 'my-alias',
+    expectedSessionId: '11111111-1111-4111-8111-111111111111',
+  });
+  assert.equal(directUuid, aliasWithResolvedUuid);
+});
+
+test('findTargetAppPage: binds args.pageTargetId from page CDP target ID', async () => {
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [{
+        _targetId: 'TARGET-BOUND-1',
+        url: () => 'https://chatgpt.com/c/33333333-3333-4333-8333-333333333333',
+      }],
+    }],
+  };
+
+  const args = {
+    conversation: '33333333-3333-4333-8333-333333333333',
+    cdp: 'http://127.0.0.1:9241',
+  };
+
+  const page = await findTargetAppPage(mockBrowser, args);
+  assert.ok(page);
+  assert.equal(args.pageTargetId, 'TARGET-BOUND-1');
+});
