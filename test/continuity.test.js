@@ -4534,3 +4534,43 @@ test('branchWithContextCarryForward: returns existing completed incident without
   assert.equal(res.childSessionId, childId);
   assert.equal(res.continuityPrompt, 'Existing continuity prompt');
 });
+
+test('openBranchMenu: rejects when target turn cannot be uniquely located in DOM', async () => {
+  const mockPage = {
+    locator: (selector) => ({
+      count: async () => 0,
+      first: () => ({ count: async () => 0 }),
+    }),
+  };
+
+  const sourceAssistant = {
+    turnKey: 'missing-turn-key',
+    testid: 'asst-missing-turn-key',
+    messageId: '',
+  };
+
+  await assert.rejects(
+    () => openBranchMenu(mockPage, sourceAssistant),
+    (err) => err.code === 'BRANCH_SOURCE_UNVERIFIED'
+  );
+});
+
+test('openBranchMenu: rejects when multiple candidate containers match source selector', async () => {
+  const mockPage = {
+    locator: (selector) => ({
+      count: async () => 2,
+      first: () => ({ count: async () => 2 }),
+    }),
+  };
+
+  const sourceAssistant = {
+    turnKey: 'duplicate-turn-key',
+    testid: 'asst-duplicate-turn-key',
+    messageId: '',
+  };
+
+  await assert.rejects(
+    () => openBranchMenu(mockPage, sourceAssistant),
+    (err) => err.code === 'BRANCH_SOURCE_UNVERIFIED' && err.message.includes('could not be uniquely located')
+  );
+});

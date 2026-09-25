@@ -1102,8 +1102,9 @@ async function getPageTargetId(page) {
       }
     } catch {}
   }
-  // Fail closed in production. Only isolated test harnesses without a full CDP session may fall back to mocks.
-  if (process.env.NODE_ENV === 'test' || !ctx || typeof ctx.newCDPSession !== 'function') {
+  // Fail closed in production: strict Target.getTargetInfo required.
+  // Only isolated test harnesses without a real CDP session may fall back to mocks.
+  if (process.env.NODE_ENV === 'test' || typeof process.env.NODE_TEST_CONTEXT === 'string' || !ctx || typeof ctx.newCDPSession !== 'function') {
     if (typeof page?._mockTargetId === 'string') return page._mockTargetId;
     if (typeof page?._targetId === 'string') return page._targetId;
     if (!ctx) return 'test-mock-target';
@@ -2139,35 +2140,31 @@ async function getConversationTurns(page) {
     let idx = 0;
     for (const roundEl of turnKeyEls) {
       const turnKey = roundEl.getAttribute('data-turn-key') || '';
-      const editBtn = roundEl.querySelector('button[aria-label="Edit message"]');
-      const userBubble = roundEl.querySelector('[data-user-message-bubble="true"]');
-      const userSearchUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"]');
 
-      const userContainer = (editBtn && (editBtn.closest('.flex.flex-col') || editBtn.parentElement))
-        || (userBubble && (userBubble.closest('.group\\/user-message') || userBubble.closest('.flex.flex-col') || userBubble.parentElement))
-        || (userSearchUnit && (userSearchUnit.closest('.group\\/user-message') || userSearchUnit.closest('.flex.flex-col') || userSearchUnit.parentElement));
+      // Separate DOM subtrees: extract user and assistant from verified subtrees without text subtraction
+      const userUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
+      const asstUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], .markdown');
 
-      const asstBlock = roundEl.querySelector('button[aria-label="More actions"], .markdown, [data-message-author-role="assistant"], [data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"]');
+      const userMessageId = (userUnit?.getAttribute('data-chatgpt-search-message-ids') || userUnit?.getAttribute('data-message-id') || '').split(' ')[0];
+      const asstMessageId = (asstUnit?.getAttribute('data-chatgpt-search-message-ids') || asstUnit?.getAttribute('data-message-id') || '').split(' ')[0];
 
-      let userText = '';
-      let asstText = '';
-      const fullText = textOf(roundEl);
+      const cleanTextOf = (el) => {
+        if (!el) return '';
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('h4, [role="separator"], button, [role="button"], .sr-only').forEach((b) => b.remove());
+        return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+      };
 
-      if (userContainer && asstBlock) {
-        userText = textOf(userContainer).replace(/^.*?You said:\s*/i, '').trim();
-        asstText = fullText.replace(textOf(userContainer), '').replace(/^.*?ChatGPT said:\s*/i, '').trim();
-      } else if (userContainer) {
-        userText = (textOf(userContainer) || fullText).replace(/^.*?You said:\s*/i, '').trim();
-      } else {
-        asstText = fullText.replace(/^.*?ChatGPT said:\s*/i, '').trim();
-      }
+      const userText = cleanTextOf(userUnit);
+      const asstText = cleanTextOf(asstUnit);
 
       if (userText) {
         extracted.push({
           index: idx++,
           testid: `user-${turnKey}`,
+          logicalTurnId: `user:${turnKey}`,
           turnKey,
-          messageId: '',
+          messageId: userMessageId || '',
           role: 'user',
           text: userText,
           turnText: userText,
@@ -2177,8 +2174,9 @@ async function getConversationTurns(page) {
         extracted.push({
           index: idx++,
           testid: `asst-${turnKey}`,
+          logicalTurnId: `assistant:${turnKey}`,
           turnKey,
-          messageId: '',
+          messageId: asstMessageId || '',
           role: 'assistant',
           text: asstText,
           turnText: asstText,
@@ -8516,20 +8514,21 @@ async function openBranchMenu(page, sourceAssistant) {
   let turnEl = null;
   const turnKey = sourceAssistant.turnKey || (sourceAssistant.testid?.startsWith('asst-') ? sourceAssistant.testid.slice(5) : null);
   if (turnKey) {
-    turnEl = page.locator(`[data-turn-key="${turnKey}"]`).first();
+    turnEl = page.locator(`[data-turn-key="${turnKey}"]`);
   }
   if (!turnEl || !(await turnEl.count().catch(() => 0))) {
     if (sourceAssistant.testid) {
-      turnEl = page.locator(`[data-testid="${sourceAssistant.testid}"]`).first();
+      turnEl = page.locator(`[data-testid="${sourceAssistant.testid}"]`);
       if (!(await turnEl.count().catch(() => 0))) {
-        turnEl = page.locator(`[data-turn-key="${sourceAssistant.testid}"]`).first();
+        turnEl = page.locator(`[data-turn-key="${sourceAssistant.testid}"]`);
       }
     } else if (sourceAssistant.messageId) {
-      turnEl = page.locator(`[data-message-id="${sourceAssistant.messageId}"]`).first();
+      turnEl = page.locator(`[data-message-id="${sourceAssistant.messageId}"]`);
     }
   }
-  if (!turnEl || !(await turnEl.count().catch(() => 0))) {
-    throw cbError('BRANCH_SOURCE_UNVERIFIED', `Exact source turn "${sourceAssistant.testid || sourceAssistant.messageId}" could not be located in DOM`);
+  const matchCount = await turnEl?.count().catch(() => 0);
+  if (matchCount !== 1) {
+    throw cbError('BRANCH_SOURCE_UNVERIFIED', `Exact source turn "${sourceAssistant.turnKey || sourceAssistant.testid || sourceAssistant.messageId}" could not be uniquely located in DOM (matched ${matchCount})`);
   }
 
   await turnEl.scrollIntoViewIfNeeded().catch(() => {});
@@ -8913,18 +8912,24 @@ async function branchWithContextCarryForward(page, args) {
     branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
   });
 
-  const targetPage = childPage || page;
-  const childTid = await getPageTargetId(targetPage);
-  if (childTid) {
-    updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
+  const targetPage = childPage || branchResult.childPage;
+  if (!targetPage) {
+    throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
   }
+
+  const childTid = await getPageTargetId(targetPage);
+  if (typeof childTid !== 'string' || !childTid.trim()) {
+    throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot dispatch carry-forward prompt without verified physical child target identity');
+  }
+
+  updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
 
   const childArgs = {
     ...args,
     conversation: childSessionId,
     expectedSessionId: childSessionId,
-    pageTargetId: childTid || '',
-    targetId: childTid || '',
+    pageTargetId: childTid,
+    targetId: childTid,
     branchTurn: '',
     branchCarryForward: false,
     message: continuityPrompt,
