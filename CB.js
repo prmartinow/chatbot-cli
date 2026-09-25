@@ -8687,27 +8687,44 @@ function formatCarryForwardPrompt(options = {}) {
 }
 
 function extractLastTurnFromTranscript(transcriptPath) {
-  if (!fs.existsSync(transcriptPath)) return null;
-  const text = fs.readFileSync(transcriptPath, 'utf8');
-  const entries = parseTranscriptEntries(text);
-  if (entries.length < 2) return null;
-  let lastUser = null;
-  let lastAssistant = null;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (!lastAssistant && entries[i].role === 'assistant') {
-      lastAssistant = entries[i];
-    } else if (lastAssistant && entries[i].role === 'user') {
-      lastUser = entries[i];
-      break;
+  let candidatePaths = [transcriptPath];
+  const dir = path.dirname(transcriptPath);
+  const base = path.basename(transcriptPath);
+  if (fs.existsSync(dir)) {
+    const stales = fs.readdirSync(dir)
+      .filter(f => f.startsWith(`${base}.stale-`))
+      .sort()
+      .reverse()
+      .map(f => path.join(dir, f));
+    candidatePaths = [...candidatePaths, ...stales];
+  }
+
+  for (const p of candidatePaths) {
+    if (!fs.existsSync(p)) continue;
+    const text = fs.readFileSync(p, 'utf8');
+    const entries = parseTranscriptEntries(text);
+    if (entries.length < 2) continue;
+    let lastUser = null;
+    let lastAssistant = null;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (!lastAssistant && entries[i].role === 'assistant') {
+        lastAssistant = entries[i];
+      } else if (lastAssistant && entries[i].role === 'user') {
+        lastUser = entries[i];
+        break;
+      }
+    }
+    if (lastUser && lastAssistant) {
+      return {
+        sourceFile: p,
+        request: lastUser.text,
+        response: lastAssistant.text,
+        userAt: lastUser.at,
+        assistantAt: lastAssistant.at,
+      };
     }
   }
-  if (!lastUser || !lastAssistant) return null;
-  return {
-    request: lastUser.text,
-    response: lastAssistant.text,
-    userAt: lastUser.at,
-    assistantAt: lastAssistant.at,
-  };
+  return null;
 }
 
 async function branchWithContextCarryForward(page, args) {
@@ -8800,7 +8817,10 @@ async function branchConversationTurn(page, args) {
       const preState = await getTargetAppState(page);
       const generation = await getCombinedGenerationState(page, preState);
       if (generation.isGenerating) {
-        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active');
+        if (!args.branchCarryForward && !preState?.maxLengthReached) {
+          throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active');
+        }
+        info('[stage3] Notice: Tail generation control is active or stranded, but proceeding with Stage 3 branch recovery');
       }
 
       await syncTranscriptFromPage(page, args);
@@ -8825,7 +8845,10 @@ async function branchConversationTurn(page, args) {
 
       const genCheck = await getCombinedGenerationState(page);
       if (genCheck.isGenerating) {
-        throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
+        if (!args.branchCarryForward && !preState?.maxLengthReached) {
+          throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
+        }
+        info('[stage3] Notice: Proceeding with branch click despite tail generation state');
       }
 
       let destinationPage = null;
