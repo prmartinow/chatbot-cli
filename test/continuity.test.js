@@ -43,6 +43,9 @@ const {
   withTopologyLease,
   getPageTargetId,
   openAndResolveVersionViewer,
+  formatCarryForwardPrompt,
+  extractLastTurnFromTranscript,
+  branchWithContextCarryForward,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
   takeBrowserLaneLease,
@@ -4377,5 +4380,65 @@ test('branchConversationTurn: fails closed with PAGE_TARGET_ID_UNVERIFIED when c
   await assert.rejects(
     () => branchConversationTurn(mockParentPage, args),
     (err) => err.code === 'PAGE_TARGET_ID_UNVERIFIED'
+  );
+});
+
+test('formatCarryForwardPrompt: formats capacity notice, preceding request, preceding response, and prompt', () => {
+  const prompt = formatCarryForwardPrompt({
+    carryRequest: 'Please review commit abc',
+    carryResponse: 'Commit abc looks solid',
+    carryPrompt: 'Please continue to step 2',
+    parentSessionId: '11111111-2222-4333-8444-555555555555',
+    branchAnchorDesc: 'turn-3',
+  });
+
+  assert.match(prompt, /Thread Continuity Notice: The previous session/);
+  assert.match(prompt, /11111111-2222-4333-8444-555555555555/);
+  assert.match(prompt, /turn-3/);
+  assert.ok(prompt.includes('### Preceding Request:\nPlease review commit abc'));
+  assert.ok(prompt.includes('### Preceding Agent Response:\nCommit abc looks solid'));
+  assert.ok(prompt.includes('Please continue to step 2'));
+});
+
+test('extractLastTurnFromTranscript: extracts the last user request and assistant response', () => {
+  const tmpFile = path.join(testIsolationDir, 'sample-transcript.txt');
+  fs.writeFileSync(tmpFile, [
+    '[2026-09-24T10:00:00.000Z] USER',
+    'Earlier prompt',
+    '',
+    '[2026-09-24T10:01:00.000Z] ASSISTANT',
+    'Earlier response',
+    '',
+    '[2026-09-24T10:05:00.000Z] USER',
+    'Final prompt before capacity',
+    '',
+    '[2026-09-24T10:06:00.000Z] ASSISTANT',
+    'Final response before capacity reached',
+    '',
+  ].join('\n'), 'utf8');
+
+  const res = extractLastTurnFromTranscript(tmpFile);
+  assert.notEqual(res, null);
+  assert.equal(res.request, 'Final prompt before capacity');
+  assert.equal(res.response, 'Final response before capacity reached');
+  assert.equal(res.userAt, '2026-09-24T10:05:00.000Z');
+  assert.equal(res.assistantAt, '2026-09-24T10:06:00.000Z');
+});
+
+test('branchWithContextCarryForward: rejects if payload cannot be resolved from transcript or args', async () => {
+  const mockPage = {
+    url: () => 'https://chatgpt.com/c/11111111-2222-4333-8444-555555555555',
+  };
+
+  const args = {
+    expectedSessionId: '11111111-2222-4333-8444-555555555555',
+    branchTurn: 'latest',
+    branchCarryForward: true,
+    transcript: path.join(testIsolationDir, 'empty-transcript.txt'),
+  };
+
+  await assert.rejects(
+    () => branchWithContextCarryForward(mockPage, args),
+    (err) => err.code === 'CARRY_FORWARD_PAYLOAD_UNRESOLVED'
   );
 });
