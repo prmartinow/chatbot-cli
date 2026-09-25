@@ -3293,7 +3293,10 @@ function turnMatchesMessage(turnText, message) {
   if (renderedMessage.length >= 1000) {
     const head = renderedMessage.slice(0, 200);
     const tail = renderedMessage.slice(-200);
-    return renderedTurn.includes(head) && renderedTurn.includes(tail);
+    if (renderedTurn.includes(head) && renderedTurn.includes(tail)) return true;
+    if (renderedTurn.includes(head) && (renderedTurn.includes('…') || renderedTurn.includes('...') || renderedTurn.length >= 800)) {
+      return true;
+    }
   }
   return false;
 }
