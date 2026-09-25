@@ -6329,8 +6329,8 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
         const cIndex = parts.indexOf('c');
         return cIndex !== -1 ? (parts[cIndex + 1] || '') : '';
       };
-      const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].filter(isVisible);
-      const roleNodes = [...document.querySelectorAll('[data-message-author-role]')].filter(isVisible);
+      const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-turn-key], [data-content-search-turn-key]')].filter(isVisible);
+      const roleNodes = [...document.querySelectorAll('[data-message-author-role], [data-turn-key]')].filter(isVisible);
       const composer = [...document.querySelectorAll('#prompt-textarea, [data-testid="composer-input"], div[contenteditable="true"]')].find(isVisible);
       const currentSessionId = sessionIdFromLocation();
       return {
