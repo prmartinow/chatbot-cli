@@ -46,6 +46,7 @@ const {
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,
+  getOrCreateCarryForwardIncident,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
   takeBrowserLaneLease,
@@ -4456,4 +4457,80 @@ test('routeSessionIdFromUrl: normalizes local-chatgpt: prefix to stable UUID whi
 
   assert.equal(routeSessionIdFromUrl(plainUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
   assert.equal(sessionIdFromUrl(plainUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+});
+
+test('extractLastTurnFromTranscript: extracts provenance and SHA-256 hash from active and quarantined stale transcripts', () => {
+  const dir = path.join(testIsolationDir, 'prov-test-' + Date.now());
+  fs.mkdirSync(dir, { recursive: true });
+  const activeFile = path.join(dir, 'prov-session.txt');
+  const staleFile = path.join(dir, 'prov-session.txt.stale-2026-09-25T12-00-00');
+
+  const content = [
+    formatTranscriptEntry('user', 'Prov Request', '2026-09-25T12:00:00.000Z'),
+    formatTranscriptEntry('assistant', 'Prov Response', '2026-09-25T12:01:00.000Z'),
+  ].join('');
+
+  fs.writeFileSync(activeFile, content, 'utf8');
+  const activeRes = extractLastTurnFromTranscript(activeFile);
+  assert.equal(activeRes.provenance, 'active_transcript');
+  assert.ok(activeRes.sourceFileHash);
+  assert.equal(activeRes.request, 'Prov Request');
+
+  fs.writeFileSync(staleFile, content, 'utf8');
+  fs.unlinkSync(activeFile);
+  const staleRes = extractLastTurnFromTranscript(activeFile);
+  assert.equal(staleRes.provenance, 'quarantined_stale_fallback');
+  assert.equal(staleRes.sourceFile, staleFile);
+  assert.ok(staleRes.sourceFileHash);
+});
+
+test('resolveBranchableTurn: preserves turnKey and resolves selection by exact turnKey', async () => {
+  const mockPage = {
+    evaluate: async () => [
+      { index: 0, testid: 'user-tk-1', turnKey: 'tk-1', role: 'user', text: 'Prompt 1' },
+      { index: 1, testid: 'asst-tk-1', turnKey: 'tk-1', role: 'assistant', text: 'Response 1' },
+      { index: 2, testid: 'user-tk-2', turnKey: 'tk-2', role: 'user', text: 'Prompt 2' },
+      { index: 3, testid: 'asst-tk-2', turnKey: 'tk-2', role: 'assistant', text: 'Response 2' },
+    ],
+  };
+
+  const latest = await resolveBranchableTurn(mockPage, 'latest');
+  assert.equal(latest.turnKey, 'tk-2');
+  assert.equal(latest.text, 'Response 2');
+
+  const byTurnKey = await resolveBranchableTurn(mockPage, 'tk-1');
+  assert.equal(byTurnKey.turnKey, 'tk-1');
+  assert.equal(byTurnKey.text, 'Response 1');
+});
+
+test('branchWithContextCarryForward: returns existing completed incident without re-branching', async () => {
+  const parentId = '99999999-aaaa-4bbb-8ccc-dddddddddddd';
+  const childId = '88888888-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const incidentId = 'INC-CAPACITY-TEST-RESUME';
+
+  const mockPage = {
+    url: () => `https://chatgpt.com/c/${parentId}`,
+  };
+
+  const args = {
+    expectedSessionId: parentId,
+    recoveryIncidentId: incidentId,
+    carryRequest: 'Resume prompt',
+    carryResponse: 'Resume response',
+    branchCarryForward: true,
+  };
+
+  const payloadHash = messageHash('Resume prompt\nResume response');
+  getOrCreateCarryForwardIncident(args, parentId, payloadHash);
+  updateRecoveryIncident(incidentId, {
+    state: 'completed',
+    childSessionId: childId,
+    continuityPrompt: 'Existing continuity prompt',
+    continuationResponse: { text: 'Done' },
+  });
+
+  const res = await branchWithContextCarryForward(mockPage, args);
+  assert.equal(res.status, 'completed');
+  assert.equal(res.childSessionId, childId);
+  assert.equal(res.continuityPrompt, 'Existing continuity prompt');
 });
