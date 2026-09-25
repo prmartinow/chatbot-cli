@@ -4442,3 +4442,18 @@ test('branchWithContextCarryForward: rejects if payload cannot be resolved from 
     (err) => err.code === 'CARRY_FORWARD_PAYLOAD_UNRESOLVED'
   );
 });
+
+test('routeSessionIdFromUrl: normalizes local-chatgpt: prefix to stable UUID while preserving WEB: prefix', () => {
+  const localUrl = 'https://chatgpt.com/c/local-chatgpt%3A5418843d-ee1e-4461-926f-78c7a8a5ef5a';
+  const webUrl = 'https://chatgpt.com/c/WEB:5418843d-ee1e-4461-926f-78c7a8a5ef5a';
+  const plainUrl = 'https://chatgpt.com/c/5418843d-ee1e-4461-926f-78c7a8a5ef5a';
+
+  assert.equal(routeSessionIdFromUrl(localUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+  assert.equal(sessionIdFromUrl(localUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+
+  assert.equal(routeSessionIdFromUrl(webUrl), 'WEB:5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+  assert.equal(sessionIdFromUrl(webUrl), '');
+
+  assert.equal(routeSessionIdFromUrl(plainUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+  assert.equal(sessionIdFromUrl(plainUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+});

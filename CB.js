@@ -840,8 +840,15 @@ function routeSessionIdFromUrl(url) {
     const parsed = new URL(url);
     const parts = parsed.pathname.split('/').filter(Boolean);
     const cIndex = parts.indexOf('c');
-    if (cIndex !== -1 && parts[cIndex + 1] && ROUTE_SESSION_ID_RE.test(parts[cIndex + 1])) {
-      return parts[cIndex + 1];
+    if (cIndex !== -1 && parts[cIndex + 1]) {
+      const decoded = decodeURIComponent(parts[cIndex + 1]);
+      if (/^WEB:[a-f0-9-]{20,}$/i.test(decoded)) {
+        return decoded;
+      }
+      const match = decoded.match(/^(?:local-chatgpt:)?([a-f0-9-]{20,})$/i);
+      if (match) {
+        return match[1];
+      }
     }
   } catch {}
 
@@ -6327,7 +6334,10 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
       const sessionIdFromLocation = () => {
         const parts = location.pathname.split('/').filter(Boolean);
         const cIndex = parts.indexOf('c');
-        return cIndex !== -1 ? (parts[cIndex + 1] || '') : '';
+        if (cIndex === -1 || !parts[cIndex + 1]) return '';
+        const decoded = decodeURIComponent(parts[cIndex + 1]);
+        const m = decoded.match(/^(?:WEB:|local-chatgpt:|[a-z0-9_-]+:)?([a-f0-9-]{20,})$/i);
+        return m ? m[1] : decoded;
       };
       const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-turn-key], [data-content-search-turn-key]')].filter(isVisible);
       const roleNodes = [...document.querySelectorAll('[data-message-author-role], [data-turn-key]')].filter(isVisible);
