@@ -1101,7 +1101,6 @@ async function getPageTargetId(page) {
     } catch {}
   }
   if (typeof page?._targetId === 'string') return page._targetId;
-  if (typeof page?._guid === 'string') return page._guid;
   if (page && (typeof page.context !== 'function' || !page.context)) {
     return page._mockTargetId || 'test-mock-target';
   }
@@ -2103,42 +2102,80 @@ async function getConversationTurns(page) {
       clone.querySelectorAll('button, [role="button"]').forEach((b) => b.remove());
       return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
     };
-    let elements = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
-    if (!elements.length) {
-      elements = [...document.querySelectorAll('[data-turn-key]')];
+    let classicEls = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+    if (classicEls.length) {
+      return classicEls
+        .map((turn, index) => {
+          const roleEls = turn.matches('[data-message-author-role]')
+            ? [turn]
+            : [...turn.querySelectorAll('[data-message-author-role]')];
+          let role = roleEls[0]?.getAttribute('data-message-author-role')
+            || turn.getAttribute('data-turn')
+            || '';
+          const roleTexts = roleEls.map(textOf).filter(Boolean);
+          const messageId = turn.getAttribute('data-message-id')
+            || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
+            || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+            || '';
+          return {
+            index,
+            testid: turn.getAttribute('data-testid') || '',
+            messageId,
+            role,
+            text: roleTexts[0] || textOf(turn),
+            roleTexts,
+            turnText: textOf(turn),
+          };
+        })
+        .filter((turn) => turn.role && (turn.text || turn.turnText));
     }
-    return elements
-      .map((turn, index) => {
-        const roleEls = turn.matches('[data-message-author-role]')
-          ? [turn]
-          : [...turn.querySelectorAll('[data-message-author-role]')];
-        let role = roleEls[0]?.getAttribute('data-message-author-role')
-          || turn.getAttribute('data-turn')
-          || '';
-        if (!role) {
-          if (turn.querySelector('button[aria-label="More actions"]')) role = 'assistant';
-          else if (turn.querySelector('button[aria-label="Edit message"]') || (turn.innerText || '').includes('You said:')) role = 'user';
-        }
-        const roleTexts = roleEls.map(textOf).filter(Boolean);
-        const messageId = turn.getAttribute('data-message-id')
-          || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
-          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
-          || '';
-        const testid = turn.getAttribute('data-testid')
-          || turn.getAttribute('data-turn-key')
-          || `turn-${index}`;
-        return {
-          index,
-          testid,
-          turnKey: turn.getAttribute('data-turn-key') || '',
-          messageId,
-          role,
-          text: roleTexts[0] || textOf(turn),
-          roleTexts,
-          turnText: textOf(turn),
-        };
-      })
-      .filter((turn) => turn.role && (turn.text || turn.turnText));
+
+    const turnKeyEls = [...document.querySelectorAll('[data-turn-key]')];
+    const extracted = [];
+    let idx = 0;
+    for (const roundEl of turnKeyEls) {
+      const turnKey = roundEl.getAttribute('data-turn-key') || '';
+      const editBtn = roundEl.querySelector('button[aria-label="Edit message"]');
+      const moreBtn = roundEl.querySelector('button[aria-label="More actions"]');
+
+      const userContainer = editBtn ? (editBtn.closest('.flex.flex-col') || editBtn.parentElement) : null;
+      let userText = '';
+      let asstText = '';
+      const fullText = textOf(roundEl);
+
+      if (userContainer && moreBtn) {
+        userText = textOf(userContainer).replace(/^.*?You said:\s*/i, '').trim();
+        asstText = fullText.replace(textOf(userContainer), '').trim();
+      } else if (editBtn) {
+        userText = fullText.replace(/^.*?You said:\s*/i, '').trim();
+      } else {
+        asstText = fullText;
+      }
+
+      if (userText) {
+        extracted.push({
+          index: idx++,
+          testid: `user-${turnKey}`,
+          turnKey,
+          messageId: '',
+          role: 'user',
+          text: userText,
+          turnText: userText,
+        });
+      }
+      if (asstText) {
+        extracted.push({
+          index: idx++,
+          testid: `asst-${turnKey}`,
+          turnKey,
+          messageId: '',
+          role: 'assistant',
+          text: asstText,
+          turnText: asstText,
+        });
+      }
+    }
+    return extracted;
   });
   return turns
     .map((turn) => ({
@@ -8477,15 +8514,6 @@ async function openBranchMenu(page, sourceAssistant) {
     }
   }
   if (!turnEl || !(await turnEl.count().catch(() => 0))) {
-    const moreBtns = page.locator('button[aria-label="More actions"]');
-    if ((await moreBtns.count().catch(() => 0)) > 0) {
-      turnEl = moreBtns.last().locator('xpath=ancestor::*[@data-turn-key or contains(@class, "turn") or @data-testid][1]');
-      if (!(await turnEl.count().catch(() => 0))) {
-        turnEl = moreBtns.last().locator('..');
-      }
-    }
-  }
-  if (!turnEl || !(await turnEl.count().catch(() => 0))) {
     throw cbError('BRANCH_SOURCE_UNVERIFIED', `Exact source turn "${sourceAssistant.testid || sourceAssistant.messageId}" could not be located in DOM`);
   }
 
@@ -8781,17 +8809,20 @@ async function branchWithContextCarryForward(page, args) {
     branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
   });
 
+  const targetPage = childPage || page;
+  const childTid = await getPageTargetId(targetPage);
   const childArgs = {
     ...args,
     conversation: childSessionId,
     expectedSessionId: childSessionId,
+    pageTargetId: childTid || '',
+    targetId: childTid || '',
     branchTurn: '',
     branchCarryForward: false,
     message: continuityPrompt,
   };
 
   info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
-  const targetPage = childPage || page;
   const askResult = await ask(targetPage, continuityPrompt, childArgs);
 
   return {
