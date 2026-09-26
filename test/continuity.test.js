@@ -88,6 +88,9 @@ const {
   getConversationTurns,
   expandCollapsedUserTurn,
   drainSafePreviewDialogs,
+  assertNoBlockingModal,
+  ensureNoBlockingModal,
+  ensureTargetClickable,
   resolveBranchableTurn,
   branchConversationTurn,
   recoverCandidateBranchLineage,
@@ -5552,4 +5555,61 @@ test('drainSafePreviewDialogs: fails closed with COMPOSER_BLOCK_STATE_UNVERIFIED
   const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
   assert.equal(res.resolved, false);
   assert.match(res.error, /COMPOSER_BLOCK_STATE_UNVERIFIED/);
+});
+
+test('expandCollapsedUserTurn: throws PAGE_TARGET_ID_UNVERIFIED if physical CDP target ID cannot be verified', async () => {
+  const mockPage = { _mockTargetId: '' };
+  await assert.rejects(
+    async () => expandCollapsedUserTurn(mockPage, { turnKey: 'test-turn' }),
+    (err) => err.code === 'PAGE_TARGET_ID_UNVERIFIED'
+  );
+});
+
+test('ensureNoBlockingModal: throws UI_BLOCKER_UNRESOLVED if drainSafePreviewDialogs returns unresolved', async () => {
+  const mockPage = {
+    evaluate: async (fn) => {
+      // getBlockingModal returns a modal
+      if (typeof fn === 'function' && fn.toString().includes('BLOCKING_MODAL_SELECTORS')) {
+        return { id: 'preview-1', kind: 'table_preview', text: 'Table preview' };
+      }
+      // drainSafePreviewDialogs returns composer unverified error
+      if (typeof fn === 'function' && fn.toString().includes('composer_element_missing')) {
+        return { verified: false, error: 'composer_element_missing' };
+      }
+      return { hasDialogs: false };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => ensureNoBlockingModal(mockPage, 'test-context'),
+    (err) => err.code === 'UI_BLOCKER_UNRESOLVED'
+  );
+});
+
+test('ensureTargetClickable: throws CLICKABILITY_STATE_UNVERIFIED if inspection fails', async () => {
+  const mockPage = {
+    evaluate: async (fn) => {
+      if (typeof fn === 'function' && fn.toString().includes('interceptorSelectors')) {
+        throw new Error('CDP execution context destroyed');
+      }
+      return null;
+    },
+  };
+
+  await assert.rejects(
+    async () => ensureTargetClickable(mockPage, ['#btn'], 'test button', 'context'),
+    (err) => err.code === 'CLICKABILITY_STATE_UNVERIFIED'
+  );
+});
+
+test('assertNoBlockingModal: throws UI_BLOCKER_PRESENT when modal is visible', async () => {
+  const mockPage = {
+    evaluate: async () => ({ id: 'sub-modal', kind: 'subscription_modal', text: 'Upgrade your plan' }),
+  };
+
+  await assert.rejects(
+    async () => assertNoBlockingModal(mockPage, 'before search'),
+    (err) => err.code === 'UI_BLOCKER_PRESENT'
+  );
 });

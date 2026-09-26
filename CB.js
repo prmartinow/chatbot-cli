@@ -1109,7 +1109,7 @@ async function getPageTargetId(page) {
   // Fail closed in production: strict Target.getTargetInfo required.
   // Only isolated test harnesses under test runner may fall back to mocks.
   if (process.env.NODE_ENV === 'test' || typeof process.env.NODE_TEST_CONTEXT === 'string') {
-    if (typeof page?._mockTargetId === 'string') return page._mockTargetId;
+    if (page?._mockTargetId !== undefined) return page._mockTargetId || '';
     if (typeof page?._targetId === 'string') return page._targetId;
     if (!ctx) return 'test-mock-target';
   }
@@ -3156,10 +3156,13 @@ async function getBlockingModal(page) {
     }
 
     return null;
-  }, BLOCKING_MODAL_SELECTORS).catch(() => null);
+  }, BLOCKING_MODAL_SELECTORS).catch((err) => ({
+    error: err?.message || String(err),
+    kind: 'modal_inspection_error',
+  }));
 }
 
-async function expandCollapsedUserTurn(page, turnRef) {
+async function expandCollapsedUserTurn(page, turnRef, options = {}) {
   const action = async () => {
     const res = await page.evaluate((target) => {
       const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
@@ -3206,21 +3209,51 @@ async function expandCollapsedUserTurn(page, turnRef) {
     }
 
     await page.waitForTimeout(150);
-    const postCheck = await page.evaluate(() => {
+    const postCheck = await page.evaluate((target, initialLen) => {
       const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
       const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], .codex-dialog')).filter(isVisible);
-      return { dialogCount: dialogs.length };
-    });
+      if (dialogs.length > 0) return { dialogCount: dialogs.length, expanded: false };
+
+      const userContainers = Array.from(document.querySelectorAll(
+        '[data-user-message-bubble="true"], [data-message-author-role="user"]'
+      )).filter(isVisible);
+
+      let targetContainer = null;
+      for (const u of userContainers) {
+        if (target?.turnKey && u.closest(`[data-turn-key="${target.turnKey}"]`)) {
+          targetContainer = u;
+          break;
+        }
+        if (target?.testid && (u.closest(`[data-testid="${target.testid}"]`) || u.getAttribute('data-testid') === target.testid)) {
+          targetContainer = u;
+          break;
+        }
+      }
+      if (!targetContainer) return { dialogCount: 0, expanded: false, error: 'target_turn_container_not_found_post' };
+      const finalLen = (targetContainer.innerText || '').length;
+      return {
+        dialogCount: 0,
+        finalLen,
+        expanded: finalLen > initialLen,
+      };
+    }, turnRef, res.initialLen);
 
     if (postCheck.dialogCount > 0) {
       throw cbError('TURN_EXPANSION_ILLEGAL_MUTATION', 'Turn expansion mounted an unexpected dialog');
     }
+    if (!postCheck.expanded) {
+      throw cbError('TURN_EXPANSION_VERIFICATION_FAILED', `Turn expansion did not increase container length (before: ${res.initialLen}, after: ${postCheck.finalLen || 0})`);
+    }
 
-    return { expanded: true };
+    return { expanded: true, finalLen: postCheck.finalLen };
   };
 
-  const laneArg = { cdp: args?.cdp || DEFAULT_CDP, pageTargetId: await getPageTargetId(page).catch(() => '') };
-  return laneArg.pageTargetId ? withBrowserLaneLease(laneArg, randomId('expand-user-turn'), action) : action();
+  const pageTargetId = await getPageTargetId(page).catch(() => '');
+  if (!pageTargetId) {
+    throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot expand user turn: physical CDP page target ID could not be verified for browser lane lease');
+  }
+  const laneArg = { cdp: options.cdp || DEFAULT_CDP, pageTargetId };
+  return withBrowserLaneLease(laneArg, randomId('expand-user-turn'), action);
 }
 
 async function drainSafePreviewDialogs(page, options = {}) {
@@ -3384,14 +3417,36 @@ async function dismissBlockingModal(page) {
   };
 }
 
+async function assertNoBlockingModal(page, context) {
+  const modal = await getBlockingModal(page);
+  if (modal) {
+    if (modal.error) {
+      throw cbError('MODAL_INSPECTION_FAILED', `Failed to inspect blocking modals ${context ? `(${context})` : ''}: ${modal.error}`);
+    }
+    throw cbError('UI_BLOCKER_PRESENT', `Blocking modal present ${context ? `(${context})` : ''}: ${modal.kind || 'unknown'}`);
+  }
+}
+
 async function ensureNoBlockingModal(page, context) {
   let modal = await getBlockingModal(page);
   if (!modal) return null;
+  if (modal.error) {
+    throw cbError('MODAL_INSPECTION_FAILED', `Failed to inspect blocking modals ${context ? `(${context})` : ''}: ${modal.error}`);
+  }
 
   const dismiss = await dismissBlockingModal(page);
+  if (!dismiss.dismissed) {
+    throw cbError('UI_BLOCKER_UNRESOLVED', dismiss.reason || dismiss.error || `Failed to resolve UI blocker ${context ? `(${context})` : ''}`);
+  }
+
   modal = await getBlockingModal(page);
-  if (!modal) return dismiss;
-  throw new Error(blockingModalErrorMessage(modal, context));
+  if (modal) {
+    if (modal.error) {
+      throw cbError('MODAL_INSPECTION_FAILED', `Failed to inspect blocking modals after dismiss ${context ? `(${context})` : ''}: ${modal.error}`);
+    }
+    throw cbError('UI_BLOCKER_PRESENT', `Blocking modal still present after dismiss ${context ? `(${context})` : ''}: ${modal.kind || 'unknown'}`);
+  }
+  return dismiss;
 }
 
 async function getCenterPointClickBlocker(page, selectors, label, options = {}) {
@@ -3491,6 +3546,9 @@ async function ensureTargetClickable(page, selectors, label, context, options = 
     await ensureNoBlockingModal(page, context);
   }
   let blocker = await getCenterPointClickBlocker(page, selectors, label, options);
+  if (blocker.error) {
+    throw cbError('CLICKABILITY_STATE_UNVERIFIED', `Failed to verify clickability for ${label} ${context ? `(${context})` : ''}: ${blocker.error}`);
+  }
   if (!blocker.blocked) return blocker;
 
   if (options.dismissBlockers === false) {
@@ -3498,10 +3556,15 @@ async function ensureTargetClickable(page, selectors, label, context, options = 
   }
 
   const dismiss = await dismissBlockingModal(page);
-  if (dismiss.dismissed) {
-    blocker = await getCenterPointClickBlocker(page, selectors, label, options);
-    if (!blocker.blocked) return blocker;
+  if (!dismiss.dismissed) {
+    throw cbError('UI_BLOCKER_UNRESOLVED', dismiss.reason || dismiss.error || `Failed to dismiss blocking modal covering ${label} ${context ? `(${context})` : ''}`);
   }
+
+  blocker = await getCenterPointClickBlocker(page, selectors, label, options);
+  if (blocker.error) {
+    throw cbError('CLICKABILITY_STATE_UNVERIFIED', `Failed to verify clickability after dismiss for ${label} ${context ? `(${context})` : ''}: ${blocker.error}`);
+  }
+  if (!blocker.blocked) return blocker;
 
   throw new Error(clickableBlockerErrorMessage(blocker, context));
 }
@@ -10974,6 +11037,14 @@ async function watchTargetAppState(page, args, options = {}) {
         if (event.blocked) {
           throw cbError('UI_BLOCKER_UNRESOLVED', 'Target still blocked after preview drain');
         }
+        if (event.phase === 'ready' || event.phase === 'idle') {
+          return {
+            ...event,
+            ready: true,
+            waitSatisfied: true,
+            completionReason: 'quiescent_blocker_cleared',
+          };
+        }
       }
     }
     if (args.waitReady && !noTimeout && Date.now() - start >= args.timeout) {
@@ -12505,6 +12576,9 @@ module.exports = {
   getConversationTurns,
   expandCollapsedUserTurn,
   drainSafePreviewDialogs,
+  assertNoBlockingModal,
+  ensureNoBlockingModal,
+  ensureTargetClickable,
   resolveBranchableTurn,
   openBranchMenu,
   isPositivelyBoundBranch,
