@@ -128,6 +128,8 @@ const BLOCKING_MODAL_SELECTORS = [
   '[data-testid^="modal-"][data-testid*="artifact"]',
   '[id^="modal-"][id*="lightbox"]',
   '[data-testid^="modal-"][data-testid*="lightbox"]',
+  '[role="dialog"]',
+  'div.codex-dialog',
 ];
 const CLICK_INTERCEPTOR_SELECTORS = [
   '[role="dialog"]',
