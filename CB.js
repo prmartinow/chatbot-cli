@@ -109,6 +109,7 @@ const COMPOSER_SELECTORS = [
 const SEND_BUTTON_SELECTORS = [
   '#composer-submit-button',
   '[data-testid="send-button"]',
+  'button[aria-label="Send"]',
   'button[aria-label="Send prompt"]',
   'button[aria-label="Send message"]',
 ];
