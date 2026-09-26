@@ -5413,41 +5413,69 @@ test('parseArgs: parses --no-reload flag for capacity recovery branching without
 
 
 test('getConversationTurns: strictly observational (zero clicks on show-more or table buttons)', async () => {
-  let clickCount = 0;
-  // Simulated DOM tree with a Show more button
-  const fakeElement = {
-    click: () => { clickCount++; }
+  // Test simulated DOM turns array where collapsed is preserved
+  const mockPage = {
+    evaluate: async () => [
+      {
+        index: 0,
+        testid: 'turn-u1',
+        messageId: 'u1',
+        turnKey: 'tk1',
+        role: 'user',
+        text: 'User question',
+        roleTexts: ['User question'],
+        turnText: 'User question',
+        collapsed: true,
+        expansionAvailable: true,
+      },
+      {
+        index: 1,
+        testid: 'turn-a1',
+        messageId: 'a1',
+        turnKey: 'tk1',
+        role: 'assistant',
+        text: 'Assistant answer',
+        roleTexts: ['Assistant answer'],
+        turnText: 'Assistant answer',
+        collapsed: false,
+        expansionAvailable: false,
+      }
+    ]
   };
-  // Test that getConversationTurns evaluation logic observes expansionAvailable without clicking
-  const turnData = {
-    role: 'user',
-    text: 'User prompt',
-    collapsed: true,
-    expansionAvailable: true
-  };
-  assert.equal(turnData.collapsed, true);
-  assert.equal(turnData.expansionAvailable, true);
-  assert.equal(clickCount, 0);
+
+  const turns = await getConversationTurns(mockPage);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].collapsed, true);
+  assert.equal(turns[0].expansionAvailable, true);
+  assert.equal(turns[1].collapsed, false);
 });
 
 test('drainSafePreviewDialogs: drains stacked safe preview dialogs and reports resolved', async () => {
-  let calls = 0;
+  let dialogsRemaining = 2;
   const mockPage = {
-    evaluate: async (fn) => {
-      calls++;
-      if (calls === 1) {
-        return { hasDialogs: true, safe: true, fingerprint: 'fp-1', hasCloseButton: true, dialogCount: 2 };
+    evaluate: async (fn, arg) => {
+      // If checking composer verification
+      if (typeof fn === 'function' && fn.toString().includes('composer_element_missing')) {
+        return { verified: true, blocked: false };
       }
-      if (calls === 2) {
-        return { hasDialogs: true, safe: true, fingerprint: 'fp-2', hasCloseButton: true, dialogCount: 1 };
+      // If postProbe (checking if cleared or stuck)
+      if (typeof fn === 'function' && fn.toString().includes('curFp === prevFp')) {
+        dialogsRemaining--;
+        return { cleared: dialogsRemaining === 0, stuck: false, remaining: dialogsRemaining };
       }
-      if (calls === 3) {
-        return { hasDialogs: false };
+      // Dialog probe
+      if (dialogsRemaining > 0) {
+        return {
+          hasDialogs: true,
+          safe: true,
+          kind: 'table_preview',
+          fingerprint: `fp-${dialogsRemaining}`,
+          dialogCount: dialogsRemaining,
+        };
       }
-      // Check composer isBlocked call
-      return false;
+      return { hasDialogs: false };
     },
-    waitForTimeout: async () => {}
+    waitForTimeout: async () => {},
   };
 
   const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
@@ -5458,19 +5486,70 @@ test('drainSafePreviewDialogs: drains stacked safe preview dialogs and reports r
 
 test('drainSafePreviewDialogs: detects MODAL_DISMISS_NO_PROGRESS when fingerprint repeats', async () => {
   const mockPage = {
-    evaluate: async () => {
+    evaluate: async (fn, arg) => {
+      if (typeof fn === 'function' && fn.toString().includes('curFp === prevFp')) {
+        return { cleared: false, stuck: true, remaining: 1 };
+      }
       return {
         hasDialogs: true,
         safe: true,
+        kind: 'table_preview',
         fingerprint: 'static-stuck-fingerprint',
-        hasCloseButton: true,
-        dialogCount: 1
+        dialogCount: 1,
       };
     },
-    waitForTimeout: async () => {}
+    waitForTimeout: async () => {},
   };
 
   const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
   assert.equal(res.resolved, false);
   assert.equal(res.error, 'MODAL_DISMISS_NO_PROGRESS');
+});
+
+test('drainSafePreviewDialogs: fails closed with MODAL_CLOSE_CONTROL_AMBIGUOUS if multiple close controls exist', async () => {
+  const mockPage = {
+    evaluate: async () => ({
+      hasDialogs: true,
+      safe: true,
+      kind: 'table_preview',
+      error: 'MODAL_CLOSE_CONTROL_AMBIGUOUS',
+    }),
+    waitForTimeout: async () => {},
+  };
+
+  const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
+  assert.equal(res.resolved, false);
+  assert.equal(res.error, 'MODAL_CLOSE_CONTROL_AMBIGUOUS');
+});
+
+test('drainSafePreviewDialogs: rejects unsupported or subscription modals from auto-dismiss', async () => {
+  const mockPage = {
+    evaluate: async () => ({
+      hasDialogs: true,
+      safe: false,
+      kind: 'subscription_modal',
+      error: 'dialog_not_on_allowlist: subscription_modal',
+    }),
+    waitForTimeout: async () => {},
+  };
+
+  const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
+  assert.equal(res.resolved, false);
+  assert.match(res.error, /dialog_not_on_allowlist/);
+});
+
+test('drainSafePreviewDialogs: fails closed with COMPOSER_BLOCK_STATE_UNVERIFIED if composer verification throws or is missing', async () => {
+  const mockPage = {
+    evaluate: async (fn) => {
+      if (typeof fn === 'function' && fn.toString().includes('composer_element_missing')) {
+        return { verified: false, error: 'composer_element_missing' };
+      }
+      return { hasDialogs: false };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
+  assert.equal(res.resolved, false);
+  assert.match(res.error, /COMPOSER_BLOCK_STATE_UNVERIFIED/);
 });

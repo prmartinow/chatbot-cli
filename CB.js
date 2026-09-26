@@ -2363,6 +2363,14 @@ async function getConversationTurns(page) {
         const userText = cleanTextOf(userUnit);
         const asstText = cleanTextOf(asstUnit);
 
+        const isCollapsedUser = Boolean(userUnit && Array.from(userUnit.querySelectorAll('button')).some((b) => {
+          if (b.closest('table, [role="table"], [class*="table"]')) return false;
+          if (b.hasAttribute('aria-haspopup') && b.getAttribute('aria-haspopup') !== 'false') return false;
+          const a = (b.getAttribute('aria-label') || '').toLowerCase();
+          const t = (b.textContent || '').trim().toLowerCase();
+          return t === 'show more' || a === 'show more' || b.getAttribute('data-testid') === 'show-more-button';
+        }));
+
         if (userText) {
           extracted.push({
             index: idx++,
@@ -2373,6 +2381,8 @@ async function getConversationTurns(page) {
             role: 'user',
             text: userText,
             turnText: userText,
+            collapsed: isCollapsedUser,
+            expansionAvailable: isCollapsedUser,
           });
         }
         if (asstText) {
@@ -2403,6 +2413,8 @@ async function getConversationTurns(page) {
       text: turn.role === 'assistant'
         ? assistantResponseText(turn.roleTexts?.length ? turn.roleTexts : turn.text, turn.turnText)
         : turn.text,
+      collapsed: Boolean(turn.collapsed),
+      expansionAvailable: Boolean(turn.expansionAvailable),
     }))
     .filter((turn) => turn.role && turn.text);
 }
@@ -3117,6 +3129,9 @@ async function getBlockingModal(page) {
       if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
         return 'settings_modal';
       }
+      if (meta.aria === 'Table preview' || meta.aria === 'table preview' || /^table preview\b/i.test(meta.text) || meta.title === 'Table preview') {
+        return 'table_preview';
+      }
       if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
         return 'artifact_lightbox';
       }
@@ -3145,320 +3160,228 @@ async function getBlockingModal(page) {
 }
 
 async function expandCollapsedUserTurn(page, turnRef) {
-  return page.evaluate((targetTurn) => {
-    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    const userContainers = document.querySelectorAll(
-      '[data-user-message-bubble="true"], [data-message-author-role="user"]'
-    );
-    for (const u of userContainers) {
-      if (targetTurn?.turnKey && u.closest(`[data-turn-key="${targetTurn.turnKey}"]`)) {
-        const btn = [...u.querySelectorAll('button')].find(b => {
-          if (b.closest('table')) return false;
-          const txt = (b.textContent || '').trim().toLowerCase();
-          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-          return (txt === 'show more' || aria === 'show more' || b.getAttribute('data-testid') === 'show-more-button') && isVisible(b);
-        });
-        if (btn) {
-          btn.click();
-          return { expanded: true };
+  const action = async () => {
+    const res = await page.evaluate((target) => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const userContainers = Array.from(document.querySelectorAll(
+        '[data-user-message-bubble="true"], [data-message-author-role="user"]'
+      )).filter(isVisible);
+
+      let targetContainer = null;
+      for (const u of userContainers) {
+        if (target?.turnKey && u.closest(`[data-turn-key="${target.turnKey}"]`)) {
+          targetContainer = u;
+          break;
+        }
+        if (target?.testid && (u.closest(`[data-testid="${target.testid}"]`) || u.getAttribute('data-testid') === target.testid)) {
+          targetContainer = u;
+          break;
         }
       }
+      if (!targetContainer) return { success: false, error: 'target_turn_container_not_found' };
+
+      const qualifyingButtons = Array.from(targetContainer.querySelectorAll('button')).filter((b) => {
+        if (!isVisible(b)) return false;
+        if (b.closest('table, [role="table"], [class*="table"]')) return false;
+        if (b.hasAttribute('aria-haspopup') && b.getAttribute('aria-haspopup') !== 'false') return false;
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        const txt = (b.textContent || '').trim().toLowerCase();
+        return txt === 'show more' || aria === 'show more' || b.getAttribute('data-testid') === 'show-more-button';
+      });
+
+      if (qualifyingButtons.length === 0) return { success: false, error: 'no_qualifying_expand_buttons' };
+      if (qualifyingButtons.length > 1) return { success: false, error: 'EXPAND_CONTROL_AMBIGUOUS' };
+
+      const initialLen = (targetContainer.innerText || '').length;
+      qualifyingButtons[0].click();
+
+      return {
+        success: true,
+        initialLen,
+      };
+    }, turnRef);
+
+    if (!res.success) {
+      throw cbError('TURN_EXPANSION_FAILED', `Failed to expand user turn: ${res.error}`);
     }
-    return { expanded: false };
-  }, turnRef).catch(() => ({ expanded: false }));
+
+    await page.waitForTimeout(150);
+    const postCheck = await page.evaluate(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], .codex-dialog')).filter(isVisible);
+      return { dialogCount: dialogs.length };
+    });
+
+    if (postCheck.dialogCount > 0) {
+      throw cbError('TURN_EXPANSION_ILLEGAL_MUTATION', 'Turn expansion mounted an unexpected dialog');
+    }
+
+    return { expanded: true };
+  };
+
+  const laneArg = { cdp: args?.cdp || DEFAULT_CDP, pageTargetId: await getPageTargetId(page).catch(() => '') };
+  return laneArg.pageTargetId ? withBrowserLaneLease(laneArg, randomId('expand-user-turn'), action) : action();
 }
 
 async function drainSafePreviewDialogs(page, options = {}) {
   const maxDialogs = options.maxDialogs || 16;
   let dismissedCount = 0;
-  let previousFingerprint = null;
 
   for (let step = 0; step < maxDialogs; step++) {
-    const drainProbe = await page.evaluate(() => {
+    // 1. Enumerate visible dialogs, classify top layer, and resolve unique close button
+    const dialogProbe = await page.evaluate(() => {
       const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
       const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
 
-      const allDialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .codex-dialog'))
+      const allDialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]'))
         .filter(isVisible);
 
       if (allDialogs.length === 0) {
         return { hasDialogs: false };
       }
 
-      // Pick top-layer dialog (highest in document / DOM order)
+      // Pick the topmost layer in DOM order
       const topDialog = allDialogs[allDialogs.length - 1];
-      const aria = (topDialog.getAttribute('aria-label') || '').toLowerCase();
-      const testid = (topDialog.getAttribute('data-testid') || '').toLowerCase();
-      const id = (topDialog.id || '').toLowerCase();
-      const text = textOf(topDialog).toLowerCase();
+      const aria = (topDialog.getAttribute('aria-label') || '').trim();
+      const testid = (topDialog.getAttribute('data-testid') || '').trim();
+      const text = textOf(topDialog);
 
-      // Strict allow-list for automated dismissal
-      const isTablePreview = aria.includes('table preview') || text.startsWith('table preview') || topDialog.classList.contains('codex-dialog');
-      const isArtifactLightbox = /artifact|lightbox|image preview|media preview/i.test(aria) || /artifact|lightbox/i.test(testid);
-      const isSubscriptionFailure = id.includes('modal-subscription-failure') || testid.includes('modal-subscription-failure');
+      // Semantic classification (never structural .codex-dialog alone)
+      let kind = 'unsupported_dialog';
+      if (aria.toLowerCase() === 'table preview' || /^table preview\b/i.test(text)) {
+        kind = 'table_preview';
+      } else if (/(?:artifact|lightbox|image preview|media preview)/i.test(aria) || /(?:artifact|lightbox)/i.test(testid)) {
+        kind = 'artifact_preview';
+      }
 
-      if (!isTablePreview && !isArtifactLightbox && !isSubscriptionFailure) {
+      // Strict allow-list
+      if (kind !== 'table_preview' && kind !== 'artifact_preview') {
         return {
           hasDialogs: true,
           safe: false,
-          kind: 'unsupported_dialog',
+          kind,
           id: topDialog.id,
-          aria: topDialog.getAttribute('aria-label')
+          aria,
+          error: `dialog_not_on_allowlist: ${kind}`,
         };
       }
 
-      // Compute fingerprint for top dialog
-      const fingerprint = `${topDialog.id || ''}:${topDialog.getAttribute('aria-label') || ''}:${text.slice(0, 100)}:${allDialogs.length}`;
-
-      // Locate close button strictly within topDialog
-      const closeButtons = Array.from(topDialog.querySelectorAll('button, [role="button"]')).filter(b => {
-        if (!isVisible(b)) return false;
-        const bAria = (b.getAttribute('aria-label') || '').toLowerCase();
-        const bText = textOf(b).toLowerCase();
-        return bAria === 'close table preview'
-          || bAria === 'close'
-          || bAria.includes('close')
-          || bText === 'close'
-          || b.getAttribute('data-testid') === 'close-button';
-      });
+      // Unique close control resolution
+      let closeButtons = [];
+      if (kind === 'table_preview') {
+        closeButtons = Array.from(topDialog.querySelectorAll('button, [role="button"]')).filter((b) => {
+          if (!isVisible(b)) return false;
+          const bAria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+          return bAria === 'close table preview' || bAria === 'close';
+        });
+      } else {
+        closeButtons = Array.from(topDialog.querySelectorAll('button, [role="button"]')).filter((b) => {
+          if (!isVisible(b)) return false;
+          const bAria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+          const bText = textOf(b).toLowerCase();
+          return bAria === 'close' || bText === 'close';
+        });
+      }
 
       if (closeButtons.length === 0) {
-        return {
-          hasDialogs: true,
-          safe: true,
-          fingerprint,
-          hasCloseButton: false
-        };
+        return { hasDialogs: true, safe: true, kind, error: 'close_button_not_found' };
+      }
+      if (closeButtons.length > 1) {
+        return { hasDialogs: true, safe: true, kind, error: 'MODAL_CLOSE_CONTROL_AMBIGUOUS' };
       }
 
-      // Click the primary close button
-      const closeBtn = closeButtons[0];
-      closeBtn.click();
+      const fingerprint = `${topDialog.id || ''}:${aria}:${text.slice(0, 100)}:${allDialogs.length}`;
+
+      // Click exactly once
+      closeButtons[0].click();
 
       return {
         hasDialogs: true,
         safe: true,
+        kind,
         fingerprint,
-        hasCloseButton: true,
-        dialogCount: allDialogs.length
+        dialogCount: allDialogs.length,
       };
-    }).catch(err => ({ error: err.message || String(err) }));
+    }).catch((err) => ({ error: err.message || String(err) }));
 
-    if (drainProbe.error) {
-      return { resolved: false, dismissedCount, remainingDialogs: -1, error: drainProbe.error };
+    if (dialogProbe.error) {
+      return { resolved: false, dismissedCount, remainingDialogs: -1, error: dialogProbe.error };
     }
 
-    if (!drainProbe.hasDialogs) {
-      // Zero dialogs left! Verify composer center is unblocked
-      const isBlocked = await page.evaluate(() => {
+    if (!dialogProbe.hasDialogs) {
+      // Zero dialogs remain: fail-closed positive postcondition on composer center
+      const composerVerification = await page.evaluate(() => {
         const composer = document.querySelector('#prompt-textarea, [contenteditable="true"]');
-        if (!composer) return false;
+        if (!composer) return { verified: false, error: 'composer_element_missing' };
         const rect = composer.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (rect.width <= 0 || rect.height <= 0) return { verified: false, error: 'composer_geometry_zero' };
         const topEl = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
-        return Boolean(topEl && topEl !== composer && !composer.contains(topEl) && topEl.closest('[role="dialog"], [aria-modal="true"]'));
-      }).catch(() => false);
+        if (!topEl) return { verified: false, error: 'composer_top_element_missing' };
+        const isOverlay = topEl !== composer && !composer.contains(topEl) && topEl.closest('[role="dialog"], [aria-modal="true"], .codex-dialog');
+        return {
+          verified: true,
+          blocked: Boolean(isOverlay),
+        };
+      }).catch((err) => ({ verified: false, error: err.message || String(err) }));
 
-      if (isBlocked) {
+      if (!composerVerification.verified) {
+        return { resolved: false, dismissedCount, remainingDialogs: 0, error: `COMPOSER_BLOCK_STATE_UNVERIFIED: ${composerVerification.error}` };
+      }
+      if (composerVerification.blocked) {
         return { resolved: false, dismissedCount, remainingDialogs: 0, error: 'composer_still_blocked_by_overlay' };
       }
 
       return { resolved: true, dismissedCount, remainingDialogs: 0, error: null };
     }
 
-    if (!drainProbe.safe) {
-      return { resolved: false, dismissedCount, remainingDialogs: 1, error: `dialog_not_on_allowlist: ${drainProbe.id || drainProbe.aria}` };
-    }
+    // Single-click immediate postcondition check
+    await page.waitForTimeout(150);
+    const postProbe = await page.evaluate((prevFp) => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+      const currentDialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open]')).filter(isVisible);
+      if (currentDialogs.length === 0) return { cleared: true };
+      const top = currentDialogs[currentDialogs.length - 1];
+      const curFp = `${top.id || ''}:${top.getAttribute('aria-label') || ''}:${textOf(top).slice(0, 100)}:${currentDialogs.length}`;
+      return { cleared: false, stuck: curFp === prevFp, remaining: currentDialogs.length };
+    }, dialogProbe.fingerprint);
 
-    if (!drainProbe.hasCloseButton) {
-      return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'close_button_not_found' };
-    }
-
-    if (drainProbe.fingerprint === previousFingerprint) {
+    if (postProbe.stuck) {
       return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'MODAL_DISMISS_NO_PROGRESS' };
     }
 
-    previousFingerprint = drainProbe.fingerprint;
     dismissedCount++;
-    await page.waitForTimeout(100);
   }
 
   return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'MAX_DRAIN_ITERATIONS_EXCEEDED' };
 }
 
 async function dismissBlockingModal(page) {
-  let dismissedAny = false;
-  let lastCandidate = null;
-
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const candidate = await page.evaluate((selectors) => {
-    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
-    const kindOf = (meta) => {
-      const joined = [meta.id || '', meta.testid || '', meta.role || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
-      if (/conversation-history-rate-limit|conversation\s+history.*rate\s+limit|rate\s+limit|too many requests|limit reached/i.test(joined)) {
-        return 'conversation_history_rate_limit';
-      }
-      if (/modal-subscription-failure|subscription|plan limit/i.test(joined)) {
-        return 'subscription_modal';
-      }
-      if (/modal-settings|settings|personalization|custom instructions|base style and tone/i.test(joined)) {
-        return 'settings_modal';
-      }
-      if (/\b(artifact|lightbox|image preview|media preview)\b/i.test(joined)) {
-        return 'artifact_lightbox';
-      }
-      return 'blocking_modal';
+  const drain = await drainSafePreviewDialogs(page, { maxDialogs: 8 });
+  if (drain.resolved && drain.dismissedCount > 0) {
+    return {
+      dismissed: true,
+      found: true,
+      safe: true,
+      clicked: true,
+      escaped: false,
+      modal: { kind: 'safe_preview_dialog' },
+      remaining: null,
+      dismissedCount: drain.dismissedCount,
     };
-    const isSafe = (meta) => {
-      const joined = [meta.id || '', meta.testid || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
-      return /modal-subscription-failure/i.test(joined)
-        || /\b(artifact|lightbox|image preview|media preview|table preview|preview)\b/i.test(joined);
-    };
-    const unsafeAction = (el) => /\b(update payment|upgrade|log in|login|sign in|captcha|delete|remove|confirm|continue|subscribe|buy|purchase|pay)\b/i.test([
-      el.getAttribute('aria-label') || '',
-      el.getAttribute('title') || '',
-      textOf(el),
-    ].join(' '));
-    const metaOf = (modal, candidateEl) => {
-      const result = {
-        id: modal.id || candidateEl.id || '',
-        testid: modal.getAttribute('data-testid') || candidateEl.getAttribute('data-testid') || '',
-        role: modal.getAttribute('role') || '',
-        ariaModal: modal.getAttribute('aria-modal') || '',
-        aria: modal.getAttribute('aria-label') || candidateEl.getAttribute('aria-label') || '',
-        title: modal.getAttribute('title') || candidateEl.getAttribute('title') || '',
-        text: textOf(modal),
-      };
-      return { ...result, kind: kindOf(result) };
-    };
-
-    for (const selector of selectors) {
-      for (const candidateEl of document.querySelectorAll(selector)) {
-        const modal = candidateEl.closest('[role="dialog"],[aria-modal="true"],[id^="modal-"],[data-testid^="modal-"]') || candidateEl;
-        if (!isVisible(modal)) continue;
-        const modalMeta = metaOf(modal, candidateEl);
-        if (!isSafe(modalMeta)) return { found: true, safe: false, modal: modalMeta };
-
-        const controls = [
-          ...modal.querySelectorAll('button[aria-label*="close" i], [role="button"][aria-label*="close" i]'),
-          ...[...modal.querySelectorAll('button')].filter((button) => /close/i.test(textOf(button))),
-        ].filter((control, index, list) => list.indexOf(control) === index)
-          .filter(isVisible)
-          .filter((control) => !unsafeAction(control));
-        const marker = `cb-dismiss-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        if (controls[0]) {
-          controls[0].setAttribute('data-cb-dismiss-blocker', marker);
-          return {
-            found: true,
-            safe: true,
-            modal: modalMeta,
-            closeSelector: `[data-cb-dismiss-blocker="${marker}"]`,
-          };
-        }
-
-        return { found: true, safe: true, modal: modalMeta, closeSelector: '' };
-      }
-    }
-
-    return { found: false, safe: false, modal: null, closeSelector: '' };
-  }, BLOCKING_MODAL_SELECTORS).catch((error) => ({
-    found: false,
-    safe: false,
-    modal: null,
-    closeSelector: '',
-    error: error.message || String(error),
-  }));
-
-    if (!candidate?.found) {
-      if (dismissedAny) {
-        return {
-          dismissed: true,
-          found: true,
-          safe: true,
-          clicked: true,
-          escaped: false,
-          modal: lastCandidate?.modal || null,
-          remaining: null,
-        };
-      }
-      return { dismissed: false, found: false, reason: candidate?.error || 'no blocker' };
-    }
-    if (!candidate.safe) {
-      return { dismissed: false, found: true, modal: candidate.modal, reason: 'not safe to dismiss automatically' };
-    }
-
-    lastCandidate = candidate;
-    if (candidate.closeSelector) {
-      const clicked = await page.evaluate((sel) => {
-        const el = document.querySelector(sel);
-        if (el) { el.click(); return true; }
-        return false;
-      }, candidate.closeSelector).catch(() => false);
-      if (clicked) {
-        dismissedAny = true;
-        await page.waitForTimeout(300);
-        continue;
-      }
-    }
-
-    await page.keyboard.press('Escape').catch(() => {});
-    await page.waitForTimeout(400);
-    dismissedAny = true;
   }
-
   const remaining = await getBlockingModal(page);
   return {
-    dismissed: !remaining,
-    found: true,
-    safe: true,
-    clicked: dismissedAny,
-    escaped: dismissedAny,
-    modal: lastCandidate?.modal || null,
+    dismissed: drain.resolved,
+    found: Boolean(remaining || drain.dismissedCount > 0),
+    safe: !drain.error?.includes('dialog_not_on_allowlist'),
+    clicked: drain.dismissedCount > 0,
+    escaped: false,
+    reason: drain.error || '',
+    modal: remaining,
     remaining,
+    dismissedCount: drain.dismissedCount,
   };
-}
-
-function printBlockingDismissal(result, jsonl = false) {
-  const payload = {
-    type: 'target_app_blocker_dismissal',
-    at: nowIso(),
-    dismissed: Boolean(result.dismissed),
-    found: Boolean(result.found),
-    safe: Boolean(result.safe),
-    clicked: Boolean(result.clicked),
-    escaped: Boolean(result.escaped),
-    reason: result.reason || '',
-    modal: result.modal || null,
-    remaining: result.remaining || null,
-  };
-  if (jsonl) {
-    console.log(JSON.stringify(payload));
-    return;
-  }
-
-  if (!payload.found) {
-    console.log('No blocking modal found.');
-  } else if (!payload.safe) {
-    console.log(`Blocking modal is not safe to dismiss automatically: ${blockingModalSummary(payload.modal)}`);
-    if (payload.reason) console.log(`Reason: ${payload.reason}`);
-  } else if (payload.dismissed) {
-    const actions = [
-      payload.clicked ? 'clicked close control' : '',
-      payload.escaped ? 'pressed Escape' : '',
-    ].filter(Boolean).join(', ') || 'dismissed';
-    console.log(`Dismissed blocking modal: ${blockingModalSummary(payload.modal)}`);
-    console.log(`Action: ${actions}`);
-  } else {
-    console.log(`Blocking modal remains: ${blockingModalSummary(payload.remaining || payload.modal)}`);
-    if (payload.reason) console.log(`Reason: ${payload.reason}`);
-  }
-}
-
-async function assertNoBlockingModal(page, context) {
-  const modal = await getBlockingModal(page);
-  if (modal) throw new Error(blockingModalErrorMessage(modal, context));
-  return null;
 }
 
 async function ensureNoBlockingModal(page, context) {
@@ -11016,6 +10939,9 @@ async function watchTargetAppState(page, args, options = {}) {
           if (event.phase === 'error' || event.terminalError) {
             throw cbError('ASSISTANT_TERMINAL_ERROR', `Generation ceased with terminal error: ${event.terminalErrorText || event.terminalError || 'unknown error'}`);
           }
+          if (event.connectionInterrupted) {
+            throw cbError('CONNECTION_INTERRUPTED', 'Connection interrupted while awaiting assistant response');
+          }
           if (event.blocked) {
             throw cbError('UI_BLOCKER_UNRESOLVED', 'Target still blocked after preview drain');
           }
@@ -11027,6 +10953,26 @@ async function watchTargetAppState(page, args, options = {}) {
             waitSatisfied: true,
             completionReason: 'generation_ceased',
           };
+        }
+      }
+
+      // Quiescent blocked state recovery: if already blocked with no generation active, drain immediately
+      if (!sawGenerating && event.blocked && !event.generating && !event.activeProgress) {
+        info(`[watcher] Target is quiescent but blocked by ${event.blockingModal?.kind || 'modal'}; draining safe preview dialogs...`);
+        const drainResult = await drainSafePreviewDialogs(page, { maxDialogs: 16 });
+        if (!drainResult.resolved) {
+          throw cbError('UI_BLOCKER_UNRESOLVED', `UI blocker unresolved on quiescent target: ${drainResult.error || 'could not dismiss modal'}`);
+        }
+        const state = await getTargetAppState(page);
+        event = emitter.emit(state);
+        if (event.phase === 'error' || event.terminalError) {
+          throw cbError('ASSISTANT_TERMINAL_ERROR', `Terminal error: ${event.terminalErrorText || event.terminalError || 'unknown error'}`);
+        }
+        if (event.connectionInterrupted) {
+          throw cbError('CONNECTION_INTERRUPTED', 'Connection interrupted');
+        }
+        if (event.blocked) {
+          throw cbError('UI_BLOCKER_UNRESOLVED', 'Target still blocked after preview drain');
         }
       }
     }
