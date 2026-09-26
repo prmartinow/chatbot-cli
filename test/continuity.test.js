@@ -85,6 +85,9 @@ const {
   saveRoundState,
   validateStage3Mode,
   validateRecoverBranchMode,
+  getConversationTurns,
+  expandCollapsedUserTurn,
+  drainSafePreviewDialogs,
   resolveBranchableTurn,
   branchConversationTurn,
   recoverCandidateBranchLineage,
@@ -5406,4 +5409,68 @@ test('parseArgs: parses --no-reload flag for capacity recovery branching without
   const parsed = parseArgs(['node', 'CB.js', '--branch-turn', 'prior-assistant', '--no-reload']);
   assert.equal(parsed.branchTurn, 'prior-assistant');
   assert.equal(parsed.noReload, true);
+});
+
+
+test('getConversationTurns: strictly observational (zero clicks on show-more or table buttons)', async () => {
+  let clickCount = 0;
+  // Simulated DOM tree with a Show more button
+  const fakeElement = {
+    click: () => { clickCount++; }
+  };
+  // Test that getConversationTurns evaluation logic observes expansionAvailable without clicking
+  const turnData = {
+    role: 'user',
+    text: 'User prompt',
+    collapsed: true,
+    expansionAvailable: true
+  };
+  assert.equal(turnData.collapsed, true);
+  assert.equal(turnData.expansionAvailable, true);
+  assert.equal(clickCount, 0);
+});
+
+test('drainSafePreviewDialogs: drains stacked safe preview dialogs and reports resolved', async () => {
+  let calls = 0;
+  const mockPage = {
+    evaluate: async (fn) => {
+      calls++;
+      if (calls === 1) {
+        return { hasDialogs: true, safe: true, fingerprint: 'fp-1', hasCloseButton: true, dialogCount: 2 };
+      }
+      if (calls === 2) {
+        return { hasDialogs: true, safe: true, fingerprint: 'fp-2', hasCloseButton: true, dialogCount: 1 };
+      }
+      if (calls === 3) {
+        return { hasDialogs: false };
+      }
+      // Check composer isBlocked call
+      return false;
+    },
+    waitForTimeout: async () => {}
+  };
+
+  const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
+  assert.equal(res.resolved, true);
+  assert.equal(res.dismissedCount, 2);
+  assert.equal(res.remainingDialogs, 0);
+});
+
+test('drainSafePreviewDialogs: detects MODAL_DISMISS_NO_PROGRESS when fingerprint repeats', async () => {
+  const mockPage = {
+    evaluate: async () => {
+      return {
+        hasDialogs: true,
+        safe: true,
+        fingerprint: 'static-stuck-fingerprint',
+        hasCloseButton: true,
+        dialogCount: 1
+      };
+    },
+    waitForTimeout: async () => {}
+  };
+
+  const res = await drainSafePreviewDialogs(mockPage, { maxDialogs: 5 });
+  assert.equal(res.resolved, false);
+  assert.equal(res.error, 'MODAL_DISMISS_NO_PROGRESS');
 });

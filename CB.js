@@ -2268,7 +2268,8 @@ async function getConversationTurns(page) {
     const extracted = [];
     let idx = 0;
 
-    // Auto-expand collapsed user bubbles only (strictly scoped to user containers, never clicking table controls)
+    // PASSIVE OBSERVATION: Inspect collapsed user turns without mutating or clicking DOM
+    const collapsedTurnKeys = new Set();
     try {
       const userContainers = document.querySelectorAll(
         '[data-user-message-bubble="true"], [data-message-author-role="user"]'
@@ -2281,7 +2282,8 @@ async function getConversationTurns(page) {
           const txt = (btn.textContent || '').trim().toLowerCase();
           if (aria.includes('table') || txt.includes('table')) return;
           if (txt === 'show more' || aria === 'show more' || btn.getAttribute('data-testid') === 'show-more-button') {
-            btn.click();
+            const tk = u.closest('[data-turn-key]')?.getAttribute('data-turn-key');
+            if (tk) collapsedTurnKeys.add(tk);
           }
         });
       });
@@ -2305,6 +2307,7 @@ async function getConversationTurns(page) {
         const roleTexts = roleEls.map(cleanTextOf).filter(Boolean);
         const messageId = getMessageId(container) || (roleEls[0] ? getMessageId(roleEls[0]) : '');
         if (role && (roleTexts[0] || cleanTextOf(container))) {
+          const cKey = container.getAttribute('data-turn-key') || '';
           extracted.push({
             index: idx++,
             testid: container.getAttribute('data-testid') || '',
@@ -2313,6 +2316,8 @@ async function getConversationTurns(page) {
             text: roleTexts[0] || cleanTextOf(container),
             roleTexts,
             turnText: cleanTextOf(container),
+            collapsed: collapsedTurnKeys.has(cKey),
+            expansionAvailable: collapsedTurnKeys.has(cKey),
           });
         }
       } else if (container.hasAttribute('data-turn-key')) {
@@ -3137,6 +3142,148 @@ async function getBlockingModal(page) {
 
     return null;
   }, BLOCKING_MODAL_SELECTORS).catch(() => null);
+}
+
+async function expandCollapsedUserTurn(page, turnRef) {
+  return page.evaluate((targetTurn) => {
+    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+    const userContainers = document.querySelectorAll(
+      '[data-user-message-bubble="true"], [data-message-author-role="user"]'
+    );
+    for (const u of userContainers) {
+      if (targetTurn?.turnKey && u.closest(`[data-turn-key="${targetTurn.turnKey}"]`)) {
+        const btn = [...u.querySelectorAll('button')].find(b => {
+          if (b.closest('table')) return false;
+          const txt = (b.textContent || '').trim().toLowerCase();
+          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+          return (txt === 'show more' || aria === 'show more' || b.getAttribute('data-testid') === 'show-more-button') && isVisible(b);
+        });
+        if (btn) {
+          btn.click();
+          return { expanded: true };
+        }
+      }
+    }
+    return { expanded: false };
+  }, turnRef).catch(() => ({ expanded: false }));
+}
+
+async function drainSafePreviewDialogs(page, options = {}) {
+  const maxDialogs = options.maxDialogs || 16;
+  let dismissedCount = 0;
+  let previousFingerprint = null;
+
+  for (let step = 0; step < maxDialogs; step++) {
+    const drainProbe = await page.evaluate(() => {
+      const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+
+      const allDialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .codex-dialog'))
+        .filter(isVisible);
+
+      if (allDialogs.length === 0) {
+        return { hasDialogs: false };
+      }
+
+      // Pick top-layer dialog (highest in document / DOM order)
+      const topDialog = allDialogs[allDialogs.length - 1];
+      const aria = (topDialog.getAttribute('aria-label') || '').toLowerCase();
+      const testid = (topDialog.getAttribute('data-testid') || '').toLowerCase();
+      const id = (topDialog.id || '').toLowerCase();
+      const text = textOf(topDialog).toLowerCase();
+
+      // Strict allow-list for automated dismissal
+      const isTablePreview = aria.includes('table preview') || text.startsWith('table preview') || topDialog.classList.contains('codex-dialog');
+      const isArtifactLightbox = /artifact|lightbox|image preview|media preview/i.test(aria) || /artifact|lightbox/i.test(testid);
+      const isSubscriptionFailure = id.includes('modal-subscription-failure') || testid.includes('modal-subscription-failure');
+
+      if (!isTablePreview && !isArtifactLightbox && !isSubscriptionFailure) {
+        return {
+          hasDialogs: true,
+          safe: false,
+          kind: 'unsupported_dialog',
+          id: topDialog.id,
+          aria: topDialog.getAttribute('aria-label')
+        };
+      }
+
+      // Compute fingerprint for top dialog
+      const fingerprint = `${topDialog.id || ''}:${topDialog.getAttribute('aria-label') || ''}:${text.slice(0, 100)}:${allDialogs.length}`;
+
+      // Locate close button strictly within topDialog
+      const closeButtons = Array.from(topDialog.querySelectorAll('button, [role="button"]')).filter(b => {
+        if (!isVisible(b)) return false;
+        const bAria = (b.getAttribute('aria-label') || '').toLowerCase();
+        const bText = textOf(b).toLowerCase();
+        return bAria === 'close table preview'
+          || bAria === 'close'
+          || bAria.includes('close')
+          || bText === 'close'
+          || b.getAttribute('data-testid') === 'close-button';
+      });
+
+      if (closeButtons.length === 0) {
+        return {
+          hasDialogs: true,
+          safe: true,
+          fingerprint,
+          hasCloseButton: false
+        };
+      }
+
+      // Click the primary close button
+      const closeBtn = closeButtons[0];
+      closeBtn.click();
+
+      return {
+        hasDialogs: true,
+        safe: true,
+        fingerprint,
+        hasCloseButton: true,
+        dialogCount: allDialogs.length
+      };
+    }).catch(err => ({ error: err.message || String(err) }));
+
+    if (drainProbe.error) {
+      return { resolved: false, dismissedCount, remainingDialogs: -1, error: drainProbe.error };
+    }
+
+    if (!drainProbe.hasDialogs) {
+      // Zero dialogs left! Verify composer center is unblocked
+      const isBlocked = await page.evaluate(() => {
+        const composer = document.querySelector('#prompt-textarea, [contenteditable="true"]');
+        if (!composer) return false;
+        const rect = composer.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const topEl = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return Boolean(topEl && topEl !== composer && !composer.contains(topEl) && topEl.closest('[role="dialog"], [aria-modal="true"]'));
+      }).catch(() => false);
+
+      if (isBlocked) {
+        return { resolved: false, dismissedCount, remainingDialogs: 0, error: 'composer_still_blocked_by_overlay' };
+      }
+
+      return { resolved: true, dismissedCount, remainingDialogs: 0, error: null };
+    }
+
+    if (!drainProbe.safe) {
+      return { resolved: false, dismissedCount, remainingDialogs: 1, error: `dialog_not_on_allowlist: ${drainProbe.id || drainProbe.aria}` };
+    }
+
+    if (!drainProbe.hasCloseButton) {
+      return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'close_button_not_found' };
+    }
+
+    if (drainProbe.fingerprint === previousFingerprint) {
+      return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'MODAL_DISMISS_NO_PROGRESS' };
+    }
+
+    previousFingerprint = drainProbe.fingerprint;
+    dismissedCount++;
+    await page.waitForTimeout(100);
+  }
+
+  return { resolved: false, dismissedCount, remainingDialogs: 1, error: 'MAX_DRAIN_ITERATIONS_EXCEEDED' };
 }
 
 async function dismissBlockingModal(page) {
@@ -4309,7 +4456,7 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     || state.generationControls?.length
     || progressOnlyAssistant
     || progressActivityWithoutAssistant);
-  const ready = Boolean(!activeProgress && assistantAdvanced);
+  const ready = Boolean(!activeProgress && assistantAdvanced && !blockedByModal && !state.terminalError && !state.connectionInterrupted);
   const composerBusy = Boolean(state.composer?.textChars || state.composer?.attachments?.length);
   const phase = ready
     ? 'ready'
@@ -4328,6 +4475,11 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     at: new Date().toISOString(),
     phase,
     ready,
+    activeProgress,
+    blocked: blockedByModal,
+    terminalError: Boolean(state.terminalError),
+    terminalErrorText: state.terminalErrorText || '',
+    connectionInterrupted: Boolean(state.connectionInterrupted),
     maxLengthReached: Boolean(state.maxLengthReached),
     connectionInterrupted: Boolean(state.connectionInterrupted),
     edgeState: state.maxLengthReached ? 'max_conversation_length' : (state.connectionInterrupted ? 'connection_interrupted' : null),
@@ -10848,7 +11000,25 @@ async function watchTargetAppState(page, args, options = {}) {
       // If generation was active and has now completely ceased:
       if (sawGenerating && !event.generating && !event.activeProgress) {
         if (event.phase === 'error' || event.terminalError) {
-          throw cbError('ASSISTANT_TERMINAL_ERROR', `Generation ceased with terminal error: ${event.terminalError || 'unknown error'}`);
+          throw cbError('ASSISTANT_TERMINAL_ERROR', `Generation ceased with terminal error: ${event.terminalErrorText || event.terminalError || 'unknown error'}`);
+        }
+        if (event.connectionInterrupted) {
+          throw cbError('CONNECTION_INTERRUPTED', 'Connection interrupted while awaiting assistant response');
+        }
+        if (event.blocked) {
+          info(`[watcher] Generation ceased but target is blocked by ${event.blockingModal?.kind || 'modal'}; draining safe preview dialogs...`);
+          const drainResult = await drainSafePreviewDialogs(page, { maxDialogs: 16 });
+          if (!drainResult.resolved) {
+            throw cbError('UI_BLOCKER_UNRESOLVED', `UI blocker unresolved after generation ceased: ${drainResult.error || 'could not dismiss modal'}`);
+          }
+          const state = await getTargetAppState(page);
+          event = emitter.emit(state);
+          if (event.phase === 'error' || event.terminalError) {
+            throw cbError('ASSISTANT_TERMINAL_ERROR', `Generation ceased with terminal error: ${event.terminalErrorText || event.terminalError || 'unknown error'}`);
+          }
+          if (event.blocked) {
+            throw cbError('UI_BLOCKER_UNRESOLVED', 'Target still blocked after preview drain');
+          }
         }
         if (event.phase === 'ready' || event.phase === 'idle') {
           return {
@@ -12387,6 +12557,8 @@ module.exports = {
   queueHoldStatusForError,
   findRoundForJob,
   getConversationTurns,
+  expandCollapsedUserTurn,
+  drainSafePreviewDialogs,
   resolveBranchableTurn,
   openBranchMenu,
   isPositivelyBoundBranch,
