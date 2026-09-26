@@ -49,6 +49,7 @@ const {
   waitForSendReady,
   getSendButtonState,
   findComposerRootLocator,
+  turnMatchesMessage,
   composerDraftMatchesMessage,
   isPositivelyBoundBranch,
   isPositivelyCompletedRound,
@@ -4787,6 +4788,8 @@ test('isPositivelyCompletedRound: rejects terminal_error, uncertain outcome, fai
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'uncertain' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'prepared' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'dispatching' }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted', assistantOutcome: null }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted' }), false);
 });
 
 test('isPositivelyBoundBranch: validates done/bound status, child session identity, and structured attestations', () => {
@@ -5186,4 +5189,94 @@ test('watchTargetAppState: returns cleanly when generation ceases into idle phas
   const res = await watchTargetAppState(fakePage, args);
   assert.equal(res.phase, 'idle');
   assert.equal(res.generating, false);
+});
+
+test('turnMatchesMessage: rejects truncated partial message and requires full canonical prompt text', () => {
+  const fullMessage = 'A'.repeat(500) + ' MIDDLE CONTENT ' + 'Z'.repeat(500);
+  const truncatedBubble = 'A'.repeat(500) + '...'; // only head prefix, dropped middle and tail
+
+  // Must reject truncated bubble
+  assert.equal(turnMatchesMessage(truncatedBubble, fullMessage), false);
+
+  // Must accept complete matching text
+  assert.equal(turnMatchesMessage(fullMessage, fullMessage), true);
+});
+
+test('branchConversationTurn: pre-click generation check aborts with CONVERSATION_BUSY cleanly without ReferenceError', async () => {
+  const parentId = '77777777-7777-7777-7777-777777777777';
+  let callCount = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${parentId}`,
+    goto: async () => {},
+    reload: async () => {},
+    bringToFront: async () => {},
+    waitForLoadState: async () => {},
+    waitForTimeout: async () => {},
+    evaluate: async (fn) => {
+      callCount++;
+      // Handle hydration checks
+      if (typeof fn === 'function' && fn.toString().includes('sessionIdFromLocation')) {
+        return {
+          hydrated: true,
+          sessionId: parentId,
+          turnCount: 2,
+          roleNodeCount: 2,
+        };
+      }
+      // First 3 calls: initial check, post-reload check are not generating
+      if (callCount <= 4) {
+        return {
+          url: `https://chatgpt.com/c/${parentId}`,
+          hydrated: true,
+          sessionId: parentId,
+          isGenerating: false,
+          generationControls: [],
+          turnCount: 2,
+          lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a', turnKey: 'k-a' }],
+          activityTexts: [],
+        };
+      }
+      // Immediate pre-click check: generation became active!
+      return {
+        url: `https://chatgpt.com/c/${parentId}`,
+        hydrated: true,
+        sessionId: parentId,
+        isGenerating: true,
+        generationControls: [{ text: 'Stop' }],
+        turnCount: 2,
+        lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a', turnKey: 'k-a' }],
+        activityTexts: ['Thinking'],
+      };
+    },
+    $$eval: async () => [
+      { role: 'assistant', index: 1, textid: 't-a', turnKey: 'k-a', text: 'turn content' }
+    ],
+    locator: (sel) => ({
+      first: () => ({
+        count: async () => 1,
+        click: async () => {},
+        waitFor: async () => {},
+        isVisible: async () => true,
+        hover: async () => {},
+      }),
+      last: () => ({
+        count: async () => 1,
+        click: async () => {},
+        waitFor: async () => {},
+        isVisible: async () => true,
+      }),
+      count: async () => 1,
+    }),
+  };
+
+  const args = {
+    expectedSessionId: parentId,
+    branchTurn: 'latest',
+  };
+
+  await assert.rejects(
+    async () => branchConversationTurn(fakePage, args),
+    (err) => err.code === 'CONVERSATION_BUSY'
+  );
 });

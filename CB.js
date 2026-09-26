@@ -1487,7 +1487,8 @@ function isPositivelyCompletedRound(round) {
   if (round.status === 'failed' || round.dispatchState === 'aborted_precommit' || round.dispatchState === 'uncertain') {
     return false;
   }
-  if (round.assistantOutcome && round.assistantOutcome !== 'succeeded') {
+  // Require positive proof of successful assistant completion
+  if (round.assistantOutcome !== 'succeeded') {
     return false;
   }
   const isStatusDone = round.status === 'done' || round.status === 'completed';
@@ -2227,90 +2228,122 @@ async function getConversationTurns(page) {
       clone.querySelectorAll('button, [role="button"]').forEach((b) => b.remove());
       return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
     };
+    const cleanTextOf = (el) => {
+      if (!el) return '';
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('[role="separator"], button, [role="button"], .sr-only, h4.sr-only').forEach((b) => b.remove());
+      clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+      clone.querySelectorAll('p, div, li, tr').forEach(block => {
+        block.prepend('\n');
+        block.append('\n');
+      });
+      // Protect pre/code blocks from global tab/space collapsing
+      const preBlocks = [];
+      clone.querySelectorAll('pre, code').forEach((pre, i) => {
+        const token = `__PRE_BLOCK_${i}__`;
+        preBlocks.push({ token, text: pre.textContent || '' });
+        pre.textContent = token;
+      });
+      let text = (clone.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
+      for (const item of preBlocks) {
+        text = text.replace(item.token, item.text);
+      }
+      return text;
+    };
+
+    const getMessageId = (el) => {
+      if (!el) return '';
+      const direct = el.getAttribute('data-chatgpt-search-message-ids') || el.getAttribute('data-message-id') || '';
+      if (direct) return direct.split(' ')[0];
+      const descendant = el.querySelector('[data-chatgpt-search-message-ids], [data-message-id]');
+      if (descendant) {
+        return (descendant.getAttribute('data-chatgpt-search-message-ids') || descendant.getAttribute('data-message-id') || '').split(' ')[0];
+      }
+      return '';
+    };
+
     const extracted = [];
     let idx = 0;
-    const classicEls = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
-    if (classicEls.length) {
-      classicEls.forEach((turn) => {
-        const roleEls = turn.matches('[data-message-author-role]')
-          ? [turn]
-          : [...turn.querySelectorAll('[data-message-author-role]')];
+
+    // Collect all candidate turn containers in true document order
+    const allContainers = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-turn-key]')];
+    // Filter to top-level containers so inner elements don't produce duplicate turns
+    const topContainers = allContainers.filter((el, index, arr) => {
+      return !arr.some((other, otherIdx) => otherIdx !== index && other.contains(el));
+    });
+
+    for (const container of topContainers) {
+      if (container.getAttribute('data-testid')?.startsWith('conversation-turn-')) {
+        const roleEls = container.matches('[data-message-author-role]')
+          ? [container]
+          : [...container.querySelectorAll('[data-message-author-role]')];
         let role = roleEls[0]?.getAttribute('data-message-author-role')
-          || turn.getAttribute('data-turn')
+          || container.getAttribute('data-turn')
           || '';
-        const roleTexts = roleEls.map(textOf).filter(Boolean);
-        const messageId = turn.getAttribute('data-message-id')
-          || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
-          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
-          || '';
-        if (role && (roleTexts[0] || textOf(turn))) {
+        const roleTexts = roleEls.map(cleanTextOf).filter(Boolean);
+        const messageId = getMessageId(container) || (roleEls[0] ? getMessageId(roleEls[0]) : '');
+        if (role && (roleTexts[0] || cleanTextOf(container))) {
           extracted.push({
             index: idx++,
-            testid: turn.getAttribute('data-testid') || '',
+            testid: container.getAttribute('data-testid') || '',
             messageId,
             role,
-            text: roleTexts[0] || textOf(turn),
+            text: roleTexts[0] || cleanTextOf(container),
             roleTexts,
-            turnText: textOf(turn),
+            turnText: cleanTextOf(container),
           });
         }
-      });
-    }
+      } else if (container.hasAttribute('data-turn-key')) {
+        const turnKey = container.getAttribute('data-turn-key') || '';
+        const userUnit = container.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
+        
+        // Find explicit disjoint assistant units (excluding user unit)
+        const explicitAssts = [...container.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], [data-turn="assistant"]')]
+          .filter(u => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit)));
+        
+        // Prefer answer root over reasoning/thought roots if multiple exist
+        let asstUnit = null;
+        if (explicitAssts.length === 1) {
+          asstUnit = explicitAssts[0];
+        } else if (explicitAssts.length > 1) {
+          // If multiple exist (e.g. thought + answer), choose the one that is not marked as thought/reasoning or take the last substantive one
+          const nonThought = explicitAssts.filter(u => !u.matches('[data-testid*="thought"], [class*="thought"]') && !u.querySelector('[data-testid*="thought"]'));
+          asstUnit = nonThought.length ? nonThought[nonThought.length - 1] : explicitAssts[explicitAssts.length - 1];
+        }
 
-    const turnKeyEls = [...document.querySelectorAll('[data-turn-key]')];
-    for (const roundEl of turnKeyEls) {
-      // Skip if this roundEl is inside an already-extracted classic turn
-      if (classicEls.some((c) => c.contains(roundEl))) continue;
-      const turnKey = roundEl.getAttribute('data-turn-key') || '';
+        const userMessageId = getMessageId(userUnit);
+        const asstMessageId = getMessageId(asstUnit);
 
-      // Separate DOM subtrees: ensure assistant root is disjoint from user subtree
-      const userUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
-      const candidateAsstUnits = [...roundEl.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], [data-turn="assistant"]')];
-      let asstUnit = candidateAsstUnits.find(u => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit))) || null;
+        const userText = cleanTextOf(userUnit);
+        const asstText = cleanTextOf(asstUnit);
 
-      const userMessageId = (userUnit?.getAttribute('data-chatgpt-search-message-ids') || userUnit?.getAttribute('data-message-id') || '').split(' ')[0];
-      const asstMessageId = (asstUnit?.getAttribute('data-chatgpt-search-message-ids') || asstUnit?.getAttribute('data-message-id') || '').split(' ')[0];
-
-      const cleanTextOf = (el) => {
-        if (!el) return '';
-        const clone = el.cloneNode(true);
-        clone.querySelectorAll('[role="separator"], button, [role="button"], .sr-only, h4.sr-only').forEach((b) => b.remove());
-        clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
-        clone.querySelectorAll('p, div, li, tr').forEach(block => {
-          block.prepend('\n');
-          block.append('\n');
-        });
-        return (clone.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
-      };
-
-      const userText = cleanTextOf(userUnit);
-      const asstText = cleanTextOf(asstUnit);
-
-      if (userText) {
-        extracted.push({
-          index: idx++,
-          testid: `user-${turnKey}`,
-          logicalTurnId: `user:${turnKey}`,
-          turnKey,
-          messageId: userMessageId || '',
-          role: 'user',
-          text: userText,
-          turnText: userText,
-        });
-      }
-      if (asstText) {
-        extracted.push({
-          index: idx++,
-          testid: `asst-${turnKey}`,
-          logicalTurnId: `assistant:${turnKey}`,
-          turnKey,
-          messageId: asstMessageId || '',
-          role: 'assistant',
-          text: asstText,
-          turnText: asstText,
-        });
+        if (userText) {
+          extracted.push({
+            index: idx++,
+            testid: `user-${turnKey}`,
+            logicalTurnId: `user:${turnKey}`,
+            turnKey,
+            messageId: userMessageId || '',
+            role: 'user',
+            text: userText,
+            turnText: userText,
+          });
+        }
+        if (asstText) {
+          extracted.push({
+            index: idx++,
+            testid: `asst-${turnKey}`,
+            logicalTurnId: `assistant:${turnKey}`,
+            turnKey,
+            messageId: asstMessageId || '',
+            role: 'assistant',
+            text: asstText,
+            turnText: asstText,
+          });
+        }
       }
     }
+
     return extracted;
   });
   return turns
@@ -3500,11 +3533,6 @@ function turnMatchesMessage(turnText, message) {
   const renderedTurn = normalizePromptForRenderedComparison(turnText);
   const renderedMessage = normalizePromptForRenderedComparison(message);
   if (renderedTurn === renderedMessage || renderedTurn.includes(renderedMessage)) return true;
-  if (renderedMessage.length >= 1000) {
-    const head = renderedMessage.slice(0, 200);
-    const tail = renderedMessage.slice(-200);
-    if (renderedTurn.includes(head) && renderedTurn.includes(tail)) return true;
-  }
   return false;
 }
 
@@ -9485,11 +9513,7 @@ async function branchConversationTurn(page, args) {
 
       const genCheck = await getCombinedGenerationState(page);
       if (genCheck.isGenerating) {
-        const stranded = await isStrandedAtCapacity();
-        if (!stranded) {
-          throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
-        }
-        info('[stage3] Notice: Proceeding with branch click as generation is quiescent at capacity limit');
+        throw cbError('CONVERSATION_BUSY', 'Generation became active before branch could be clicked');
       }
 
       let destinationPage = null;
@@ -12242,6 +12266,7 @@ module.exports = {
   waitForSendReady,
   getSendButtonState,
   findComposerRootLocator,
+  turnMatchesMessage,
   composerDraftMatchesMessage,
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
