@@ -1453,6 +1453,56 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
   });
 }
 
+function isPositivelyCompletedRound(round) {
+  if (!round) return false;
+  if (round.status === 'failed' || round.dispatchState === 'aborted_precommit' || round.dispatchState === 'uncertain' || round.assistantOutcome === 'failed') {
+    return false;
+  }
+  const isStatusDone = round.status === 'done' || round.status === 'completed';
+  const isDispatchDone = round.dispatchState === 'accepted' || round.dispatchState === 'completed';
+  return isStatusDone && isDispatchDone;
+}
+
+function extractRoundResponseFromTranscript(transcriptPath, round) {
+  if (round?.responseText) return round.responseText;
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return '';
+  try {
+    const raw = fs.readFileSync(transcriptPath, 'utf8');
+    const entries = parseTranscriptEntries(raw);
+    if (!entries.length) return '';
+
+    if (round?.responseTurnId) {
+      const match = entries.find((e) => e.role === 'assistant' && (
+        e.turnId === round.responseTurnId
+        || e.messageId === round.responseTurnId
+      ));
+      if (match) return match.text || match.content || '';
+    }
+
+    if (round?.acceptedUserTurn) {
+      const userIdx = entries.findIndex((e) => e.role === 'user' && (
+        (round.acceptedUserTurn.messageId && e.messageId === round.acceptedUserTurn.messageId)
+        || (round.acceptedUserTurn.testid && e.turnId === round.acceptedUserTurn.testid)
+        || (e.text && round.message && normalizeIdentityText(e.text) === normalizeIdentityText(round.message))
+      ));
+      if (userIdx !== -1) {
+        const nextAsst = entries.slice(userIdx + 1).find((e) => e.role === 'assistant');
+        if (nextAsst) return nextAsst.text || nextAsst.content || '';
+      }
+    }
+
+    if (round?.message) {
+      const normMsg = normalizeIdentityText(round.message);
+      const userIdx = entries.findIndex((e) => e.role === 'user' && normalizeIdentityText(e.text) === normMsg);
+      if (userIdx !== -1) {
+        const nextAsst = entries.slice(userIdx + 1).find((e) => e.role === 'assistant');
+        if (nextAsst) return nextAsst.text || nextAsst.content || '';
+      }
+    }
+  } catch {}
+  return '';
+}
+
 function registerPendingRound(args, page, message, baselineLastTurnId, extra = {}) {
   const sessionId = extra.expectedSessionId || sessionIdFromUrl(page.url());
   const transcript = args.transcript || (sessionId ? transcriptPathForSession(sessionId) : '');
@@ -9048,21 +9098,8 @@ async function branchWithContextCarryForward(page, args) {
     if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
       const roundsState = loadRoundState();
       const existingRound = roundsState.rounds.find((r) => r.id === incident.continuationRoundId);
-      const isPositivelyCompleted = existingRound
-        && (existingRound.status === 'done' || existingRound.status === 'completed')
-        && existingRound.status !== 'failed'
-        && existingRound.dispatchState !== 'aborted_precommit'
-        && existingRound.dispatchState !== 'uncertain';
-
-      if (isPositivelyCompleted) {
-        let respText = existingRound.responseText || '';
-        if (!respText && existingRound.transcript && fs.existsSync(existingRound.transcript)) {
-          try {
-            const trEntries = parseTranscriptEntries(fs.readFileSync(existingRound.transcript, 'utf8'));
-            const asst = trEntries.reverse().find((e) => e.role === 'assistant' && (e.text || e.content));
-            if (asst) respText = asst.text || asst.content;
-          } catch {}
-        }
+      if (isPositivelyCompletedRound(existingRound)) {
+        const respText = extractRoundResponseFromTranscript(existingRound.transcript, existingRound) || existingRound.responseText || '';
         const askResult = { text: respText, roundId: existingRound.id };
         updateRecoveryIncident(incident.id, {
           state: 'completed',
@@ -9083,6 +9120,7 @@ async function branchWithContextCarryForward(page, args) {
     let childSessionId = incident.childSessionId;
     let childPage = null;
     let branchResult = null;
+    let childLaneLease = null;
 
     // Reconcile branch_started using lower-level lineage if child was not recorded
     if (!childSessionId && incident.state === 'branch_started' && incident.branchOperationId) {
@@ -9142,8 +9180,9 @@ async function branchWithContextCarryForward(page, args) {
           newTab: true,
         };
         childPage = await findTargetAppPage(browser, newPageArgs);
-        if (newPageArgs._laneLease && childPage) {
-          childPage._laneLease = newPageArgs._laneLease;
+        if (newPageArgs._laneLease) {
+          childLaneLease = newPageArgs._laneLease;
+          newPageArgs._laneLease = null;
         }
       }
       if (!childPage) {
@@ -9165,22 +9204,24 @@ async function branchWithContextCarryForward(page, args) {
       branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
     });
 
-    const targetPage = childPage || branchResult.childPage;
-    if (!targetPage) {
-      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
-    }
-
-    const childTid = await getPageTargetId(targetPage);
-    if (typeof childTid !== 'string' || !childTid.trim()) {
-      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot dispatch carry-forward prompt without verified physical child target identity');
-    }
-
-    updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
-
-    let childLaneLease = targetPage._laneLease || null;
-    targetPage._laneLease = null; // Clear from page so it cannot become stale
-
     try {
+      const targetPage = childPage || branchResult.childPage;
+      if (!targetPage) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
+      }
+
+      const childTid = await getPageTargetId(targetPage);
+      if (typeof childTid !== 'string' || !childTid.trim()) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot dispatch carry-forward prompt without verified physical child target identity');
+      }
+
+      updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
+
+      if (targetPage._laneLease) {
+        childLaneLease = targetPage._laneLease;
+        targetPage._laneLease = null;
+      }
+
       const childArgs = {
         ...args,
         conversation: childSessionId,
@@ -9193,28 +9234,29 @@ async function branchWithContextCarryForward(page, args) {
         message: continuityPrompt,
         _laneLease: childLaneLease,
       };
-      // Ownership transferred to childArgs; ask() will release it
-      childLaneLease = null;
 
       updateRecoveryIncident(incident.id, {
         state: 'continuation_dispatching',
         continuityPrompt,
       }, 'carry_forward_dispatching');
 
+      // Ownership transferred to childArgs; ask() will release it
+      childLaneLease = null;
+
       info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
       const askResult = await ask(targetPage, continuityPrompt, childArgs);
 
-    updateRecoveryIncident(incident.id, {
-      state: 'completed',
-      continuationResponse: askResult,
-    }, 'carry_forward_completed');
+      updateRecoveryIncident(incident.id, {
+        state: 'completed',
+        continuationResponse: askResult,
+      }, 'carry_forward_completed');
 
-    return {
-      ...branchResult,
-      incidentId: incident.id,
-      continuityPrompt,
-      continuationResponse: askResult,
-    };
+      return {
+        ...branchResult,
+        incidentId: incident.id,
+        continuityPrompt,
+        continuationResponse: askResult,
+      };
     } finally {
       if (childLaneLease) {
         try { releaseBrowserLaneLease(childLaneLease); } catch {}
@@ -9282,6 +9324,18 @@ async function branchConversationTurn(page, args) {
         id: args.branchId || provisionalBranchId,
         parentSessionId: expectedParentSessionId,
       });
+
+      if (branchRecord.dispatchState !== 'prepared') {
+        if (branchRecord.childSessionId) {
+          info(`[stage3] Branch "${branchRecord.id}" already resolved to child ${branchRecord.childSessionId}`);
+          return {
+            childSessionId: branchRecord.childSessionId,
+            childUrl: targetConversationUrl(branchRecord.childSessionId),
+            branchRecord,
+          };
+        }
+        throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${branchRecord.id}" is in state "${branchRecord.dispatchState}" and cannot be re-dispatched`);
+      }
       localDispatchState = 'prepared';
 
       const controls = await openBranchMenu(page, sourceAssistant);
@@ -10621,20 +10675,15 @@ async function ask(page, message, args) {
     }
     const round = registerPendingRound(args, page, message, baselineLastTurnId, roundExtra);
 
-    if (round.status === 'done' || round.status === 'completed' || round.assistantOutcome === 'succeeded') {
+    if (isPositivelyCompletedRound(round)) {
       info(`[ask] Round "${round.id}" was already completed; returning existing result without re-dispatching`);
-      if (round.transcript && fs.existsSync(round.transcript)) {
-        try {
-          const trEntries = parseTranscriptEntries(fs.readFileSync(round.transcript, 'utf8'));
-          const asst = trEntries.reverse().find((e) => e.role === 'assistant' && (e.text || e.content));
-          if (asst) return asst.text || asst.content;
-        } catch {}
-      }
+      const resp = extractRoundResponseFromTranscript(round.transcript, round);
+      if (resp) return resp;
       return round.responseText || '';
     }
 
-    if (round.dispatchState === 'uncertain' || round.dispatchState === 'dispatching') {
-      throw cbError('ROUND_DISPATCH_UNCERTAIN', `Round "${round.id}" is in in-flight/uncertain state "${round.dispatchState}" and requires reconciliation before any new dispatch`);
+    if (round.dispatchState !== 'prepared') {
+      throw cbError('ROUND_ALREADY_DISPATCHED', `Reserved round "${round.id}" is in post-dispatch state "${round.dispatchState}" (status: ${round.status || 'unknown'}) and cannot be re-dispatched`);
     }
 
     if (!isNewChat && expectedSessionId) {
@@ -12001,6 +12050,8 @@ module.exports = {
   getConversationTurns,
   resolveBranchableTurn,
   openBranchMenu,
+  isPositivelyCompletedRound,
+  extractRoundResponseFromTranscript,
   waitForSendReady,
   getSendButtonState,
   composerDraftMatchesMessage,

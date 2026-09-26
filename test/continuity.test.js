@@ -49,6 +49,8 @@ const {
   waitForSendReady,
   getSendButtonState,
   composerDraftMatchesMessage,
+  isPositivelyCompletedRound,
+  extractRoundResponseFromTranscript,
   canonicalCarryForwardPayloadHash,
   getOrCreateCarryForwardIncident,
   releaseBrowserLaneLease,
@@ -4725,4 +4727,47 @@ test('registerPendingBranch: enforces immutable parentSessionId binding', () => 
     }),
     (err) => err.code === 'BRANCH_BINDING_MISMATCH'
   );
+});
+
+test('extractRoundResponseFromTranscript: attributes response to exact user turn and ignores subsequent unrelated exchanges', () => {
+  const tmpTranscript = '/tmp/fake-transcript-attribution-test.txt';
+  const transcriptContent = `
+[2026-09-26T00:00:01.000Z] USER
+Initial prompt
+
+[2026-09-26T00:00:02.000Z] ASSISTANT
+Initial response
+
+[2026-09-26T00:00:10.000Z] USER
+Target prompt to attribute
+
+[2026-09-26T00:00:15.000Z] ASSISTANT
+INTENDED TARGET RESPONSE
+
+[2026-09-26T00:00:30.000Z] USER
+Later unrelated prompt
+
+[2026-09-26T00:00:35.000Z] ASSISTANT
+LATER UNRELATED RESPONSE
+`;
+  fs.writeFileSync(tmpTranscript, transcriptContent);
+
+  const round = {
+    message: 'Target prompt to attribute',
+  };
+
+  const recovered = extractRoundResponseFromTranscript(tmpTranscript, round);
+  assert.equal(recovered, 'INTENDED TARGET RESPONSE', 'extracts the exact attributed assistant response following the target user prompt');
+
+  try { fs.unlinkSync(tmpTranscript); } catch {}
+});
+
+test('isPositivelyCompletedRound: rejects failed, aborted, or uncertain rounds', () => {
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted' }), true);
+  assert.equal(isPositivelyCompletedRound({ status: 'completed', dispatchState: 'completed' }), true);
+
+  assert.equal(isPositivelyCompletedRound({ status: 'failed', dispatchState: 'aborted_precommit', assistantOutcome: 'succeeded' }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'uncertain' }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'prepared' }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'dispatching' }), false);
 });
