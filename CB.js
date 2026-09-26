@@ -1526,6 +1526,15 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
       if (message && existing.messageHash && existing.messageHash !== incomingHash) {
         throw cbError('ROUND_PAYLOAD_MISMATCH', `Reserved round "${id}" is bound to message hash "${existing.messageHash}", cannot mutate to "${incomingHash}"`);
       }
+      if (extra.operationKind && existing.operationKind && extra.operationKind !== existing.operationKind) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${id}" is bound to operationKind "${existing.operationKind}", cannot mutate to "${extra.operationKind}"`);
+      }
+      if (extra.recoveryStage && existing.recoveryStage && Number(extra.recoveryStage) !== Number(existing.recoveryStage)) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${id}" is bound to recoveryStage "${existing.recoveryStage}", cannot mutate to "${extra.recoveryStage}"`);
+      }
+      if (extra.recoveryIncidentId && existing.recoveryIncidentId && extra.recoveryIncidentId !== existing.recoveryIncidentId) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${id}" is bound to recoveryIncidentId "${existing.recoveryIncidentId}", cannot mutate to "${extra.recoveryIncidentId}"`);
+      }
       // Non-regressive update: preserve existing dispatchState and status if already beyond prepared
       const preservedDispatchState = (existing.dispatchState && existing.dispatchState !== 'prepared')
         ? existing.dispatchState
@@ -1839,6 +1848,9 @@ function reconcilePendingRoundsFromTranscript(args, options = {}) {
       if (!finalResponse) continue;
       Object.assign(round, {
         status: 'done',
+        dispatchState: 'accepted',
+        assistantOutcome: 'succeeded',
+        responseText: finalResponse,
         sessionId: roundSessionId || round.sessionId || '',
         url: sessionIdFromUrl(round.url || '') ? round.url : (roundSessionId ? targetConversationUrl(roundSessionId) : round.url || ''),
         responseChars: finalResponse.length,
@@ -2486,7 +2498,7 @@ async function findComposerRootLocator(page, composerLocator) {
     if ((await composerDiv.count().catch(() => 0)) > 0) return composerDiv;
     return composerLocator.locator('..');
   } catch {
-    return page;
+    return composerLocator.locator('..');
   }
 }
 
@@ -2515,9 +2527,10 @@ async function getSendButtonState(page, composerLocator = null) {
   }
 
   const root = await findComposerRootLocator(page, composerLocator);
-  const candidateLocator = root && typeof root.locator === 'function'
-    ? root.locator(SEND_BUTTON_SELECTORS.join(', '))
-    : page.locator(SEND_BUTTON_SELECTORS.join(', '));
+  if (!root || typeof root.locator !== 'function') {
+    throw cbError('COMPOSER_ROOT_UNRESOLVED', 'Unable to resolve composer root container');
+  }
+  const candidateLocator = root.locator(SEND_BUTTON_SELECTORS.join(', '));
 
   const count = await candidateLocator.count().catch(() => 0);
   if (count === 0) return { exists: false, count: 0, disabled: false, label: '' };
@@ -2537,8 +2550,9 @@ async function getSendButtonState(page, composerLocator = null) {
     return { exists: true, ambiguous: true, count: visibleCount, disabled: false, label: '' };
   }
 
-  const disabled = (await singleVisible.isDisabled().catch(() => false))
-    || (await singleVisible.getAttribute('aria-disabled').catch(() => null)) === 'true';
+  // Treat inspection failure as disabled (fail closed)
+  const disabled = (await singleVisible.isDisabled().catch(() => true))
+    || (await singleVisible.getAttribute('aria-disabled').catch(() => 'true')) === 'true';
   const label = (await singleVisible.getAttribute('aria-label').catch(() => ''))
     || (await singleVisible.getAttribute('data-testid').catch(() => ''))
     || (await singleVisible.innerText().catch(() => ''));
@@ -3484,7 +3498,8 @@ function turnMatchesMessage(turnText, message) {
     const startsWithHead = renderedTurn.startsWith(head) || renderedTurn.slice(0, 300).includes(head);
     const hasTruncationMarker = renderedTurn.endsWith('…') || renderedTurn.endsWith('...') || renderedTurn.includes('…') || renderedTurn.includes('Show more');
     if (startsWithHead && hasTruncationMarker) {
-      return true;
+      const longerHead = renderedMessage.slice(0, 500);
+      if (renderedTurn.includes(longerHead)) return true;
     }
   }
   return false;
@@ -6396,17 +6411,20 @@ async function applySliderModelSelection(page, selection, menuState, label) {
 
       const openMenus = page.locator('[role="menu"][data-state="open"], [data-radix-popper-content-wrapper] [role="menu"]');
       const menuCount = await openMenus.count();
-      let targetMenu = null;
+      const matchingMenus = [];
       for (let i = 0; i < menuCount; i++) {
         const candidate = openMenus.nth(i);
         if (await candidate.locator('[role="slider"]').count() === 1) {
-          targetMenu = candidate;
-          break;
+          matchingMenus.push(candidate);
         }
       }
-      if (!targetMenu) {
+      if (matchingMenus.length === 0) {
         throw cbError('REASONING_SELECTION_UNVERIFIED', 'Could not locate active open model menu containing exactly one reasoning slider');
       }
+      if (matchingMenus.length > 1) {
+        throw cbError('REASONING_SELECTION_AMBIGUOUS', `Multiple open menus (${matchingMenus.length}) contain a reasoning slider`);
+      }
+      const targetMenu = matchingMenus[0];
 
       const slider = targetMenu.locator('[role="slider"]');
       const sliderControl = targetMenu.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
@@ -7781,17 +7799,16 @@ async function retryEditTurn(page, args) {
   }
 
   const action = async () => {
-    if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
-      await openConversationBySessionId(page, expectedSessionId);
-    }
-    await reloadExactConversation(page, expectedSessionId, 'stage1-edit-reload');
-
     const provisionalRoundId = randomId('round-edit');
     const leaseHandle = await acquireConversationLease(expectedSessionId, provisionalRoundId);
 
     let round = null;
     let localDispatchState = 'unregistered';
     try {
+      if (sessionIdFromUrl(page.url()) !== expectedSessionId) {
+        await openConversationBySessionId(page, expectedSessionId);
+      }
+      await reloadExactConversation(page, expectedSessionId, 'stage1-edit-reload');
       await assertThreadIdentity(page, expectedSessionId, 'before stage1 edit preparation');
 
       const preState = await getTargetAppState(page);
@@ -8334,7 +8351,26 @@ async function autoRecoverConversationTurn(page, args) {
 
       let safeToRetryStage1 = false;
       if (incident.state === 'stage1_running' && existingRound) {
-        const recon = await reconcileStage1EditTurn(page, args, existingRound);
+        if (isPositivelyCompletedRound(existingRound)) {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'completed_stage1',
+            stage1RoundId: existingRound.id,
+            finalSessionId: incident.parentSessionId,
+            finalOutcome: 'stage1_succeeded',
+          }) || incident;
+          info(`[auto-recover] Prior Stage 1 round ${existingRound.id} already completed successfully`);
+          return { incident, state: 'completed_stage1', sessionId: incident.parentSessionId, responseText: existingRound.responseText };
+        }
+
+        const convLease = await acquireConversationLease(expectedParentSessionId, randomId('stage1-recon'));
+        let recon;
+        try {
+          recon = await withBrowserLaneLease(args, randomId('stage1-recon-lane'), async () => {
+            return await reconcileStage1EditTurn(page, args, existingRound);
+          });
+        } finally {
+          await releaseConversationLease(convLease);
+        }
         if (recon.outcome === 'promoted_to_accepted' || recon.outcome === 'already_accepted') {
           info(`[auto-recover] Reconciled Stage 1 round ${existingRound.id} as accepted`);
           if (recon.round?.assistantOutcome === 'terminal_error') {
@@ -8478,15 +8514,22 @@ async function autoRecoverConversationTurn(page, args) {
         const stage2Message = stage2Args.message;
 
         try {
-          await prepareConversationForRead(page, stage2Args);
-          if (stage2Args.expectedSessionId && sessionIdFromUrl(page.url()) !== stage2Args.expectedSessionId) {
-            await openConversationBySessionId(page, stage2Args.expectedSessionId);
+          const convLease = await acquireConversationLease(stage2Args.expectedSessionId, randomId('stage2-prep'));
+          try {
+            await withBrowserLaneLease(stage2Args, randomId('stage2-prep-lane'), async () => {
+              await prepareConversationForRead(page, stage2Args);
+              if (stage2Args.expectedSessionId && sessionIdFromUrl(page.url()) !== stage2Args.expectedSessionId) {
+                await openConversationBySessionId(page, stage2Args.expectedSessionId);
+              }
+              await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
+              await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
+              await syncTranscriptFromPage(page, stage2Args);
+            });
+          } finally {
+            await releaseConversationLease(convLease);
           }
-          await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
-          await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
-          await syncTranscriptFromPage(page, stage2Args);
 
-          // DO NOT wrap in withBrowserLaneLease! ask() acquires and owns the browser lane lease internally!
+          // ask() acquires and owns the browser lane lease internally!
           const responseText = await ask(page, stage2Message, stage2Args);
 
           const postState = loadRoundState();
@@ -8535,8 +8578,7 @@ async function autoRecoverConversationTurn(page, args) {
 
       let safeToRetryStage3 = false;
       if (incident.state === 'stage3_running' && existingBranch) {
-        // Inspect dispatchState, NOT status!
-        if (existingBranch.dispatchState === 'bound' || existingBranch.dispatchState === 'lineage_attested') {
+        if (isPositivelyBoundBranch(existingBranch, incident.parentSessionId)) {
           incident = updateRecoveryIncident(incidentId, {
             state: 'completed_stage3_bound',
             stage3BranchId: existingBranch.id,
@@ -8545,7 +8587,7 @@ async function autoRecoverConversationTurn(page, args) {
           }) || incident;
           info(`[auto-recover] Reconciled Stage 3 branch ${existingBranch.id} as bound`);
           return { incident, state: 'completed_stage3_bound', childSessionId: existingBranch.childSessionId, childUrl: existingBranch.childUrl };
-        } else if (existingBranch.dispatchState === 'stable_candidate' || existingBranch.dispatchState === 'destination_unverified') {
+        } else if (existingBranch.dispatchState === 'stable_candidate' || existingBranch.dispatchState === 'destination_unverified' || existingBranch.dispatchState === 'lineage_attested') {
           info(`[auto-recover] In-flight Stage 3 branch ${existingBranch.id} requires candidate recovery`);
           const rec = await recoverCandidateBranchLineage(page, args, existingBranch);
           if (rec.dispatchState === 'bound' || (rec.status === 'done' && rec.childSessionId)) {
@@ -9237,14 +9279,19 @@ async function branchWithContextCarryForward(page, args) {
       info(`[stage3-carry] Reusing established child session ${childSessionId} for incident ${incident.id}...`);
       const browser = page.context ? (typeof page.context === 'function' ? page.context().browser() : page.context.browser?.()) : null;
       if (browser) {
+        const matchingPages = [];
         for (const ctx of browser.contexts()) {
           for (const p of ctx.pages()) {
             if (sessionIdFromUrl(p.url()) === childSessionId) {
-              childPage = p;
-              break;
+              matchingPages.push(p);
             }
           }
-          if (childPage) break;
+        }
+        if (matchingPages.length > 1) {
+          throw cbError('MULTIPLE_CONVERSATION_TABS', `Multiple open tabs matched child conversation "${childSessionId}"`);
+        }
+        if (matchingPages.length === 1) {
+          childPage = matchingPages[0];
         }
       }
       if (!childPage && browser) {
@@ -9252,7 +9299,7 @@ async function branchWithContextCarryForward(page, args) {
         childPage = await findTargetAppPage(browser, childArgs);
       }
       if (!childPage) {
-        childPage = page;
+        throw cbError('CHILD_PAGE_UNAVAILABLE', `Could not allocate or locate dedicated page for child conversation "${childSessionId}"`);
       }
       branchResult = {
         childSessionId,
@@ -9350,9 +9397,14 @@ async function branchConversationTurn(page, args) {
         }
         if (args.branchTurn && existingBranch.sourceTurnRef) {
           const reqTurn = String(args.branchTurn).trim();
-          const existingKey = existingBranch.sourceTurnRef.turnKey || existingBranch.sourceTurnRef.logicalTurnId || existingBranch.sourceTurnRef.testid || existingBranch.sourceTurnRef.messageId || '';
-          if (reqTurn && !['latest', 'prior-assistant', ''].includes(reqTurn) && existingKey && reqTurn !== existingKey) {
-            throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" source turn mismatch: expected "${existingKey}", got "${reqTurn}"`);
+          const storedKeys = [
+            existingBranch.sourceTurnRef.turnKey,
+            existingBranch.sourceTurnRef.logicalTurnId,
+            existingBranch.sourceTurnRef.messageId,
+            existingBranch.sourceTurnRef.testid,
+          ].filter(Boolean);
+          if (reqTurn && !['latest', 'prior-assistant', ''].includes(reqTurn) && storedKeys.length && !storedKeys.includes(reqTurn)) {
+            throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" source turn mismatch: requested "${reqTurn}" not found in stored turn identities [${storedKeys.join(', ')}]`);
           }
         }
         if (args.recoveryIncidentId && existingBranch.recoveryIncidentId && args.recoveryIncidentId !== existingBranch.recoveryIncidentId) {
@@ -9382,19 +9434,30 @@ async function branchConversationTurn(page, args) {
       if (sessionIdFromUrl(page.url()) !== expectedParentSessionId) {
         await openConversationBySessionId(page, expectedParentSessionId);
       }
-      await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
-      await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
 
-      const preState = await getTargetAppState(page);
-      const isStrandedAtCapacity = async () => {
-        if (!preState?.maxLengthReached) return false;
-        const stopBtn = await page.$('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label="Stop"]').catch(() => null);
-        if (stopBtn) return false;
+      // POSITIVELY ESTABLISH RELOAD-SAFE LIFECYCLE STATE BEFORE RELOADING!
+      const initialPreState = await getTargetAppState(page);
+      const initialGen = await getCombinedGenerationState(page, initialPreState);
+
+      const isStrandedAtCapacity = async (currentState, currentGen) => {
+        if (!currentState?.maxLengthReached) return false;
+        if (currentGen.hasStopControl) return false;
+        if (currentGen.activity && /thinking|thought|searching|reading|analyzing|running|tool|generating/i.test(currentGen.activity)) {
+          return false;
+        }
+        // Positively assert stop button absence without swallowing errors
+        const stopLoc = page.locator('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label="Stop"]');
+        const count = await stopLoc.count().catch(() => 1);
+        if (count > 0) return false;
         try {
           const t1 = await getConversationTurns(page);
           if (!t1 || !t1.length) return false;
           const s1 = t1.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
-          await page.waitForTimeout(400);
+          if (typeof page.waitForTimeout === 'function') {
+            await page.waitForTimeout(600);
+          } else {
+            await new Promise((r) => setTimeout(r, 600));
+          }
           const t2 = await getConversationTurns(page);
           if (!t2 || !t2.length) return false;
           const s2 = t2.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
@@ -9404,13 +9467,25 @@ async function branchConversationTurn(page, args) {
         }
       };
 
-      const generation = await getCombinedGenerationState(page, preState);
-      if (generation.isGenerating) {
-        const stranded = await isStrandedAtCapacity();
+      if (initialGen.isGenerating) {
+        const stranded = await isStrandedAtCapacity(initialPreState, initialGen);
         if (!stranded) {
           throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while active token generation is in progress');
         }
-        info('[stage3] Notice: Tail generation control is stranded at capacity limit (quiescent); proceeding with Stage 3 branch recovery');
+        info('[stage3] Notice: Tail generation control is stranded at capacity limit (quiescent); verified safe to reload');
+      }
+
+      await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
+      await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
+
+      const preState = await getTargetAppState(page);
+      const generation = await getCombinedGenerationState(page, preState);
+      if (generation.isGenerating) {
+        const stranded = await isStrandedAtCapacity(preState, generation);
+        if (!stranded) {
+          throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while active token generation is in progress');
+        }
+        info('[stage3] Notice: Post-reload tail generation control is stranded at capacity limit (quiescent); proceeding with Stage 3 branch recovery');
       }
 
       await syncTranscriptFromPage(page, args);
@@ -10696,6 +10771,12 @@ async function ask(page, message, args) {
       }
       if (args.recoveryIncidentId && existingRound.recoveryIncidentId && args.recoveryIncidentId !== existingRound.recoveryIncidentId) {
         throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${args.roundId}" recovery incident mismatch: expected "${existingRound.recoveryIncidentId}", got "${args.recoveryIncidentId}"`);
+      }
+      if (args.operationKind && existingRound.operationKind && args.operationKind !== existingRound.operationKind) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${args.roundId}" operationKind mismatch: expected "${existingRound.operationKind}", got "${args.operationKind}"`);
+      }
+      if (args.recoveryStage && existingRound.recoveryStage && Number(args.recoveryStage) !== Number(existingRound.recoveryStage)) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${args.roundId}" recoveryStage mismatch: expected "${existingRound.recoveryStage}", got "${args.recoveryStage}"`);
       }
       if (isPositivelyCompletedRound(existingRound)) {
         info(`[ask] Round "${existingRound.id}" was already completed; returning existing result without browser preparation`);
@@ -12181,6 +12262,7 @@ module.exports = {
   extractRoundResponseFromTranscript,
   waitForSendReady,
   getSendButtonState,
+  findComposerRootLocator,
   composerDraftMatchesMessage,
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,

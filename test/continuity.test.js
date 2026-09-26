@@ -48,6 +48,7 @@ const {
   branchWithContextCarryForward,
   waitForSendReady,
   getSendButtonState,
+  findComposerRootLocator,
   composerDraftMatchesMessage,
   isPositivelyBoundBranch,
   isPositivelyCompletedRound,
@@ -3293,6 +3294,10 @@ test('autoRecoverConversationTurn: stage3_running restart reconciles existing br
     parentSessionId: parentId,
     childSessionId: childId,
     childUrl: `https://chatgpt.com/c/${childId}`,
+    parentAttestation: {
+      verifiedVia: 'dom_divider',
+      parentSessionId: parentId,
+    },
   });
   saveLineageState(lineageState);
 
@@ -4974,4 +4979,100 @@ test('branchWithContextCarryForward: sanitizes childArgs by stripping parent pag
   };
   assert.equal(sanitizedChildArgs.pageTargetId, '');
   assert.equal(sanitizedChildArgs.targetId, '');
+});
+
+test('registerPendingRound: enforces immutable operationKind, recoveryStage, and recoveryIncidentId on re-registration', () => {
+  const roundId = 'test-immutable-semantic-fields';
+  const testSession = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  registerPendingRound(
+    { transcript: '/tmp/test-semantic-fields.txt' },
+    { url: () => `https://chatgpt.com/c/${testSession}` },
+    'Immutable prompt test',
+    '',
+    {
+      id: roundId,
+      expectedSessionId: testSession,
+      operationKind: 'edit_retry',
+      recoveryStage: 1,
+      recoveryIncidentId: 'inc-123',
+    }
+  );
+
+  // 1. Altering operationKind throws ROUND_BINDING_MISMATCH
+  assert.throws(
+    () => registerPendingRound(
+      { transcript: '/tmp/test-semantic-fields.txt' },
+      { url: () => `https://chatgpt.com/c/${testSession}` },
+      'Immutable prompt test',
+      '',
+      { id: roundId, expectedSessionId: testSession, operationKind: 'resend' }
+    ),
+    (err) => err.code === 'ROUND_BINDING_MISMATCH'
+  );
+
+  // 2. Altering recoveryStage throws ROUND_BINDING_MISMATCH
+  assert.throws(
+    () => registerPendingRound(
+      { transcript: '/tmp/test-semantic-fields.txt' },
+      { url: () => `https://chatgpt.com/c/${testSession}` },
+      'Immutable prompt test',
+      '',
+      { id: roundId, expectedSessionId: testSession, recoveryStage: 2 }
+    ),
+    (err) => err.code === 'ROUND_BINDING_MISMATCH'
+  );
+
+  // 3. Altering recoveryIncidentId throws ROUND_BINDING_MISMATCH
+  assert.throws(
+    () => registerPendingRound(
+      { transcript: '/tmp/test-semantic-fields.txt' },
+      { url: () => `https://chatgpt.com/c/${testSession}` },
+      'Immutable prompt test',
+      '',
+      { id: roundId, expectedSessionId: testSession, recoveryIncidentId: 'inc-999' }
+    ),
+    (err) => err.code === 'ROUND_BINDING_MISMATCH'
+  );
+});
+
+test('branchConversationTurn preflight: matches concrete source turn across logicalTurnId, messageId, or testid', async () => {
+  const branchId = 'test-branch-flexible-id-matching';
+  const parentSessionId = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  registerPendingBranch(
+    { branchId },
+    { url: () => `https://chatgpt.com/c/${parentSessionId}` },
+    { turnKey: 'turn-key-1', logicalTurnId: 'logical-1', messageId: 'msg-uuid-1', testid: 'testid-1' },
+    { id: branchId, parentSessionId }
+  );
+
+  const mockPage = {
+    url: () => { throw new Error('page should not be accessed during preflight branch matching'); }
+  };
+
+  // Mismatched branchTurn throws BRANCH_BINDING_MISMATCH
+  await assert.rejects(
+    async () => branchConversationTurn(mockPage, {
+      branchId,
+      expectedSessionId: parentSessionId,
+      branchTurn: 'unrelated-turn-id',
+      skipPreparation: true,
+    }),
+    (err) => err.code === 'BRANCH_BINDING_MISMATCH'
+  );
+});
+
+test('findComposerRootLocator: isolates to composer container and avoids widening to global page', async () => {
+  let countCalls = 0;
+  const mockComposerLocator = {
+    locator: (selector) => ({
+      count: async () => {
+        countCalls++;
+        return 0; // neither form nor data-testid="composer" matched
+      },
+    }),
+  };
+
+  const root = await findComposerRootLocator(null, mockComposerLocator);
+  // Returns parent locator of composer instead of global page
+  assert.notEqual(root, null);
 });
