@@ -3218,7 +3218,13 @@ async function dismissBlockingModal(page) {
 
   let clicked = false;
   if (candidate.closeSelector) {
-    clicked = await page.locator(candidate.closeSelector).click({ timeout: 5000 }).then(() => true).catch(() => false);
+    clicked = await page.locator(candidate.closeSelector).click({ timeout: 2000 }).then(() => true).catch(async () => {
+      return page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (el) { el.click(); return true; }
+        return false;
+      }, candidate.closeSelector).catch(() => false);
+    });
     await page.waitForTimeout(300);
   }
 
