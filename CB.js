@@ -5251,11 +5251,14 @@ async function markModelSwitcher(page) {
           return null;
         }
         const containingForm = el.closest('form');
-        const insideComposer = Boolean(containingForm && /composer|ask anything/i.test([
-          containingForm.getAttribute('data-testid') || '',
-          containingForm.className || '',
-          textOf(containingForm),
-        ].join(' ')));
+        const insideComposer = Boolean(containingForm && (
+          containingForm.querySelector('#prompt-textarea, [contenteditable="true"], [data-testid*="composer"], textarea')
+          || /composer|ask anything/i.test([
+            containingForm.getAttribute('data-testid') || '',
+            containingForm.className || '',
+            textOf(containingForm),
+          ].join(' '))
+        ));
         const rect = el.getBoundingClientRect();
         const text = textOf(el);
         const meta = [
@@ -5268,8 +5271,12 @@ async function markModelSwitcher(page) {
         let modelSignal = false;
         if (el.getAttribute('data-testid') === 'model-switcher-dropdown-button') score += 100;
         if (el.getAttribute('data-testid') === 'model-switcher-dropdown-button') modelSignal = true;
-        if (/model selector/i.test(el.getAttribute('aria-label') || '')) {
+        if (/model selector|model switcher|select (?:chatgpt )?model/i.test(el.getAttribute('aria-label') || '')) {
           score += 100;
+          modelSignal = true;
+        }
+        if (el.getAttribute('data-composer-navigation-target') === 'reasoning' || el.getAttribute('data-codex-intelligence-trigger') === 'true' || el.hasAttribute('data-selected-reasoning-effort')) {
+          score += 150;
           modelSignal = true;
         }
         if (el.matches('button.__composer-pill, button[class*="__composer-pill"]') || el.querySelector('.uFxlGa_TriggerWrapper, [data-model-reasoning-effort-slider]')) {
@@ -5280,7 +5287,7 @@ async function markModelSwitcher(page) {
           score += 120;
           modelSignal = true;
         }
-        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra)\b/i.test(text)) {
+        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra|extra high|high|medium|low|auto|fast)\b/i.test(text)) {
           score += 50;
           modelSignal = true;
         }
@@ -6473,9 +6480,19 @@ async function selectModel(page, label) {
 
 async function selectReasoning(page, label) {
   const selection = parseModelSelection(label);
+  const state = await getTargetAppState(page).catch(() => null);
+  const currentModelLabel = state?.model || '';
+  if (selection.effort && normalizeModelLabel(currentModelLabel).toLowerCase() === normalizeModelLabel(selection.effort).toLowerCase()) {
+    info(`[reasoning] "${currentModelLabel}" is already selected; skipping switcher`);
+    return {
+      requested: label,
+      selected: currentModelLabel,
+      fallback: false,
+      available: [currentModelLabel],
+    };
+  }
   if (!selection.mode && selection.effort) {
-    const state = await getTargetAppState(page).catch(() => null);
-    selection.mode = parseModeAndEffort(state?.model || '').mode;
+    selection.mode = parseModeAndEffort(currentModelLabel).mode;
   }
   const requested = [selection.mode, selection.effort].filter(Boolean).join(' ') || label;
   const result = await selectModel(page, requested);
