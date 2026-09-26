@@ -5400,3 +5400,10 @@ test('getConversationTurns: preserves DOM order and resolves answer over reasoni
   assert.equal(order[2], 'assistant:k2');
   assert.equal(order[3], 'a3');
 });
+
+
+test('parseArgs: parses --no-reload flag for capacity recovery branching without refresh', () => {
+  const parsed = parseArgs(['node', 'CB.js', '--branch-turn', 'prior-assistant', '--no-reload']);
+  assert.equal(parsed.branchTurn, 'prior-assistant');
+  assert.equal(parsed.noReload, true);
+});

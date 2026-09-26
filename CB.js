@@ -377,6 +377,7 @@ function parseArgs(argv) {
     else if (arg === '--compact-conversation' || arg === '--compact' || arg === '--export-context-summary') args.compactConversation = true;
     else if (arg === '--handoff-new-session' || arg === '--compact-handoff' || arg === '--handoff') args.handoffNewSession = true;
     else if (arg === '--recovery-resend') args.recoveryResend = true;
+    else if (arg === '--no-reload') args.noReload = true;
     else if (arg === '--recovery-incident') args.recoveryIncidentId = next();
     else if (arg === '--retry-edit') {
       const val = peek();
@@ -9585,13 +9586,15 @@ async function branchConversationTurn(page, args) {
         throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active in parent conversation');
       }
 
-      await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
-      await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
+      if (!args.noReload) {
+        await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
+        await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
 
-      const preState = await getTargetAppState(page);
-      const generation = await getCombinedGenerationState(page, preState);
-      if (generation.isGenerating) {
-        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active in parent conversation');
+        const preState = await getTargetAppState(page);
+        const generation = await getCombinedGenerationState(page, preState);
+        if (generation.isGenerating) {
+          throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active in parent conversation');
+        }
       }
 
       await syncTranscriptFromPage(page, args);
