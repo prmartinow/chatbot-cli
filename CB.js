@@ -2665,6 +2665,15 @@ function composerDraftMatchesMessage(state, message) {
   if (normState === normMsg || (normMsg.length && normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
+  // For long prompts (>= 1000 chars), ProseMirror collapses whitespace/markdown rendering.
+  // Match using normalized head and tail!
+  if (normMsg.length >= 1000 && normState.length >= 500) {
+    const head = normMsg.slice(0, 150);
+    const tail = normMsg.slice(-150);
+    if (normState.includes(head) && normState.includes(tail)) {
+      return { ok: true, kind: 'composer_text_head_tail' };
+    }
+  }
   // Handle long prompts that ChatGPT auto-converts into composer attachments
   if (normMsg.length >= 1000 && state?.attachments && state.attachments.length) {
     const firstLine = normalizeTurnText(message.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '').slice(0, 30);
