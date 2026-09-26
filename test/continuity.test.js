@@ -5076,3 +5076,19 @@ test('findComposerRootLocator: isolates to composer container and avoids widenin
   // Returns parent locator of composer instead of global page
   assert.notEqual(root, null);
 });
+
+test('composerDraftMatchesMessage: accepts long message converted into composer attachment card', () => {
+  const longPrompt = '# Big prompt header\n' + 'x'.repeat(2500);
+  const draftState = {
+    text: '',
+    attachments: [
+      { text: 'Remove CB.js' },
+      { text: 'Remove continuity.test.js' },
+      { text: '# Big prompt header preview...' },
+    ],
+  };
+
+  const match = composerDraftMatchesMessage(draftState, longPrompt);
+  assert.equal(match.ok, true);
+  assert.equal(match.kind, 'composer_attachment');
+});

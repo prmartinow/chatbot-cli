@@ -2665,6 +2665,17 @@ function composerDraftMatchesMessage(state, message) {
   if (normState === normMsg || (normMsg.length && normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
+  // Handle long prompts that ChatGPT auto-converts into composer attachments
+  if (normMsg.length >= 1000 && state?.attachments && state.attachments.length) {
+    const firstLine = normalizeTurnText(message.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '').slice(0, 30);
+    const hasPastedAttachment = state.attachments.some((att) => {
+      const attText = normalizeTurnText(att.text || att.title || att.aria || '').toLowerCase();
+      return attText.includes('pasted text') || (firstLine && attText.includes(firstLine.toLowerCase()));
+    });
+    if (hasPastedAttachment) {
+      return { ok: true, kind: 'composer_attachment' };
+    }
+  }
   return { ok: false, kind: '' };
 }
 
