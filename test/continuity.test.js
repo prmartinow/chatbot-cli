@@ -4669,19 +4669,31 @@ test('waitForSendReady: throws COMPOSER_SUBMIT_CONTROL_AMBIGUOUS when multiple c
   );
 });
 
-test('registerPendingRound: consumes reserved id and is idempotent', async () => {
+test('registerPendingRound: consumes reserved id, validates immutable payload, and is non-regressive', async () => {
   const reservedId = 'round-test-reserved-123';
   const pageStub = { url: () => 'https://chatgpt.com/c/test-session-id' };
   const r1 = registerPendingRound({ transcript: '' }, pageStub, 'hello world', '', {
     roundId: reservedId,
+    dispatchState: 'accepted',
+    status: 'pending',
   });
   assert.equal(r1.id, reservedId);
+  assert.equal(r1.dispatchState, 'accepted');
 
-  const r2 = registerPendingRound({ transcript: '' }, pageStub, 'hello world updated', '', {
+  // Same payload re-registration preserves immutable state and does NOT regress to prepared
+  const r2 = registerPendingRound({ transcript: '' }, pageStub, 'hello world', '', {
     roundId: reservedId,
+    dispatchState: 'prepared',
   });
   assert.equal(r2.id, reservedId);
-  assert.equal(r2.messageChars, 19);
+  assert.equal(r2.dispatchState, 'accepted', 'dispatchState does not regress from accepted to prepared');
+  assert.equal(r2.messageChars, 11);
+
+  // Different payload throws ROUND_PAYLOAD_MISMATCH
+  assert.throws(
+    () => registerPendingRound({ transcript: '' }, pageStub, 'hello world mutated', '', { roundId: reservedId }),
+    (err) => err.code === 'ROUND_PAYLOAD_MISMATCH'
+  );
 });
 
 test('composerDraftMatchesMessage: strictly rejects prefix-only truncation markers', () => {
@@ -4693,4 +4705,24 @@ test('composerDraftMatchesMessage: strictly rejects prefix-only truncation marke
   const exactComposer = { text: fullMessage };
   const resExact = composerDraftMatchesMessage(exactComposer, fullMessage);
   assert.equal(resExact.ok, true);
+});
+
+test('registerPendingBranch: enforces immutable parentSessionId binding', () => {
+  const branchId = 'branch-immutable-binding-test';
+  const pageStub = { url: () => 'https://chatgpt.com/c/parent-session-1' };
+  const b1 = registerPendingBranch({ transcript: '' }, pageStub, null, {
+    branchId,
+    parentSessionId: 'parent-session-1',
+  });
+  assert.equal(b1.id, branchId);
+  assert.equal(b1.parentSessionId, 'parent-session-1');
+
+  // Attempting to register the same branch under a different parent throws BRANCH_BINDING_MISMATCH
+  assert.throws(
+    () => registerPendingBranch({ transcript: '' }, pageStub, null, {
+      branchId,
+      parentSessionId: 'parent-session-2',
+    }),
+    (err) => err.code === 'BRANCH_BINDING_MISMATCH'
+  );
 });

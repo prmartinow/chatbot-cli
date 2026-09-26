@@ -1463,14 +1463,29 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
     const state = loadRoundState();
     let existing = state.rounds.find((item) => item.id === id);
     if (existing) {
+      const incomingExpectedSessionId = extra.expectedSessionId || sessionId;
+      if (incomingExpectedSessionId && existing.sessionId && incomingExpectedSessionId !== existing.sessionId) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${id}" is bound to session "${existing.sessionId}", cannot rebind to "${incomingExpectedSessionId}"`);
+      }
+      const incomingHash = messageHash(canonicalRawPrompt(message));
+      if (message && existing.messageHash && existing.messageHash !== incomingHash) {
+        throw cbError('ROUND_PAYLOAD_MISMATCH', `Reserved round "${id}" is bound to message hash "${existing.messageHash}", cannot mutate to "${incomingHash}"`);
+      }
+      // Non-regressive update: preserve existing dispatchState and status if already beyond prepared
+      const preservedDispatchState = (existing.dispatchState && existing.dispatchState !== 'prepared')
+        ? existing.dispatchState
+        : (extra.dispatchState || existing.dispatchState || 'prepared');
+      const preservedStatus = (existing.status && existing.status !== 'pending')
+        ? existing.status
+        : (extra.status || existing.status || 'pending');
+
       Object.assign(existing, {
         updatedAt: now,
-        sessionId: existing.sessionId || sessionId,
         transcript: existing.transcript || transcript,
         baselineLastTurnId: existing.baselineLastTurnId || baselineLastTurnId,
-        messageChars: message ? message.length : existing.messageChars,
-        messageHash: message ? messageHash(canonicalRawPrompt(message)) : existing.messageHash,
-        ...extra,
+        jobId: extra.jobId || existing.jobId || '',
+        dispatchState: preservedDispatchState,
+        status: preservedStatus,
       });
       saveRoundState(state);
       return existing;
@@ -1576,13 +1591,9 @@ function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
     const state = loadLineageState();
     let existing = state.branches.find((b) => b.id === id);
     if (existing) {
-      Object.assign(existing, {
-        updatedAt: now,
-        parentSessionId: existing.parentSessionId || parentSessionId,
-        sourceTurnRef: existing.sourceTurnRef || sourceTurnRef,
-        ...extra,
-      });
-      saveLineageState(state);
+      if (existing.parentSessionId && parentSessionId && existing.parentSessionId !== parentSessionId) {
+        throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${id}" is bound to parent session "${existing.parentSessionId}", cannot rebind to "${parentSessionId}"`);
+      }
       return existing;
     }
 
@@ -2575,15 +2586,6 @@ function composerDraftMatchesMessage(state, message) {
   if (normState === normMsg || (normMsg.length && normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
-
-  const normalizedMessage = normalizeTurnText(message);
-  const attachmentText = (state?.attachments || [])
-    .map((item) => [item.testid, item.aria, item.title, item.text].filter(Boolean).join(' '))
-    .join(' ');
-  if (normalizedMessage.length >= 4000 && /\bpasted(?:\s+text)?\b/i.test(attachmentText)) {
-    return { ok: true, kind: 'pasted_text_attachment' };
-  }
-
   return { ok: false, kind: '' };
 }
 
@@ -9018,7 +9020,7 @@ async function branchWithContextCarryForward(page, args) {
     anchor: args.branchTurn || 'latest',
   });
 
-  const incident = getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash, {
+  let incident = getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash, {
     provenance: extractedMeta?.provenance || 'explicit_payload',
     sourceFile: extractedMeta?.sourceFile || '',
     sourceFileHash: extractedMeta?.sourceFileHash || '',
@@ -9028,6 +9030,8 @@ async function branchWithContextCarryForward(page, args) {
 
   const incidentLease = await acquireRecoveryIncidentLease(incident.id);
   try {
+    incident = getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash);
+
     if (incident.state === 'completed' && incident.childSessionId) {
       info(`[stage3-carry] Carry-forward incident ${incident.id} already completed on child session ${incident.childSessionId}`);
       return {
@@ -9038,6 +9042,42 @@ async function branchWithContextCarryForward(page, args) {
         continuationResponse: incident.continuationResponse || null,
         status: 'completed',
       };
+    }
+
+    // Check if continuation round was already dispatched/completed BEFORE allocating any child page
+    if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
+      const roundsState = loadRoundState();
+      const existingRound = roundsState.rounds.find((r) => r.id === incident.continuationRoundId);
+      const isPositivelyCompleted = existingRound
+        && (existingRound.status === 'done' || existingRound.status === 'completed')
+        && existingRound.status !== 'failed'
+        && existingRound.dispatchState !== 'aborted_precommit'
+        && existingRound.dispatchState !== 'uncertain';
+
+      if (isPositivelyCompleted) {
+        let respText = existingRound.responseText || '';
+        if (!respText && existingRound.transcript && fs.existsSync(existingRound.transcript)) {
+          try {
+            const trEntries = parseTranscriptEntries(fs.readFileSync(existingRound.transcript, 'utf8'));
+            const asst = trEntries.reverse().find((e) => e.role === 'assistant' && (e.text || e.content));
+            if (asst) respText = asst.text || asst.content;
+          } catch {}
+        }
+        const askResult = { text: respText, roundId: existingRound.id };
+        updateRecoveryIncident(incident.id, {
+          state: 'completed',
+          continuationResponse: askResult,
+        }, 'carry_forward_completed');
+        return {
+          incidentId: incident.id,
+          childSessionId: incident.childSessionId,
+          childUrl: targetConversationUrl(incident.childSessionId),
+          continuityPrompt: incident.continuityPrompt || '',
+          continuationResponse: askResult,
+          status: 'completed',
+        };
+      }
+      throw cbError('CONTINUATION_ROUND_UNCERTAIN', `Carry-forward continuation round "${incident.continuationRoundId}" is in uncertain state "${existingRound?.status || 'missing'}" and requires reconciliation`);
     }
 
     let childSessionId = incident.childSessionId;
@@ -9137,53 +9177,32 @@ async function branchWithContextCarryForward(page, args) {
 
     updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
 
-    // Check if continuation round was already dispatched/completed
-    if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
-      const roundsState = loadRoundState();
-      const existingRound = roundsState.rounds.find(r => r.id === incident.continuationRoundId);
-      const isCompleted = existingRound && (existingRound.status === 'done' || existingRound.status === 'completed' || existingRound.assistantOutcome === 'succeeded');
-      if (isCompleted) {
-        let respText = existingRound.responseText || '';
-        if (!respText && existingRound.transcript && fs.existsSync(existingRound.transcript)) {
-          try {
-            respText = fs.readFileSync(existingRound.transcript, 'utf8');
-          } catch {}
-        }
-        const askResult = { text: respText, roundId: existingRound.id };
-        updateRecoveryIncident(incident.id, {
-          state: 'completed',
-          continuationResponse: askResult,
-        }, 'carry_forward_completed');
-        return {
-          ...branchResult,
-          incidentId: incident.id,
-          continuityPrompt,
-          continuationResponse: askResult,
-        };
-      }
-      throw cbError('CONTINUATION_ROUND_UNCERTAIN', `Carry-forward continuation round "${incident.continuationRoundId}" is in uncertain state "${existingRound?.status || 'missing'}" and requires reconciliation`);
-    }
+    let childLaneLease = targetPage._laneLease || null;
+    targetPage._laneLease = null; // Clear from page so it cannot become stale
 
-    const childArgs = {
-      ...args,
-      conversation: childSessionId,
-      expectedSessionId: childSessionId,
-      pageTargetId: childTid,
-      targetId: childTid,
-      roundId: incident.continuationRoundId,
-      branchTurn: '',
-      branchCarryForward: false,
-      message: continuityPrompt,
-      _laneLease: targetPage._laneLease || null,
-    };
+    try {
+      const childArgs = {
+        ...args,
+        conversation: childSessionId,
+        expectedSessionId: childSessionId,
+        pageTargetId: childTid,
+        targetId: childTid,
+        roundId: incident.continuationRoundId,
+        branchTurn: '',
+        branchCarryForward: false,
+        message: continuityPrompt,
+        _laneLease: childLaneLease,
+      };
+      // Ownership transferred to childArgs; ask() will release it
+      childLaneLease = null;
 
-    updateRecoveryIncident(incident.id, {
-      state: 'continuation_dispatching',
-      continuityPrompt,
-    }, 'carry_forward_dispatching');
+      updateRecoveryIncident(incident.id, {
+        state: 'continuation_dispatching',
+        continuityPrompt,
+      }, 'carry_forward_dispatching');
 
-    info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
-    const askResult = await ask(targetPage, continuityPrompt, childArgs);
+      info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
+      const askResult = await ask(targetPage, continuityPrompt, childArgs);
 
     updateRecoveryIncident(incident.id, {
       state: 'completed',
@@ -9196,6 +9215,11 @@ async function branchWithContextCarryForward(page, args) {
       continuityPrompt,
       continuationResponse: askResult,
     };
+    } finally {
+      if (childLaneLease) {
+        try { releaseBrowserLaneLease(childLaneLease); } catch {}
+      }
+    }
   } finally {
     releaseRecoveryIncidentLease(incidentLease);
   }
@@ -10596,6 +10620,22 @@ async function ask(page, message, args) {
       roundExtra.id = args.roundId;
     }
     const round = registerPendingRound(args, page, message, baselineLastTurnId, roundExtra);
+
+    if (round.status === 'done' || round.status === 'completed' || round.assistantOutcome === 'succeeded') {
+      info(`[ask] Round "${round.id}" was already completed; returning existing result without re-dispatching`);
+      if (round.transcript && fs.existsSync(round.transcript)) {
+        try {
+          const trEntries = parseTranscriptEntries(fs.readFileSync(round.transcript, 'utf8'));
+          const asst = trEntries.reverse().find((e) => e.role === 'assistant' && (e.text || e.content));
+          if (asst) return asst.text || asst.content;
+        } catch {}
+      }
+      return round.responseText || '';
+    }
+
+    if (round.dispatchState === 'uncertain' || round.dispatchState === 'dispatching') {
+      throw cbError('ROUND_DISPATCH_UNCERTAIN', `Round "${round.id}" is in in-flight/uncertain state "${round.dispatchState}" and requires reconciliation before any new dispatch`);
+    }
 
     if (!isNewChat && expectedSessionId) {
       try {
