@@ -10745,6 +10745,7 @@ async function watchTargetAppState(page, args, options = {}) {
   }
   const initialState = await getTargetAppState(page);
   const baseline = stateBaseline(initialState);
+  let sawGenerating = Boolean(initialState.isGenerating || initialState.generationControls?.length);
   const emitter = createStateEmitter({
     jsonl: args.stateJsonl,
     stream: process.stdout,
@@ -10757,7 +10758,13 @@ async function watchTargetAppState(page, args, options = {}) {
   let event = emitter.emit(initialState, true);
 
   while (true) {
-    if (args.waitReady && event.ready) return event;
+    if (args.waitReady) {
+      if (event.ready) return event;
+      // If generation was active (or started during generation) and has now completely ceased, exit ready!
+      if (sawGenerating && !event.generating && !event.activeProgress && (event.phase === 'ready' || event.phase === 'idle')) {
+        return event;
+      }
+    }
     if (args.waitReady && !noTimeout && Date.now() - start >= args.timeout) {
       throw new Error(`Timed out after ${args.timeout}ms waiting for ready assistant output`);
     }
@@ -10770,6 +10777,9 @@ async function watchTargetAppState(page, args, options = {}) {
       refreshSessionTranscript(page, args);
     }
     const state = await getTargetAppState(page);
+    if (state.isGenerating || state.generationControls?.length) {
+      sawGenerating = true;
+    }
     event = emitter.emit(state);
   }
 }

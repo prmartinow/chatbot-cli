@@ -5092,3 +5092,48 @@ test('composerDraftMatchesMessage: accepts long message converted into composer 
   assert.equal(match.ok, true);
   assert.equal(match.kind, 'composer_attachment');
 });
+
+test('watchTargetAppState: returns cleanly when generation ceases into idle phase even if assistant turn count did not advance', async () => {
+  const testSession = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  let callCount = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    waitForTimeout: async () => {},
+    evaluate: async () => {
+      callCount++;
+      if (callCount === 1) {
+        // First sample: actively generating
+        return {
+          url: `https://chatgpt.com/c/${testSession}`,
+          isGenerating: true,
+          generationControls: [{ text: 'Stop' }],
+          turnCount: 2,
+          lastTurns: [{ role: 'assistant', index: 1, chars: 500, testid: 'turn-a' }],
+          activityTexts: ['Thinking'],
+        };
+      }
+      // Second sample: finished generation, state is idle
+      return {
+        url: `https://chatgpt.com/c/${testSession}`,
+        isGenerating: false,
+        generationControls: [],
+        turnCount: 2,
+        lastTurns: [{ role: 'assistant', index: 1, chars: 500, testid: 'turn-a' }],
+        activityTexts: [],
+      };
+    },
+  };
+
+  const args = {
+    expectedSessionId: testSession,
+    waitReady: true,
+    timeout: 5000,
+    stateInterval: 10,
+    stateJsonl: false,
+  };
+
+  const res = await watchTargetAppState(fakePage, args);
+  assert.equal(res.phase, 'idle');
+  assert.equal(res.generating, false);
+});
