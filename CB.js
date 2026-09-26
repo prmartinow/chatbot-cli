@@ -1467,7 +1467,19 @@ function isPositivelyBoundBranch(branch, expectedParentSessionId = '') {
   if (branch.childSessionId === branch.parentSessionId) {
     return false;
   }
-  return Boolean(branch.parentAttestation || branch.lineageAttestation);
+  const validParentAttest = Boolean(
+    branch.parentAttestation && typeof branch.parentAttestation === 'object'
+    && branch.parentAttestation.verifiedVia === 'dom_divider'
+    && branch.parentAttestation.parentSessionId === branch.parentSessionId
+  );
+  const validLineageAttest = Boolean(
+    !branch.lineageAttestation || (
+      typeof branch.lineageAttestation === 'object'
+      && branch.lineageAttestation.parentSessionId === branch.parentSessionId
+      && (branch.lineageAttestation.parentResolution === 'dom_divider' || branch.lineageAttestation.verifiedVia === 'dom_divider')
+    )
+  );
+  return validParentAttest && validLineageAttest;
 }
 
 function isPositivelyCompletedRound(round) {
@@ -1636,6 +1648,16 @@ function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
     if (existing) {
       if (existing.parentSessionId && parentSessionId && existing.parentSessionId !== parentSessionId) {
         throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${id}" is bound to parent session "${existing.parentSessionId}", cannot rebind to "${parentSessionId}"`);
+      }
+      if (existing.sourceTurnRef && sourceTurnRef && typeof existing.sourceTurnRef === 'object' && typeof sourceTurnRef === 'object') {
+        const existingKey = existing.sourceTurnRef.turnKey || existing.sourceTurnRef.logicalTurnId || existing.sourceTurnRef.testid || '';
+        const requestedKey = sourceTurnRef.turnKey || sourceTurnRef.logicalTurnId || sourceTurnRef.testid || '';
+        if (existingKey && requestedKey && existingKey !== requestedKey) {
+          throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${id}" source turn mismatch: expected "${existingKey}", got "${requestedKey}"`);
+        }
+        if (existing.sourceTurnRef.textHash && sourceTurnRef.textHash && existing.sourceTurnRef.textHash !== sourceTurnRef.textHash) {
+          throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${id}" anchor revision hash mismatch: expected "${existing.sourceTurnRef.textHash}", got "${sourceTurnRef.textHash}"`);
+        }
       }
       return existing;
     }
@@ -5287,7 +5309,7 @@ async function markModelSwitcher(page) {
           score += 120;
           modelSignal = true;
         }
-        if (text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra|extra high|high|medium|low|auto|fast)\b/i.test(text)) {
+        if ((insideComposer || modelSignal) && text.length <= 80 && /\b(gpt|latest|instant|thinking|extended|pro|sol|astra|extra high|high|medium|low|auto|fast)\b/i.test(text)) {
           score += 50;
           modelSignal = true;
         }
@@ -6372,25 +6394,32 @@ async function applySliderModelSelection(page, selection, menuState, label) {
       });
       await page.waitForTimeout(400);
 
-      const sliderControl = page.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
-      const slider = page.locator('[role="slider"]');
-      if (await slider.count()) {
-        const controlToFocus = (await sliderControl.count()) ? sliderControl.first() : slider.first();
-        await controlToFocus.focus().catch(() => {});
-        let currentVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '0', 10);
-        let steps = 0;
-        while (currentVal !== targetIndex && steps < 10) {
-          steps++;
-          if (currentVal < targetIndex) {
-            await page.keyboard.press('ArrowRight');
-          } else {
-            await page.keyboard.press('ArrowLeft');
-          }
-          await page.waitForTimeout(100);
-          const nextVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '0', 10);
-          if (nextVal === currentVal) break;
-          currentVal = nextVal;
+      const menu = page.locator('[role="menu"][data-state="open"], [role="menu"]').first();
+      const slider = menu.locator('[role="slider"]');
+      const sliderCount = await slider.count();
+      if (sliderCount !== 1) {
+        throw cbError('REASONING_SELECTION_UNVERIFIED', `Expected exactly 1 slider in model menu, found ${sliderCount}`);
+      }
+
+      const sliderControl = menu.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
+      const controlToFocus = (await sliderControl.count()) ? sliderControl.first() : slider.first();
+      await controlToFocus.focus().catch(() => {});
+      let currentVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '-1', 10);
+      let steps = 0;
+      while (currentVal !== targetIndex && steps < 10) {
+        steps++;
+        if (currentVal < targetIndex) {
+          await page.keyboard.press('ArrowRight');
+        } else {
+          await page.keyboard.press('ArrowLeft');
         }
+        await page.waitForTimeout(100);
+        const nextVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '-1', 10);
+        if (nextVal === currentVal) break;
+        currentVal = nextVal;
+      }
+      if (currentVal !== targetIndex) {
+        throw cbError('REASONING_SELECTION_UNVERIFIED', `Slider adjustment failed: reached valuenow ${currentVal}, expected ${targetIndex}`);
       }
     }
   }
@@ -6399,6 +6428,12 @@ async function applySliderModelSelection(page, selection, menuState, label) {
   await page.keyboard.press('Escape').catch(() => {});
   await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(400);
+
+  const stateAfter = await getTargetAppState(page).catch(() => null);
+  const parsedAfter = parseModeAndEffort(stateAfter?.model || '');
+  if (targetEffort && normalizeModelLabel(parsedAfter.effort || parsedAfter.mode || '').toLowerCase() !== normalizeModelLabel(targetEffort).toLowerCase()) {
+    throw cbError('REASONING_SELECTION_UNVERIFIED', `Model effort post-verification failed: expected "${targetEffort}", got "${stateAfter?.model || 'unknown'}"`);
+  }
 
   const selectedPill = await page.evaluate(() => {
     const btn = document.querySelector('form button.__composer-pill, form button:not(#composer-plus-btn)[aria-haspopup="menu"]');
@@ -6482,8 +6517,15 @@ async function selectReasoning(page, label) {
   const selection = parseModelSelection(label);
   const state = await getTargetAppState(page).catch(() => null);
   const currentModelLabel = state?.model || '';
-  if (selection.effort && normalizeModelLabel(currentModelLabel).toLowerCase() === normalizeModelLabel(selection.effort).toLowerCase()) {
-    info(`[reasoning] "${currentModelLabel}" is already selected; skipping switcher`);
+  const currentParsed = parseModeAndEffort(currentModelLabel);
+  const currentEffort = normalizeModelLabel(currentParsed.effort || currentModelLabel);
+  const targetEffort = normalizeModelLabel(selection.effort || '');
+  const currentMode = normalizeModelLabel(currentParsed.mode || '');
+  const targetMode = normalizeModelLabel(selection.mode || '');
+  const noModelOverride = !selection.model;
+
+  if (noModelOverride && targetEffort && currentEffort.toLowerCase() === targetEffort.toLowerCase() && (!targetMode || currentMode.toLowerCase() === targetMode.toLowerCase())) {
+    info(`[reasoning] "${currentModelLabel}" is already selected (mode: ${currentMode || 'none'}, effort: ${currentEffort}); skipping switcher`);
     return {
       requested: label,
       selected: currentModelLabel,
@@ -6491,8 +6533,9 @@ async function selectReasoning(page, label) {
       available: [currentModelLabel],
     };
   }
+
   if (!selection.mode && selection.effort) {
-    selection.mode = parseModeAndEffort(currentModelLabel).mode;
+    selection.mode = currentParsed.mode;
   }
   const requested = [selection.mode, selection.effort].filter(Boolean).join(' ') || label;
   const result = await selectModel(page, requested);
@@ -9173,6 +9216,8 @@ async function branchWithContextCarryForward(page, args) {
       branchResult = await branchConversationTurn(page, branchArgs);
       childSessionId = branchResult.childSessionId;
       childPage = branchResult.childPage;
+      childArgs.conversation = childSessionId;
+      childArgs.expectedSessionId = childSessionId;
       updateRecoveryIncident(incident.id, {
         state: 'branched',
         childSessionId,
@@ -9217,6 +9262,8 @@ async function branchWithContextCarryForward(page, args) {
         branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
       });
 
+      childArgs.conversation = childSessionId;
+      childArgs.expectedSessionId = childSessionId;
       const targetPage = childPage || branchResult.childPage;
       if (!targetPage) {
         throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
@@ -9282,16 +9329,26 @@ async function branchConversationTurn(page, args) {
     // Preflight disposition check: validate existing branch before acquiring parent lease or reloading
     if (args.branchId) {
       const existingBranch = loadLineageState().branches.find((b) => b.id === args.branchId);
-      if (existingBranch && existingBranch.dispatchState !== 'prepared') {
-        if (isPositivelyBoundBranch(existingBranch, expectedParentSessionId)) {
-          info(`[stage3] Branch "${existingBranch.id}" already resolved to child ${existingBranch.childSessionId}`);
-          return {
-            childSessionId: existingBranch.childSessionId,
-            childUrl: targetConversationUrl(existingBranch.childSessionId),
-            branchRecord: existingBranch,
-          };
+      if (existingBranch) {
+        if (existingBranch.parentSessionId && expectedParentSessionId && existingBranch.parentSessionId !== expectedParentSessionId) {
+          throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" parent mismatch: expected "${existingBranch.parentSessionId}", got "${expectedParentSessionId}"`);
         }
-        throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${existingBranch.id}" is in state "${existingBranch.dispatchState}" (status: ${existingBranch.status || 'unknown'}) and cannot be re-dispatched`);
+        if (args.expectedAnchorRevisionHash && existingBranch.sourceTurnRef?.textHash) {
+          if (existingBranch.sourceTurnRef.textHash !== args.expectedAnchorRevisionHash) {
+            throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" anchor revision mismatch: expected "${existingBranch.sourceTurnRef.textHash}", got "${args.expectedAnchorRevisionHash}"`);
+          }
+        }
+        if (existingBranch.dispatchState !== 'prepared') {
+          if (isPositivelyBoundBranch(existingBranch, expectedParentSessionId)) {
+            info(`[stage3] Branch "${existingBranch.id}" already resolved to child ${existingBranch.childSessionId}`);
+            return {
+              childSessionId: existingBranch.childSessionId,
+              childUrl: targetConversationUrl(existingBranch.childSessionId),
+              branchRecord: existingBranch,
+            };
+          }
+          throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${existingBranch.id}" is in state "${existingBranch.dispatchState}" (status: ${existingBranch.status || 'unknown'}) and cannot be re-dispatched`);
+        }
       }
     }
 
@@ -10607,6 +10664,16 @@ async function ask(page, message, args) {
   if (args.roundId) {
     const existingRound = loadRoundState().rounds.find((r) => r.id === args.roundId);
     if (existingRound) {
+      const incomingExpectedSessionId = args.expectedSessionId || args.conversation || '';
+      if (incomingExpectedSessionId && existingRound.sessionId && incomingExpectedSessionId !== existingRound.sessionId) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${args.roundId}" is bound to session "${existingRound.sessionId}", cannot rebind to "${incomingExpectedSessionId}"`);
+      }
+      if (message && existingRound.messageHash) {
+        const incomingHash = messageHash(canonicalRawPrompt(message));
+        if (existingRound.messageHash !== incomingHash) {
+          throw cbError('ROUND_PAYLOAD_MISMATCH', `Reserved round "${args.roundId}" message hash mismatch: expected "${existingRound.messageHash}", got "${incomingHash}"`);
+        }
+      }
       if (isPositivelyCompletedRound(existingRound)) {
         info(`[ask] Round "${existingRound.id}" was already completed; returning existing result without browser preparation`);
         const resp = extractRoundResponseFromTranscript(existingRound.transcript, existingRound) || existingRound.responseText || '';

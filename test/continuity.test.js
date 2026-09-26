@@ -4783,15 +4783,37 @@ test('isPositivelyCompletedRound: rejects terminal_error, uncertain outcome, fai
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'dispatching' }), false);
 });
 
-test('isPositivelyBoundBranch: validates done/bound status, child session identity, and attestations', () => {
+test('isPositivelyBoundBranch: validates done/bound status, child session identity, and structured attestations', () => {
   const validBranch = {
     status: 'done',
     dispatchState: 'bound',
     childSessionId: '6ab67303-2184-83ec-adec-c20355220c99',
     parentSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
-    parentAttestation: 'parent-attest-hash',
+    parentAttestation: {
+      parentSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+      verifiedVia: 'dom_divider',
+    },
+    lineageAttestation: {
+      parentSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+      parentResolution: 'dom_divider',
+    },
   };
   assert.equal(isPositivelyBoundBranch(validBranch, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c'), true);
+
+  // Rejects unstructured string attestations
+  assert.equal(isPositivelyBoundBranch({ ...validBranch, parentAttestation: 'string-token' }), false);
+
+  // Rejects attestation with mismatched parent
+  assert.equal(isPositivelyBoundBranch({
+    ...validBranch,
+    parentAttestation: { parentSessionId: 'wrong-parent', verifiedVia: 'dom_divider' }
+  }), false);
+
+  // Rejects attestation without verifiedVia: dom_divider
+  assert.equal(isPositivelyBoundBranch({
+    ...validBranch,
+    parentAttestation: { parentSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c', verifiedVia: 'heuristic' }
+  }), false);
 
   // Rejects wrong dispatch state or status
   assert.equal(isPositivelyBoundBranch({ ...validBranch, dispatchState: 'branched' }), false);
@@ -4805,4 +4827,69 @@ test('isPositivelyBoundBranch: validates done/bound status, child session identi
 
   // Rejects missing attestation
   assert.equal(isPositivelyBoundBranch({ ...validBranch, parentAttestation: null, lineageAttestation: null }), false);
+});
+
+test('registerPendingRound & ask preflight: enforce immutable payload and session binding on reserved ID reuse', () => {
+  const roundId = 'test-reserved-round-immutability';
+  const initialRound = registerPendingRound(
+    { transcript: '/tmp/test-tx.txt' },
+    { url: () => 'https://chatgpt.com/c/session-aaa' },
+    'Prompt Alpha',
+    '',
+    { id: roundId, expectedSessionId: 'session-aaa' }
+  );
+  assert.equal(initialRound.id, roundId);
+
+  // Re-registering with different payload throws ROUND_PAYLOAD_MISMATCH
+  assert.throws(() => {
+    registerPendingRound(
+      { transcript: '/tmp/test-tx.txt' },
+      { url: () => 'https://chatgpt.com/c/session-aaa' },
+      'Prompt Beta with different content',
+      '',
+      { id: roundId, expectedSessionId: 'session-aaa' }
+    );
+  }, (err) => err.code === 'ROUND_PAYLOAD_MISMATCH');
+
+  // Re-registering with different session throws ROUND_BINDING_MISMATCH
+  assert.throws(() => {
+    registerPendingRound(
+      { transcript: '/tmp/test-tx.txt' },
+      { url: () => 'https://chatgpt.com/c/session-bbb' },
+      'Prompt Alpha',
+      '',
+      { id: roundId, expectedSessionId: 'session-bbb' }
+    );
+  }, (err) => err.code === 'ROUND_BINDING_MISMATCH');
+});
+
+test('registerPendingBranch: enforces immutable sourceTurnRef and anchor revision on reserved ID reuse', () => {
+  const branchId = 'test-reserved-branch-immutability';
+  const initialBranch = registerPendingBranch(
+    { branchId },
+    { url: () => 'https://chatgpt.com/c/parent-session-111' },
+    { turnKey: 'turn-1', textHash: 'hash-revision-1' },
+    { id: branchId, parentSessionId: 'parent-session-111' }
+  );
+  assert.equal(initialBranch.id, branchId);
+
+  // Re-registering with different turnKey throws BRANCH_BINDING_MISMATCH
+  assert.throws(() => {
+    registerPendingBranch(
+      { branchId },
+      { url: () => 'https://chatgpt.com/c/parent-session-111' },
+      { turnKey: 'turn-2', textHash: 'hash-revision-1' },
+      { id: branchId, parentSessionId: 'parent-session-111' }
+    );
+  }, (err) => err.code === 'BRANCH_BINDING_MISMATCH');
+
+  // Re-registering with different textHash throws BRANCH_BINDING_MISMATCH
+  assert.throws(() => {
+    registerPendingBranch(
+      { branchId },
+      { url: () => 'https://chatgpt.com/c/parent-session-111' },
+      { turnKey: 'turn-1', textHash: 'hash-revision-2' },
+      { id: branchId, parentSessionId: 'parent-session-111' }
+    );
+  }, (err) => err.code === 'BRANCH_BINDING_MISMATCH');
 });
