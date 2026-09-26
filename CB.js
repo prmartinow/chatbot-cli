@@ -3134,7 +3134,11 @@ async function getBlockingModal(page) {
 }
 
 async function dismissBlockingModal(page) {
-  const candidate = await page.evaluate((selectors) => {
+  let dismissedAny = false;
+  let lastCandidate = null;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = await page.evaluate((selectors) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
     const kindOf = (meta) => {
@@ -3213,25 +3217,41 @@ async function dismissBlockingModal(page) {
     error: error.message || String(error),
   }));
 
-  if (!candidate?.found) return { dismissed: false, found: false, reason: candidate?.error || 'no blocker' };
-  if (!candidate.safe) return { dismissed: false, found: true, modal: candidate.modal, reason: 'not safe to dismiss automatically' };
+    if (!candidate?.found) {
+      if (dismissedAny) {
+        return {
+          dismissed: true,
+          found: true,
+          safe: true,
+          clicked: true,
+          escaped: false,
+          modal: lastCandidate?.modal || null,
+          remaining: null,
+        };
+      }
+      return { dismissed: false, found: false, reason: candidate?.error || 'no blocker' };
+    }
+    if (!candidate.safe) {
+      return { dismissed: false, found: true, modal: candidate.modal, reason: 'not safe to dismiss automatically' };
+    }
 
-  let clicked = false;
-  if (candidate.closeSelector) {
-    clicked = await page.locator(candidate.closeSelector).click({ timeout: 2000 }).then(() => true).catch(async () => {
-      return page.evaluate((sel) => {
+    lastCandidate = candidate;
+    if (candidate.closeSelector) {
+      const clicked = await page.evaluate((sel) => {
         const el = document.querySelector(sel);
         if (el) { el.click(); return true; }
         return false;
       }, candidate.closeSelector).catch(() => false);
-    });
-    await page.waitForTimeout(300);
-  }
+      if (clicked) {
+        dismissedAny = true;
+        await page.waitForTimeout(300);
+        continue;
+      }
+    }
 
-  const beforeEscape = await getBlockingModal(page);
-  if (beforeEscape) {
     await page.keyboard.press('Escape').catch(() => {});
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(400);
+    dismissedAny = true;
   }
 
   const remaining = await getBlockingModal(page);
@@ -3239,9 +3259,9 @@ async function dismissBlockingModal(page) {
     dismissed: !remaining,
     found: true,
     safe: true,
-    clicked,
-    escaped: Boolean(beforeEscape),
-    modal: candidate.modal,
+    clicked: dismissedAny,
+    escaped: dismissedAny,
+    modal: lastCandidate?.modal || null,
     remaining,
   };
 }
