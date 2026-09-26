@@ -11037,14 +11037,18 @@ async function watchTargetAppState(page, args, options = {}) {
         if (event.blocked) {
           throw cbError('UI_BLOCKER_UNRESOLVED', 'Target still blocked after preview drain');
         }
-        if (event.phase === 'ready' || event.phase === 'idle') {
+        if (event.ready) {
           return {
             ...event,
-            ready: true,
             waitSatisfied: true,
-            completionReason: 'quiescent_blocker_cleared',
+            completionReason: 'quiescent_blocker_cleared_with_answer',
           };
         }
+
+        throw cbError(
+          'WATCH_COMPLETION_UNVERIFIED',
+          'UI blocker was cleared, but no post-baseline assistant completion could be verified'
+        );
       }
     }
     if (args.waitReady && !noTimeout && Date.now() - start >= args.timeout) {

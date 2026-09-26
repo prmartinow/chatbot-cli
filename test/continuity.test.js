@@ -5613,3 +5613,181 @@ test('assertNoBlockingModal: throws UI_BLOCKER_PRESENT when modal is visible', a
     (err) => err.code === 'UI_BLOCKER_PRESENT'
   );
 });
+
+test('watchTargetAppState: quiescent target blocked by preview dialog with unchanged baseline fails closed with WATCH_COMPLETION_UNVERIFIED', async () => {
+  const testSession = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+  let drainState = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    evaluate: async (fn) => {
+      const s = typeof fn === 'function' ? fn.toString() : '';
+      if (s.includes('composer_element_missing')) {
+        return { verified: true, blocked: false };
+      }
+      if (s.includes('curFp === prevFp')) {
+        return { cleared: true, stuck: false, remaining: 0 };
+      }
+      if (s.includes('allDialogs.length === 0')) {
+        if (drainState === 0) {
+          drainState = 1;
+          return { hasDialogs: true, safe: true, kind: 'table_preview', fingerprint: 'fp-1', dialogCount: 1 };
+        }
+        return { hasDialogs: false };
+      }
+      if (s.includes('blockingModalSelectors')) {
+        if (drainState === 0) {
+          return {
+            url: `https://chatgpt.com/c/${testSession}`,
+            isGenerating: false,
+            generationControls: [],
+            turnCount: 2,
+            lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a', text: 'Initial answer' }],
+            activityTexts: [],
+            blockingModal: { id: 'radix-1', kind: 'table_preview', text: 'Table preview' },
+          };
+        }
+        return {
+          url: `https://chatgpt.com/c/${testSession}`,
+          isGenerating: false,
+          generationControls: [],
+          turnCount: 2,
+          lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a', text: 'Initial answer' }],
+          activityTexts: [],
+          blockingModal: null,
+        };
+      }
+      return {};
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => watchTargetAppState(fakePage, {
+      expectedSessionId: testSession,
+      waitReady: true,
+      timeout: 3000,
+      stateInterval: 10,
+    }),
+    (err) => err.code === 'WATCH_COMPLETION_UNVERIFIED'
+  );
+});
+
+test('watchTargetAppState: quiescent target blocked by preview dialog with verified assistant advancement returns quiescent_blocker_cleared_with_answer', async () => {
+  const testSession = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+  let drainState = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    evaluate: async (fn) => {
+      const s = typeof fn === 'function' ? fn.toString() : '';
+      if (s.includes('composer_element_missing')) {
+        return { verified: true, blocked: false };
+      }
+      if (s.includes('curFp === prevFp')) {
+        return { cleared: true, stuck: false, remaining: 0 };
+      }
+      if (s.includes('allDialogs.length === 0')) {
+        if (drainState === 0) {
+          drainState = 1;
+          return { hasDialogs: true, safe: true, kind: 'table_preview', fingerprint: 'fp-1', dialogCount: 1 };
+        }
+        return { hasDialogs: false };
+      }
+      if (s.includes('blockingModalSelectors')) {
+        if (drainState === 0) {
+          return {
+            url: `https://chatgpt.com/c/${testSession}`,
+            isGenerating: false,
+            generationControls: [],
+            turnCount: 2,
+            lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a', preview: 'Initial answer', text: 'Initial answer' }],
+            activityTexts: [],
+            blockingModal: { id: 'radix-1', kind: 'table_preview', text: 'Table preview' },
+          };
+        }
+        return {
+          url: `https://chatgpt.com/c/${testSession}`,
+          isGenerating: false,
+          generationControls: [],
+          turnCount: 3,
+          lastTurns: [{ role: 'assistant', index: 2, chars: 250, testid: 't-a-2', preview: 'Advanced new answer', text: 'Advanced new answer' }],
+          activityTexts: [],
+          blockingModal: null,
+        };
+      }
+      return {};
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await watchTargetAppState(fakePage, {
+    expectedSessionId: testSession,
+    waitReady: true,
+    timeout: 3000,
+    stateInterval: 10,
+  });
+
+  assert.equal(res.ready, true);
+  assert.equal(res.waitSatisfied, true);
+  assert.equal(res.completionReason, 'quiescent_blocker_cleared_with_answer');
+});
+
+test('watchTargetAppState: quiescent target blocked by preview dialog with latest turn still user fails closed with WATCH_COMPLETION_UNVERIFIED', async () => {
+  const testSession = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  let drainState = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    evaluate: async (fn) => {
+      const s = typeof fn === 'function' ? fn.toString() : '';
+      if (s.includes('composer_element_missing')) {
+        return { verified: true, blocked: false };
+      }
+      if (s.includes('curFp === prevFp')) {
+        return { cleared: true, stuck: false, remaining: 0 };
+      }
+      if (s.includes('allDialogs.length === 0')) {
+        if (drainState === 0) {
+          drainState = 1;
+          return { hasDialogs: true, safe: true, kind: 'table_preview', fingerprint: 'fp-1', dialogCount: 1 };
+        }
+        return { hasDialogs: false };
+      }
+      if (s.includes('blockingModalSelectors')) {
+        if (drainState === 0) {
+          return {
+            url: `https://chatgpt.com/c/${testSession}`,
+            isGenerating: false,
+            generationControls: [],
+            turnCount: 1,
+            lastTurns: [{ role: 'user', index: 0, chars: 50, testid: 't-u', text: 'User prompt' }],
+            activityTexts: [],
+            blockingModal: { id: 'radix-1', kind: 'table_preview', text: 'Table preview' },
+          };
+        }
+        return {
+          url: `https://chatgpt.com/c/${testSession}`,
+          isGenerating: false,
+          generationControls: [],
+          turnCount: 1,
+          lastTurns: [{ role: 'user', index: 0, chars: 50, testid: 't-u', text: 'User prompt' }],
+          activityTexts: [],
+          blockingModal: null,
+        };
+      }
+      return {};
+    },
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    async () => watchTargetAppState(fakePage, {
+      expectedSessionId: testSession,
+      waitReady: true,
+      timeout: 3000,
+      stateInterval: 10,
+    }),
+    (err) => err.code === 'WATCH_COMPLETION_UNVERIFIED'
+  );
+});
