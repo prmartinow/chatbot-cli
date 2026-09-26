@@ -4729,7 +4729,7 @@ test('registerPendingBranch: enforces immutable parentSessionId binding', () => 
   );
 });
 
-test('extractRoundResponseFromTranscript: attributes response to exact user turn and ignores subsequent unrelated exchanges', () => {
+test('extractRoundResponseFromTranscript: attributes response to round created via registerPendingRound and ignores subsequent unrelated exchanges', () => {
   const tmpTranscript = '/tmp/fake-transcript-attribution-test.txt';
   const transcriptContent = `
 [2026-09-26T00:00:01.000Z] USER
@@ -4752,20 +4752,30 @@ LATER UNRELATED RESPONSE
 `;
   fs.writeFileSync(tmpTranscript, transcriptContent);
 
-  const round = {
-    message: 'Target prompt to attribute',
-  };
+  // Create round via real registerPendingRound constructor (only stores messageHash/Head/Tail)
+  const round = registerPendingRound(
+    { transcript: tmpTranscript },
+    { url: () => 'https://chatgpt.com/c/test-session-id' },
+    'Target prompt to attribute',
+    ''
+  );
+  round.status = 'done';
+  round.dispatchState = 'accepted';
+  round.assistantOutcome = 'succeeded';
 
   const recovered = extractRoundResponseFromTranscript(tmpTranscript, round);
-  assert.equal(recovered, 'INTENDED TARGET RESPONSE', 'extracts the exact attributed assistant response following the target user prompt');
+  assert.equal(recovered, 'INTENDED TARGET RESPONSE', 'extracts the exact attributed assistant response following the target user prompt using messageHash/turn-window');
 
   try { fs.unlinkSync(tmpTranscript); } catch {}
 });
 
-test('isPositivelyCompletedRound: rejects failed, aborted, or uncertain rounds', () => {
-  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted' }), true);
-  assert.equal(isPositivelyCompletedRound({ status: 'completed', dispatchState: 'completed' }), true);
+test('isPositivelyCompletedRound: rejects terminal_error, uncertain outcome, failed, and aborted states', () => {
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted', assistantOutcome: 'succeeded' }), true);
+  assert.equal(isPositivelyCompletedRound({ status: 'completed', dispatchState: 'completed', assistantOutcome: 'succeeded' }), true);
 
+  // Contradictory outcome states
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted', assistantOutcome: 'terminal_error' }), false);
+  assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'accepted', assistantOutcome: 'uncertain' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'failed', dispatchState: 'aborted_precommit', assistantOutcome: 'succeeded' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'uncertain' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'prepared' }), false);

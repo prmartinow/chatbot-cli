@@ -1455,7 +1455,10 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
 
 function isPositivelyCompletedRound(round) {
   if (!round) return false;
-  if (round.status === 'failed' || round.dispatchState === 'aborted_precommit' || round.dispatchState === 'uncertain' || round.assistantOutcome === 'failed') {
+  if (round.status === 'failed' || round.dispatchState === 'aborted_precommit' || round.dispatchState === 'uncertain') {
+    return false;
+  }
+  if (round.assistantOutcome && round.assistantOutcome !== 'succeeded') {
     return false;
   }
   const isStatusDone = round.status === 'done' || round.status === 'completed';
@@ -1470,35 +1473,8 @@ function extractRoundResponseFromTranscript(transcriptPath, round) {
     const raw = fs.readFileSync(transcriptPath, 'utf8');
     const entries = parseTranscriptEntries(raw);
     if (!entries.length) return '';
-
-    if (round?.responseTurnId) {
-      const match = entries.find((e) => e.role === 'assistant' && (
-        e.turnId === round.responseTurnId
-        || e.messageId === round.responseTurnId
-      ));
-      if (match) return match.text || match.content || '';
-    }
-
-    if (round?.acceptedUserTurn) {
-      const userIdx = entries.findIndex((e) => e.role === 'user' && (
-        (round.acceptedUserTurn.messageId && e.messageId === round.acceptedUserTurn.messageId)
-        || (round.acceptedUserTurn.testid && e.turnId === round.acceptedUserTurn.testid)
-        || (e.text && round.message && normalizeIdentityText(e.text) === normalizeIdentityText(round.message))
-      ));
-      if (userIdx !== -1) {
-        const nextAsst = entries.slice(userIdx + 1).find((e) => e.role === 'assistant');
-        if (nextAsst) return nextAsst.text || nextAsst.content || '';
-      }
-    }
-
-    if (round?.message) {
-      const normMsg = normalizeIdentityText(round.message);
-      const userIdx = entries.findIndex((e) => e.role === 'user' && normalizeIdentityText(e.text) === normMsg);
-      if (userIdx !== -1) {
-        const nextAsst = entries.slice(userIdx + 1).find((e) => e.role === 'assistant');
-        if (nextAsst) return nextAsst.text || nextAsst.content || '';
-      }
-    }
+    const text = responseAfterRound(entries, round);
+    if (text) return text;
   } catch {}
   return '';
 }
@@ -9100,6 +9076,9 @@ async function branchWithContextCarryForward(page, args) {
       const existingRound = roundsState.rounds.find((r) => r.id === incident.continuationRoundId);
       if (isPositivelyCompletedRound(existingRound)) {
         const respText = extractRoundResponseFromTranscript(existingRound.transcript, existingRound) || existingRound.responseText || '';
+        if (!respText) {
+          throw cbError('CONTINUATION_RESPONSE_UNAVAILABLE', `Continuation round "${existingRound.id}" completed but attributed response could not be extracted from transcript`);
+        }
         const askResult = { text: respText, roundId: existingRound.id };
         updateRecoveryIncident(incident.id, {
           state: 'completed',
@@ -9195,16 +9174,17 @@ async function branchWithContextCarryForward(page, args) {
       };
     }
 
-    info(`[stage3-carry] Synthesizing continuity prompt for child session ${childSessionId}...`);
-    const continuityPrompt = formatCarryForwardPrompt({
-      carryRequest,
-      carryResponse,
-      carryPrompt: args.carryPrompt || args.message || '',
-      parentSessionId,
-      branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
-    });
-
+    let continuityPrompt = '';
     try {
+      info(`[stage3-carry] Synthesizing continuity prompt for child session ${childSessionId}...`);
+      continuityPrompt = formatCarryForwardPrompt({
+        carryRequest,
+        carryResponse,
+        carryPrompt: args.carryPrompt || args.message || '',
+        parentSessionId,
+        branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
+      });
+
       const targetPage = childPage || branchResult.childPage;
       if (!targetPage) {
         throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
@@ -9326,7 +9306,10 @@ async function branchConversationTurn(page, args) {
       });
 
       if (branchRecord.dispatchState !== 'prepared') {
-        if (branchRecord.childSessionId) {
+        const isVerifiedBranch = branchRecord.childSessionId
+          && (branchRecord.dispatchState === 'branched' || branchRecord.dispatchState === 'stable_candidate')
+          && branchRecord.status !== 'failed';
+        if (isVerifiedBranch) {
           info(`[stage3] Branch "${branchRecord.id}" already resolved to child ${branchRecord.childSessionId}`);
           return {
             childSessionId: branchRecord.childSessionId,
@@ -9334,7 +9317,7 @@ async function branchConversationTurn(page, args) {
             branchRecord,
           };
         }
-        throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${branchRecord.id}" is in state "${branchRecord.dispatchState}" and cannot be re-dispatched`);
+        throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${branchRecord.id}" is in state "${branchRecord.dispatchState}" (status: ${branchRecord.status || 'unknown'}) and cannot be re-dispatched`);
       }
       localDispatchState = 'prepared';
 
@@ -10677,9 +10660,9 @@ async function ask(page, message, args) {
 
     if (isPositivelyCompletedRound(round)) {
       info(`[ask] Round "${round.id}" was already completed; returning existing result without re-dispatching`);
-      const resp = extractRoundResponseFromTranscript(round.transcript, round);
+      const resp = extractRoundResponseFromTranscript(round.transcript, round) || round.responseText || '';
       if (resp) return resp;
-      return round.responseText || '';
+      throw cbError('ROUND_RESPONSE_UNAVAILABLE', `Completed round "${round.id}" response could not be attributed from transcript "${round.transcript}"`);
     }
 
     if (round.dispatchState !== 'prepared') {
@@ -10817,6 +10800,7 @@ async function ask(page, message, args) {
       assistantOutcome: 'succeeded',
       sessionId: finalSessionId,
       responseChars: response.length,
+      responseText: response,
       lastError: '',
       url: finalSessionId ? targetConversationUrl(finalSessionId) : page.url(),
       transcript: finalTranscript,
