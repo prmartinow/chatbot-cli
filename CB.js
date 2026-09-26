@@ -1103,8 +1103,8 @@ async function getPageTargetId(page) {
     } catch {}
   }
   // Fail closed in production: strict Target.getTargetInfo required.
-  // Only isolated test harnesses without a real CDP session may fall back to mocks.
-  if (process.env.NODE_ENV === 'test' || typeof process.env.NODE_TEST_CONTEXT === 'string' || !ctx || typeof ctx.newCDPSession !== 'function') {
+  // Only isolated test harnesses under test runner may fall back to mocks.
+  if (process.env.NODE_ENV === 'test' || typeof process.env.NODE_TEST_CONTEXT === 'string') {
     if (typeof page?._mockTargetId === 'string') return page._mockTargetId;
     if (typeof page?._targetId === 'string') return page._targetId;
     if (!ctx) return 'test-mock-target';
@@ -2141,9 +2141,14 @@ async function getConversationTurns(page) {
     for (const roundEl of turnKeyEls) {
       const turnKey = roundEl.getAttribute('data-turn-key') || '';
 
-      // Separate DOM subtrees: extract user and assistant from verified subtrees without text subtraction
+      // Separate DOM subtrees: ensure assistant root is disjoint from user subtree
       const userUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
-      const asstUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], .markdown');
+      const candidateAsstUnits = [...roundEl.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"]')];
+      let asstUnit = candidateAsstUnits.find(u => !userUnit || !userUnit.contains(u)) || null;
+      if (!asstUnit) {
+        const candidateMarkdowns = [...roundEl.querySelectorAll('.markdown')];
+        asstUnit = candidateMarkdowns.find(m => !userUnit || !userUnit.contains(m)) || null;
+      }
 
       const userMessageId = (userUnit?.getAttribute('data-chatgpt-search-message-ids') || userUnit?.getAttribute('data-message-id') || '').split(' ')[0];
       const asstMessageId = (asstUnit?.getAttribute('data-chatgpt-search-message-ids') || asstUnit?.getAttribute('data-message-id') || '').split(' ')[0];
@@ -2151,7 +2156,11 @@ async function getConversationTurns(page) {
       const cleanTextOf = (el) => {
         if (!el) return '';
         const clone = el.cloneNode(true);
-        clone.querySelectorAll('h4, [role="separator"], button, [role="button"], .sr-only').forEach((b) => b.remove());
+        clone.querySelectorAll('[role="separator"], button, [role="button"], .sr-only, h4.sr-only').forEach((b) => b.remove());
+        const blocks = clone.querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6, pre, blockquote');
+        if (blocks.length) {
+          return [...blocks].map(b => (b.innerText || b.textContent || '').trim()).filter(Boolean).join('\n');
+        }
         return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
       };
 
@@ -2189,6 +2198,7 @@ async function getConversationTurns(page) {
     .map((turn) => ({
       index: turn.index,
       testid: turn.testid,
+      logicalTurnId: turn.logicalTurnId || `${turn.role}:${turn.turnKey || turn.testid}`,
       turnKey: turn.turnKey || '',
       messageId: turn.messageId || '',
       role: turn.role,
@@ -8785,16 +8795,46 @@ function extractLastTurnFromTranscript(transcriptPath) {
   return null;
 }
 
+function canonicalCarryForwardPayloadHash(payload) {
+  return messageHash(JSON.stringify({
+    parentSessionId: payload.parentSessionId || '',
+    request: payload.request || '',
+    response: payload.response || '',
+    prompt: payload.prompt || '',
+    anchor: payload.anchor || 'latest',
+  }));
+}
+
 function getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash, provenanceMeta = {}) {
   return withSchedulerLock(() => {
     const state = loadRecoveryIncidentsState();
-    const existing = state.incidents.find(i =>
-      (args.recoveryIncidentId && i.id === args.recoveryIncidentId) ||
-      (i.operationKind === 'carry_forward' && i.parentSessionId === parentSessionId && i.carryPayloadHash === payloadHash && i.state !== 'failed')
+    if (args.recoveryIncidentId) {
+      const existing = state.incidents.find(i => i.id === args.recoveryIncidentId);
+      if (existing) {
+        if (existing.operationKind !== 'carry_forward') {
+          throw cbError('INCIDENT_BINDING_MISMATCH', `Recovery incident ${existing.id} operationKind "${existing.operationKind}" does not match requested "carry_forward"`);
+        }
+        if (existing.parentSessionId !== parentSessionId) {
+          throw cbError('INCIDENT_BINDING_MISMATCH', `Recovery incident ${existing.id} parentSessionId "${existing.parentSessionId}" does not match requested "${parentSessionId}"`);
+        }
+        if (existing.carryPayloadHash !== payloadHash) {
+          throw cbError('INCIDENT_BINDING_MISMATCH', `Recovery incident ${existing.id} payload hash "${existing.carryPayloadHash}" does not match requested "${payloadHash}"`);
+        }
+        return existing;
+      }
+    }
+
+    const existingMatch = state.incidents.find(i =>
+      i.operationKind === 'carry_forward' &&
+      i.parentSessionId === parentSessionId &&
+      i.carryPayloadHash === payloadHash &&
+      i.state !== 'failed'
     );
-    if (existing) return existing;
+    if (existingMatch) return existingMatch;
 
     const incidentId = args.recoveryIncidentId || `INC-CAPACITY-${randomId()}`;
+    const branchOperationId = `branch-${incidentId}`;
+    const continuationRoundId = `round-${incidentId}`;
     const record = {
       id: incidentId,
       operationKind: 'carry_forward',
@@ -8805,9 +8845,10 @@ function getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash, pro
       sourceFileHash: provenanceMeta.sourceFileHash || '',
       userAt: provenanceMeta.userAt || '',
       assistantAt: provenanceMeta.assistantAt || '',
+      branchOperationId,
+      continuationRoundId,
       childSessionId: '',
       childPageTargetId: '',
-      continuationRoundId: '',
       state: 'prepared',
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -8857,7 +8898,14 @@ async function branchWithContextCarryForward(page, args) {
     throw cbError('CARRY_FORWARD_PAYLOAD_UNRESOLVED', 'Could not resolve preceding request and response from arguments or parent transcript');
   }
 
-  const payloadHash = messageHash(`${carryRequest}\n${carryResponse}`);
+  const payloadHash = canonicalCarryForwardPayloadHash({
+    parentSessionId,
+    request: carryRequest,
+    response: carryResponse,
+    prompt: args.carryPrompt || args.message || '',
+    anchor: args.branchTurn || 'latest',
+  });
+
   const incident = getOrCreateCarryForwardIncident(args, parentSessionId, payloadHash, {
     provenance: extractedMeta?.provenance || 'explicit_payload',
     sourceFile: extractedMeta?.sourceFile || '',
@@ -8866,97 +8914,155 @@ async function branchWithContextCarryForward(page, args) {
     assistantAt: extractedMeta?.assistantAt || '',
   });
 
-  if (incident.state === 'completed' && incident.childSessionId) {
-    info(`[stage3-carry] Carry-forward incident ${incident.id} already completed on child session ${incident.childSessionId}`);
-    return {
-      incidentId: incident.id,
-      childSessionId: incident.childSessionId,
-      childUrl: targetConversationUrl(incident.childSessionId),
-      continuityPrompt: incident.continuityPrompt || '',
-      continuationResponse: incident.continuationResponse || null,
-      status: 'completed',
-    };
-  }
-
-  let childSessionId = incident.childSessionId;
-  let childPage = null;
-  let branchResult = null;
-
-  if (!childSessionId) {
-    updateRecoveryIncident(incident.id, { state: 'branch_started' }, 'carry_forward_branch_started');
-    info(`[stage3-carry] Branching from parent session ${parentSessionId}...`);
-    branchResult = await branchConversationTurn(page, args);
-    childSessionId = branchResult.childSessionId;
-    childPage = branchResult.childPage;
-    updateRecoveryIncident(incident.id, {
-      state: 'branched',
-      childSessionId,
-      branchOperationId: branchResult.branchRecord?.branchId || '',
-    }, 'carry_forward_branched');
-  } else {
-    info(`[stage3-carry] Reusing established child session ${childSessionId} for incident ${incident.id}...`);
-    if (sessionIdFromUrl(page.url()) !== childSessionId) {
-      await openConversationBySessionId(page, childSessionId);
+  const incidentLease = await acquireRecoveryIncidentLease(incident.id);
+  try {
+    if (incident.state === 'completed' && incident.childSessionId) {
+      info(`[stage3-carry] Carry-forward incident ${incident.id} already completed on child session ${incident.childSessionId}`);
+      return {
+        incidentId: incident.id,
+        childSessionId: incident.childSessionId,
+        childUrl: targetConversationUrl(incident.childSessionId),
+        continuityPrompt: incident.continuityPrompt || '',
+        continuationResponse: incident.continuationResponse || null,
+        status: 'completed',
+      };
     }
-    childPage = page;
-    branchResult = {
-      childSessionId,
-      childUrl: targetConversationUrl(childSessionId),
-      childPage,
+
+    let childSessionId = incident.childSessionId;
+    let childPage = null;
+    let branchResult = null;
+
+    // Reconcile branch_started using lower-level lineage if child was not recorded
+    if (!childSessionId && incident.state === 'branch_started' && incident.branchOperationId) {
+      const lineageState = loadLineageState();
+      const existingBranch = lineageState.branches.find(b => b.id === incident.branchOperationId || b.id === incident.id);
+      if (existingBranch && existingBranch.childSessionId) {
+        childSessionId = existingBranch.childSessionId;
+        updateRecoveryIncident(incident.id, {
+          state: 'branched',
+          childSessionId,
+          branchOperationId: existingBranch.id,
+        }, 'carry_forward_branch_reconciled');
+      }
+    }
+
+    if (!childSessionId) {
+      updateRecoveryIncident(incident.id, { state: 'branch_started' }, 'carry_forward_branch_started');
+      info(`[stage3-carry] Branching from parent session ${parentSessionId}...`);
+      branchResult = await branchConversationTurn(page, args);
+      childSessionId = branchResult.childSessionId;
+      childPage = branchResult.childPage;
+      updateRecoveryIncident(incident.id, {
+        state: 'branched',
+        childSessionId,
+        branchOperationId: branchResult.branchRecord?.id || incident.branchOperationId,
+      }, 'carry_forward_branched');
+    } else {
+      info(`[stage3-carry] Reusing established child session ${childSessionId} for incident ${incident.id}...`);
+      // Resolve child page explicitly without repurposing parent page
+      const browser = page.context ? (typeof page.context === 'function' ? page.context().browser() : page.context.browser?.()) : null;
+      if (browser) {
+        for (const ctx of browser.contexts()) {
+          for (const p of ctx.pages()) {
+            if (sessionIdFromUrl(p.url()) === childSessionId) {
+              childPage = p;
+              break;
+            }
+          }
+          if (childPage) break;
+        }
+      }
+      if (!childPage && browser) {
+        childPage = await findTargetAppPage(browser, {
+          ...args,
+          conversation: childSessionId,
+          expectedSessionId: childSessionId,
+          newTab: true,
+        });
+      }
+      if (!childPage) {
+        childPage = page;
+      }
+      branchResult = {
+        childSessionId,
+        childUrl: targetConversationUrl(childSessionId),
+        childPage,
+      };
+    }
+
+    info(`[stage3-carry] Synthesizing continuity prompt for child session ${childSessionId}...`);
+    const continuityPrompt = formatCarryForwardPrompt({
+      carryRequest,
+      carryResponse,
+      carryPrompt: args.carryPrompt || args.message || '',
+      parentSessionId,
+      branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
+    });
+
+    const targetPage = childPage || branchResult.childPage;
+    if (!targetPage) {
+      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
+    }
+
+    const childTid = await getPageTargetId(targetPage);
+    if (typeof childTid !== 'string' || !childTid.trim()) {
+      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot dispatch carry-forward prompt without verified physical child target identity');
+    }
+
+    updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
+
+    // Check if continuation round was already dispatched/completed
+    if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
+      const roundsState = loadRoundState();
+      const existingRound = roundsState.rounds.find(r => r.id === incident.continuationRoundId);
+      if (existingRound && existingRound.status === 'completed') {
+        const askResult = { text: existingRound.responseText || '', roundId: existingRound.id };
+        updateRecoveryIncident(incident.id, {
+          state: 'completed',
+          continuationResponse: askResult,
+        }, 'carry_forward_completed');
+        return {
+          ...branchResult,
+          incidentId: incident.id,
+          continuityPrompt,
+          continuationResponse: askResult,
+        };
+      }
+    }
+
+    const childArgs = {
+      ...args,
+      conversation: childSessionId,
+      expectedSessionId: childSessionId,
+      pageTargetId: childTid,
+      targetId: childTid,
+      branchTurn: '',
+      branchCarryForward: false,
+      message: continuityPrompt,
     };
+
+    updateRecoveryIncident(incident.id, {
+      state: 'continuation_dispatching',
+      continuityPrompt,
+    }, 'carry_forward_dispatching');
+
+    info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
+    const askResult = await ask(targetPage, continuityPrompt, childArgs);
+
+    updateRecoveryIncident(incident.id, {
+      state: 'completed',
+      continuationResponse: askResult,
+    }, 'carry_forward_completed');
+
+    return {
+      ...branchResult,
+      incidentId: incident.id,
+      continuityPrompt,
+      continuationResponse: askResult,
+    };
+  } finally {
+    releaseRecoveryIncidentLease(incidentLease);
   }
-
-  info(`[stage3-carry] Synthesizing continuity prompt for child session ${childSessionId}...`);
-  const continuityPrompt = formatCarryForwardPrompt({
-    carryRequest,
-    carryResponse,
-    carryPrompt: args.carryPrompt || args.message || '',
-    parentSessionId,
-    branchAnchorDesc: branchResult.branchRecord?.sourceTurnMessageId || branchResult.branchRecord?.sourceTurnTestid || '',
-  });
-
-  const targetPage = childPage || branchResult.childPage;
-  if (!targetPage) {
-    throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Stage 3 carry-forward did not resolve a bound child Page');
-  }
-
-  const childTid = await getPageTargetId(targetPage);
-  if (typeof childTid !== 'string' || !childTid.trim()) {
-    throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Cannot dispatch carry-forward prompt without verified physical child target identity');
-  }
-
-  updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
-
-  const childArgs = {
-    ...args,
-    conversation: childSessionId,
-    expectedSessionId: childSessionId,
-    pageTargetId: childTid,
-    targetId: childTid,
-    branchTurn: '',
-    branchCarryForward: false,
-    message: continuityPrompt,
-  };
-
-  updateRecoveryIncident(incident.id, {
-    state: 'continuation_dispatching',
-    continuityPrompt,
-  }, 'carry_forward_dispatching');
-
-  info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
-  const askResult = await ask(targetPage, continuityPrompt, childArgs);
-
-  updateRecoveryIncident(incident.id, {
-    state: 'completed',
-    continuationResponse: askResult,
-  }, 'carry_forward_completed');
-
-  return {
-    ...branchResult,
-    incidentId: incident.id,
-    continuityPrompt,
-    continuationResponse: askResult,
-  };
 }
 
 async function branchConversationTurn(page, args) {
@@ -8985,12 +9091,20 @@ async function branchConversationTurn(page, args) {
       const preState = await getTargetAppState(page);
       const isStrandedAtCapacity = async () => {
         if (!preState?.maxLengthReached) return false;
-        const t1 = await getConversationTurns(page).catch(() => []);
-        const l1 = t1.reduce((sum, t) => sum + (t.text?.length || 0), 0);
-        await page.waitForTimeout(300);
-        const t2 = await getConversationTurns(page).catch(() => []);
-        const l2 = t2.reduce((sum, t) => sum + (t.text?.length || 0), 0);
-        return l1 === l2;
+        const stopBtn = await page.$('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label="Stop"]').catch(() => null);
+        if (stopBtn) return false;
+        try {
+          const t1 = await getConversationTurns(page);
+          if (!t1 || !t1.length) return false;
+          const s1 = t1.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
+          await page.waitForTimeout(400);
+          const t2 = await getConversationTurns(page);
+          if (!t2 || !t2.length) return false;
+          const s2 = t2.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
+          return s1 === s2;
+        } catch {
+          return false;
+        }
       };
 
       const generation = await getCombinedGenerationState(page, preState);
@@ -11711,6 +11825,7 @@ module.exports = {
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,
+  canonicalCarryForwardPayloadHash,
   getOrCreateCarryForwardIncident,
   updateRecoveryIncident,
   formatTranscriptEntry,

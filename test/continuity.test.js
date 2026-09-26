@@ -46,6 +46,7 @@ const {
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,
+  canonicalCarryForwardPayloadHash,
   getOrCreateCarryForwardIncident,
   releaseBrowserLaneLease,
   withBrowserLaneLease,
@@ -4520,7 +4521,13 @@ test('branchWithContextCarryForward: returns existing completed incident without
     branchCarryForward: true,
   };
 
-  const payloadHash = messageHash('Resume prompt\nResume response');
+  const payloadHash = canonicalCarryForwardPayloadHash({
+    parentSessionId: parentId,
+    request: 'Resume prompt',
+    response: 'Resume response',
+    prompt: '',
+    anchor: 'latest',
+  });
   getOrCreateCarryForwardIncident(args, parentId, payloadHash);
   updateRecoveryIncident(incidentId, {
     state: 'completed',
@@ -4572,5 +4579,29 @@ test('openBranchMenu: rejects when multiple candidate containers match source se
   await assert.rejects(
     () => openBranchMenu(mockPage, sourceAssistant),
     (err) => err.code === 'BRANCH_SOURCE_UNVERIFIED' && err.message.includes('could not be uniquely located')
+  );
+});
+
+test('getOrCreateCarryForwardIncident: throws INCIDENT_BINDING_MISMATCH when reused with conflicting parentSessionId or payload hash', () => {
+  const incidentId = 'INC-CAPACITY-MISMATCH-TEST';
+  const parent1 = '11111111-1111-4111-8111-111111111111';
+  const parent2 = '22222222-2222-4222-8222-222222222222';
+  const hash1 = 'hash-1';
+  const hash2 = 'hash-2';
+
+  const args1 = { recoveryIncidentId: incidentId };
+  getOrCreateCarryForwardIncident(args1, parent1, hash1);
+
+  // Different parent
+  const args2 = { recoveryIncidentId: incidentId };
+  assert.throws(
+    () => getOrCreateCarryForwardIncident(args2, parent2, hash1),
+    (err) => err.code === 'INCIDENT_BINDING_MISMATCH' && err.message.includes('parentSessionId')
+  );
+
+  // Different payload hash
+  assert.throws(
+    () => getOrCreateCarryForwardIncident(args2, parent1, hash2),
+    (err) => err.code === 'INCIDENT_BINDING_MISMATCH' && err.message.includes('payload hash')
   );
 });
