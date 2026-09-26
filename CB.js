@@ -3156,7 +3156,7 @@ async function dismissBlockingModal(page) {
     const isSafe = (meta) => {
       const joined = [meta.id || '', meta.testid || '', meta.aria || '', meta.title || '', meta.text || ''].join(' ');
       return /modal-subscription-failure/i.test(joined)
-        || /\b(artifact|lightbox|image preview|media preview)\b/i.test(joined);
+        || /\b(artifact|lightbox|image preview|media preview|table preview|preview)\b/i.test(joined);
     };
     const unsafeAction = (el) => /\b(update payment|upgrade|log in|login|sign in|captcha|delete|remove|confirm|continue|subscribe|buy|purchase|pay)\b/i.test([
       el.getAttribute('aria-label') || '',
@@ -3184,8 +3184,8 @@ async function dismissBlockingModal(page) {
         if (!isSafe(modalMeta)) return { found: true, safe: false, modal: modalMeta };
 
         const controls = [
-          ...modal.querySelectorAll('button[aria-label="Close"], [role="button"][aria-label="Close"]'),
-          ...[...modal.querySelectorAll('button')].filter((button) => /^close$/i.test(textOf(button))),
+          ...modal.querySelectorAll('button[aria-label*="close" i], [role="button"][aria-label*="close" i]'),
+          ...[...modal.querySelectorAll('button')].filter((button) => /close/i.test(textOf(button))),
         ].filter((control, index, list) => list.indexOf(control) === index)
           .filter(isVisible)
           .filter((control) => !unsafeAction(control));
