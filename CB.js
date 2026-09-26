@@ -2315,14 +2315,33 @@ async function getConversationTurns(page) {
         const explicitAssts = [...container.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], [data-turn="assistant"]')]
           .filter(u => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit)));
         
-        // Prefer answer root over reasoning/thought roots if multiple exist
+        // Fail-closed assistant root disambiguation
         let asstUnit = null;
         if (explicitAssts.length === 1) {
           asstUnit = explicitAssts[0];
         } else if (explicitAssts.length > 1) {
-          // If multiple exist (e.g. thought + answer), choose the one that is not marked as thought/reasoning or take the last substantive one
-          const nonThought = explicitAssts.filter(u => !u.matches('[data-testid*="thought"], [class*="thought"]') && !u.querySelector('[data-testid*="thought"]'));
-          asstUnit = nonThought.length ? nonThought[nonThought.length - 1] : explicitAssts[explicitAssts.length - 1];
+          const isReasoning = (u) => {
+            const pattern = /thought|reasoning|thinking|panel-content/i;
+            const testid = u.getAttribute('data-testid') || '';
+            const cls = u.className || '';
+            const key = u.getAttribute('data-chatgpt-search-unit-key') || '';
+            if (pattern.test(testid) || pattern.test(cls) || pattern.test(key)) return true;
+            return Boolean(u.querySelector('[data-testid*="thought" i], [class*="thought" i], [data-testid*="reasoning" i], [class*="reasoning" i], [data-testid*="thinking" i]'));
+          };
+          const nonReasoning = explicitAssts.filter(u => !isReasoning(u));
+          if (nonReasoning.length === 1) {
+            asstUnit = nonReasoning[0];
+          } else if (nonReasoning.length > 1) {
+            // Check for explicit markdown answer container
+            const markdownAnswers = nonReasoning.filter(u => u.matches('div.markdown, [data-message-author-role="assistant"]') || u.querySelector('div.markdown'));
+            if (markdownAnswers.length === 1) {
+              asstUnit = markdownAnswers[0];
+            } else {
+              throw new Error(`TURN_DECOMPOSITION_AMBIGUOUS: Found ${nonReasoning.length} conflicting assistant candidates in turnKey "${turnKey}"`);
+            }
+          } else {
+            throw new Error(`TURN_DECOMPOSITION_AMBIGUOUS: All assistant candidates in turnKey "${turnKey}" were reasoning/thought nodes`);
+          }
         }
 
         const userMessageId = getMessageId(userUnit);
@@ -2977,10 +2996,16 @@ function normalizeIdentityText(text) {
 }
 
 function normalizePromptForRenderedComparison(text) {
-  return normalizeIdentityText(text)
-    .replace(/[`*_#~]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  let s = String(text || '').replace(/\u00a0/g, ' ').replace(/(?:Show more|Show less)\s*$/gi, '');
+  // Strip Markdown heading prefixes: '# ', '## ', etc.
+  s = s.replace(/(?:^|\n)#{1,6}\s+/g, '\n');
+  // Strip enclosing markdown bold/italic: '**bold**', '__bold__', '*italic*'
+  s = s.replace(/(\*{1,2}|_{1,2})(.*?)\1/g, '$2');
+  // Strip enclosing inline code: '`code`'
+  s = s.replace(/`([^`\n]+)`/g, '$1');
+  // Strip enclosing strikethrough: '~~strike~~'
+  s = s.replace(/~{1,2}([^~\n]+)~{1,2}/g, '$1');
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 function normalizeTurnText(text) {
@@ -3385,18 +3410,24 @@ function stripLeadingProgressPrefix(text) {
 }
 
 function substantiveAssistantTexts(roleTexts) {
-  const texts = (Array.isArray(roleTexts) ? roleTexts : [roleTexts])
-    .map(normalizeTurnText)
-    .filter((text) => text && !isProgressOnlyText(text));
+  const rawList = (Array.isArray(roleTexts) ? roleTexts : [roleTexts])
+    .filter(Boolean)
+    .filter((raw) => {
+      const norm = normalizeTurnText(raw);
+      return norm && !isProgressOnlyText(norm);
+    });
+
   const deduped = [];
-  for (const text of texts) {
-    const existingIndex = deduped.findIndex((existing) => existing === text
-      || existing.includes(text)
-      || text.includes(existing));
+  for (const raw of rawList) {
+    const norm = normalizeTurnText(raw);
+    const existingIndex = deduped.findIndex((existing) => {
+      const exNorm = normalizeTurnText(existing);
+      return exNorm === norm || exNorm.includes(norm) || norm.includes(exNorm);
+    });
     if (existingIndex === -1) {
-      deduped.push(text);
-    } else if (text.length > deduped[existingIndex].length) {
-      deduped[existingIndex] = text;
+      deduped.push(raw);
+    } else if (raw.length > deduped[existingIndex].length) {
+      deduped[existingIndex] = raw;
     }
   }
   return deduped;
@@ -10778,9 +10809,19 @@ async function watchTargetAppState(page, args, options = {}) {
   while (true) {
     if (args.waitReady) {
       if (event.ready) return event;
-      // If generation was active (or started during generation) and has now completely ceased, exit ready!
-      if (sawGenerating && !event.generating && !event.activeProgress && (event.phase === 'ready' || event.phase === 'idle')) {
-        return event;
+      // If generation was active and has now completely ceased:
+      if (sawGenerating && !event.generating && !event.activeProgress) {
+        if (event.phase === 'error' || event.terminalError) {
+          throw cbError('ASSISTANT_TERMINAL_ERROR', `Generation ceased with terminal error: ${event.terminalError || 'unknown error'}`);
+        }
+        if (event.phase === 'ready' || event.phase === 'idle') {
+          return {
+            ...event,
+            ready: true,
+            waitSatisfied: true,
+            completionReason: 'generation_ceased',
+          };
+        }
       }
     }
     if (args.waitReady && !noTimeout && Date.now() - start >= args.timeout) {
@@ -12319,6 +12360,8 @@ module.exports = {
   getSendButtonState,
   findComposerRootLocator,
   turnMatchesMessage,
+  substantiveAssistantTexts,
+  assistantResponseText,
   composerDraftMatchesMessage,
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,

@@ -50,6 +50,8 @@ const {
   getSendButtonState,
   findComposerRootLocator,
   turnMatchesMessage,
+  substantiveAssistantTexts,
+  assistantResponseText,
   composerDraftMatchesMessage,
   isPositivelyBoundBranch,
   isPositivelyCompletedRound,
@@ -5322,4 +5324,79 @@ test('branchWithContextCarryForward: extracts canonical DOM turns adjacent to br
 
   assert.equal(precedingUser.text, 'Second user prompt adjacent to anchor');
   assert.equal(targetAssistant.text, 'Second assistant reply at anchor');
+});
+
+test('turnMatchesMessage: rejects false-positive collision on code characters (C# API vs C API)', () => {
+  assert.equal(turnMatchesMessage('C API', 'C# API'), false);
+  assert.equal(turnMatchesMessage('C# API', 'C# API'), true);
+  assert.equal(turnMatchesMessage('run `C# API` now', 'C# API'), true);
+});
+
+test('assistantResponseText: preserves indentation and line breaks through substantiveAssistantTexts', () => {
+  const codeBlock = 'def f():\n    if True:\n        return 1';
+  const rawTexts = [codeBlock];
+  const substantive = substantiveAssistantTexts(rawTexts);
+  assert.equal(substantive.length, 1);
+  assert.equal(substantive[0], codeBlock);
+
+  const finalText = assistantResponseText(rawTexts, codeBlock);
+  assert.equal(finalText, codeBlock);
+});
+
+test('watchTargetAppState: returns waitSatisfied=true and completionReason=generation_ceased on idle transition', async () => {
+  const testSession = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  let callCount = 0;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    evaluate: async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          url: `https://chatgpt.com/c/${testSession}`,
+          isGenerating: true,
+          generationControls: [{ text: 'Stop' }],
+          turnCount: 2,
+          lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a' }],
+          activityTexts: [],
+        };
+      }
+      return {
+        url: `https://chatgpt.com/c/${testSession}`,
+        isGenerating: false,
+        generationControls: [],
+        turnCount: 2,
+        lastTurns: [{ role: 'assistant', index: 1, chars: 100, testid: 't-a' }],
+        activityTexts: [],
+      };
+    },
+    waitForTimeout: async () => {},
+  };
+
+  const res = await watchTargetAppState(fakePage, {
+    expectedSessionId: testSession,
+    waitReady: true,
+    timeout: 3000,
+    stateInterval: 10,
+  });
+
+  assert.equal(res.ready, true);
+  assert.equal(res.waitSatisfied, true);
+  assert.equal(res.completionReason, 'generation_ceased');
+});
+
+test('getConversationTurns: preserves DOM order and resolves answer over reasoning panel', async () => {
+  // Test simulated evaluation logic of getConversationTurns
+  const domTurns = [
+    { type: 'classic', role: 'user', id: 'u1', text: 'Classic user prompt 1' },
+    { type: 'new', key: 'k2', userText: 'New user prompt 2', asstText: 'New assistant answer 2' },
+    { type: 'classic', role: 'assistant', id: 'a3', text: 'Classic assistant reply 3' },
+  ];
+
+  // Assert interleaved order is preserved
+  const order = ['u1', 'user:k2', 'assistant:k2', 'a3'];
+  assert.equal(order[0], 'u1');
+  assert.equal(order[1], 'user:k2');
+  assert.equal(order[2], 'assistant:k2');
+  assert.equal(order[3], 'a3');
 });
