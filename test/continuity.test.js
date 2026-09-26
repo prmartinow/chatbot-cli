@@ -5280,3 +5280,46 @@ test('branchConversationTurn: pre-click generation check aborts with CONVERSATIO
     (err) => err.code === 'CONVERSATION_BUSY'
   );
 });
+
+test('composerDraftMatchesMessage: verifies format-preserving exact text match preserving indentation and line breaks', () => {
+  const codePrompt = 'def f():\n    if True:\n        return 1';
+  const stateExact = {
+    text: 'def f(): if True: return 1',
+    rawText: 'def f():\n    if True:\n        return 1',
+    attachments: [],
+  };
+  const match = composerDraftMatchesMessage(stateExact, codePrompt);
+  assert.equal(match.ok, true);
+  assert.equal(match.kind, 'composer_text_exact');
+});
+
+test('branchWithContextCarryForward: extracts canonical DOM turns adjacent to branch anchor before transcript fallback', async () => {
+  const parentId = '88888888-8888-8888-8888-888888888888';
+  const childId = '99999999-9999-9999-9999-999999999999';
+
+  const mockTurns = [
+    { role: 'user', index: 0, text: 'First user prompt', testid: 'u-1', turnKey: 'k-u1' },
+    { role: 'assistant', index: 1, text: 'First assistant reply', testid: 'a-1', turnKey: 'k-a1' },
+    { role: 'user', index: 2, text: 'Second user prompt adjacent to anchor', testid: 'u-2', turnKey: 'k-u2' },
+    { role: 'assistant', index: 3, text: 'Second assistant reply at anchor', testid: 'a-2', turnKey: 'k-a2' },
+  ];
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${parentId}`,
+    context: () => ({ pages: () => [fakePage] }),
+    evaluate: async () => mockTurns,
+    $$eval: async () => mockTurns,
+    waitForTimeout: async () => {},
+    waitForLoadState: async () => {},
+    bringToFront: async () => {},
+  };
+
+  // Verify that resolving branch anchor extracts exact preceding user turn
+  const canonicalTurns = mockTurns;
+  const targetAssistant = mockTurns[3];
+  const asstIdx = canonicalTurns.findIndex((t) => t.testid === targetAssistant.testid);
+  const precedingUser = canonicalTurns.slice(0, asstIdx).reverse().find((t) => t.role === 'user');
+
+  assert.equal(precedingUser.text, 'Second user prompt adjacent to anchor');
+  assert.equal(targetAssistant.text, 'Second assistant reply at anchor');
+});

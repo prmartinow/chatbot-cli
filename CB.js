@@ -2265,6 +2265,20 @@ async function getConversationTurns(page) {
     const extracted = [];
     let idx = 0;
 
+    // Auto-expand any collapsed turn buttons if present
+    try {
+      const expandButtons = document.querySelectorAll(
+        'button[aria-label*="more" i], button[aria-label*="expand" i], [data-testid*="expand"], [data-testid*="show-more"]'
+      );
+      expandButtons.forEach((btn) => {
+        const txt = (btn.textContent || '').toLowerCase();
+        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+        if (txt.includes('more') || txt.includes('expand') || aria.includes('more') || aria.includes('expand')) {
+          btn.click();
+        }
+      });
+    } catch {}
+
     // Collect all candidate turn containers in true document order
     const allContainers = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-turn-key]')];
     // Filter to top-level containers so inner elements don't produce duplicate turns
@@ -2653,6 +2667,9 @@ async function getComposerDraftState(page) {
       || composer?.parentElement?.parentElement
       || null;
     const text = textOf(composer);
+    const rawText = composer
+      ? (composer.value !== undefined ? composer.value : (composer.innerText || composer.textContent || ''))
+      : '';
     const attachments = composerRoot
       ? [...composerRoot.querySelectorAll('[data-testid], [aria-label], button, [role="button"]')]
         .filter(isVisible)
@@ -2674,6 +2691,7 @@ async function getComposerDraftState(page) {
       exists: Boolean(composer),
       visible: isVisible(composer),
       text,
+      rawText,
       textChars: text.length,
       textPreview: text.slice(0, 240),
       textTail: text.slice(-240),
@@ -2694,6 +2712,16 @@ function composerDraftMatchesMessage(state, message) {
   const normState = normalizeTurnText(state?.text || '');
   const normMsg = normalizeTurnText(message);
   if (!normMsg) return { ok: false, kind: '' };
+
+  // Formatting-preserving exact comparison
+  if (state?.rawText) {
+    const rawState = state.rawText.replace(/\r\n?/g, '\n').trim();
+    const rawMsg = String(message ?? '').replace(/\r\n?/g, '\n').trim();
+    if (rawState === rawMsg) {
+      return { ok: true, kind: 'composer_text_exact' };
+    }
+  }
+
   if (normState === normMsg || (normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
@@ -2858,14 +2886,16 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
 
   let acceptedUserTurn;
   try {
-    await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
+    if (!ready.locator) {
+      throw cbError('COMPOSER_SUBMIT_CONTROL_UNVERIFIED', 'Verified send button locator was not resolved');
+    }
     if (requireNewChatRoot) {
       assertNewChatBootstrapRoute(page);
     } else if (expectedSessionId) {
       await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
     }
-    const buttonLocator = ready.locator || page.locator(SEND_BUTTON_SELECTORS.join(', ')).first();
-    await buttonLocator.click({ timeout: 5000 });
+    await ready.locator.waitFor({ state: 'visible', timeout: 5000 });
+    await ready.locator.click({ timeout: 5000 });
 
     await page.waitForTimeout(700);
     acceptedUserTurn = await waitForPromptAccepted(page, message, baselineLastTurnId, PROMPT_ACCEPTED_TIMEOUT_MS, { expectedSessionId });
@@ -9182,10 +9212,32 @@ async function branchWithContextCarryForward(page, args) {
   carryResponse = readPayload(carryResponse);
 
   if (!carryRequest || !carryResponse) {
-    const parentTranscript = args.transcript || transcriptPathForSession(parentSessionId);
-    extractedMeta = extractLastTurnFromTranscript(parentTranscript);
-    if (!carryRequest && extractedMeta?.request) carryRequest = extractedMeta.request;
-    if (!carryResponse && extractedMeta?.response) carryResponse = extractedMeta.response;
+    // Attempt anchor-adjacent extraction from canonical page turns first
+    const canonicalTurns = await getConversationTurns(page).catch(() => []);
+    const sourceAssistant = await resolveBranchableTurn(page, args.branchTurn || 'latest', args.expectedAnchorRevisionHash).catch(() => null);
+    if (sourceAssistant && canonicalTurns.length) {
+      const asstIdx = canonicalTurns.findIndex((t) => sameTurnRevision(t, sourceAssistant));
+      if (asstIdx !== -1) {
+        const precedingUser = canonicalTurns.slice(0, asstIdx).reverse().find((t) => t.role === 'user');
+        if (precedingUser && sourceAssistant.text) {
+          if (!carryRequest) carryRequest = precedingUser.text;
+          if (!carryResponse) carryResponse = sourceAssistant.text;
+          extractedMeta = {
+            provenance: 'canonical_dom_anchor_adjacent',
+            sourceTurnRef: turnRevisionSummary(sourceAssistant),
+            userTurnRef: turnRevisionSummary(precedingUser),
+            anchor: args.branchTurn || 'latest',
+          };
+        }
+      }
+    }
+
+    if (!carryRequest || !carryResponse) {
+      const parentTranscript = args.transcript || transcriptPathForSession(parentSessionId);
+      extractedMeta = extractLastTurnFromTranscript(parentTranscript);
+      if (!carryRequest && extractedMeta?.request) carryRequest = extractedMeta.request;
+      if (!carryResponse && extractedMeta?.response) carryResponse = extractedMeta.response;
+    }
   }
 
   if (!carryRequest || !carryResponse) {
