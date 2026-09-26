@@ -2371,12 +2371,17 @@ async function findComposer(page) {
 async function getSendButtonState(page) {
   return page.evaluate((sendButtonSelectors) => {
     const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    const button = [...document.querySelectorAll(sendButtonSelectors.join(','))]
-      .find(isVisible);
+    const buttons = [...document.querySelectorAll(sendButtonSelectors.join(','))].filter(isVisible);
 
-    if (!button) return { exists: false, disabled: false, label: '' };
+    if (!buttons.length) return { exists: false, disabled: false, count: 0, label: '' };
+    if (buttons.length > 1) {
+      return { exists: true, ambiguous: true, count: buttons.length, disabled: false, label: '' };
+    }
+    const button = buttons[0];
     return {
       exists: true,
+      ambiguous: false,
+      count: 1,
       disabled: Boolean(button.disabled || button.getAttribute('aria-disabled') === 'true'),
       label: [
         button.getAttribute('data-testid') || '',
@@ -2385,7 +2390,7 @@ async function getSendButtonState(page) {
         button.innerText || '',
       ].join(' ').replace(/\s+/g, ' ').trim(),
     };
-  }, SEND_BUTTON_SELECTORS).catch(() => ({ exists: false, disabled: false, label: '' }));
+  }, SEND_BUTTON_SELECTORS).catch((err) => ({ exists: false, disabled: false, error: String(err?.message || err) }));
 }
 
 async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
@@ -2399,10 +2404,17 @@ async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
     if (lastState?.blockingModal) {
       await ensureNoBlockingModal(page, 'while waiting for the send button');
     }
-    if (!lastButton.exists || !lastButton.disabled) {
+    if (lastButton.exists && !lastButton.disabled && !lastButton.ambiguous) {
       return { button: lastButton, state: lastState };
     }
     await page.waitForTimeout(1000);
+  }
+
+  if (lastButton?.ambiguous) {
+    throw cbError('COMPOSER_SUBMIT_CONTROL_AMBIGUOUS', `Found ${lastButton.count} candidate send buttons in composer`);
+  }
+  if (!lastButton?.exists) {
+    throw cbError('COMPOSER_SUBMIT_CONTROL_UNVERIFIED', `Send button control could not be located in composer after ${timeout}ms`);
   }
 
   const attachmentSummary = lastState?.composer?.attachments?.length
@@ -2617,25 +2629,16 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
 
   let acceptedUserTurn;
   try {
-    if (!ready.button.exists) {
-      await ensureTargetClickable(page, COMPOSER_SELECTORS, 'composer', 'before pressing Enter to submit', { preferLast: true });
-      if (requireNewChatRoot) {
-        assertNewChatBootstrapRoute(page);
-      } else if (expectedSessionId) {
-        await assertThreadIdentity(page, expectedSessionId, 'immediately before Enter dispatch');
-      }
-      await page.keyboard.press('Enter');
-    } else {
-      await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
-      if (requireNewChatRoot) {
-        assertNewChatBootstrapRoute(page);
-      } else if (expectedSessionId) {
-        await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
-      }
-      await page.locator(SEND_BUTTON_SELECTORS.join(', '))
-        .first()
-        .click({ timeout: 5000 });
+    await ensureTargetClickable(page, SEND_BUTTON_SELECTORS, 'send button', 'before clicking the send button');
+    if (requireNewChatRoot) {
+      assertNewChatBootstrapRoute(page);
+    } else if (expectedSessionId) {
+      await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
     }
+    await page.locator(SEND_BUTTON_SELECTORS.join(', '))
+      .first()
+      .click({ timeout: 5000 });
+
     await page.waitForTimeout(700);
     acceptedUserTurn = await waitForPromptAccepted(page, message, baselineLastTurnId, PROMPT_ACCEPTED_TIMEOUT_MS, { expectedSessionId });
   } catch (error) {
@@ -11847,6 +11850,8 @@ module.exports = {
   getConversationTurns,
   resolveBranchableTurn,
   openBranchMenu,
+  waitForSendReady,
+  getSendButtonState,
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,

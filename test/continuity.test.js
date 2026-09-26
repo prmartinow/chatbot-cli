@@ -46,6 +46,8 @@ const {
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,
+  waitForSendReady,
+  getSendButtonState,
   canonicalCarryForwardPayloadHash,
   getOrCreateCarryForwardIncident,
   releaseBrowserLaneLease,
@@ -4639,5 +4641,29 @@ test('branchWithContextCarryForward: halts with BRANCH_OPERATION_UNCERTAIN when 
   await assert.rejects(
     () => branchWithContextCarryForward(mockPage, args),
     (err) => err.code === 'BRANCH_OPERATION_UNCERTAIN'
+  );
+});
+
+test('waitForSendReady: throws COMPOSER_SUBMIT_CONTROL_UNVERIFIED when send button is absent', async () => {
+  const mockPage = {
+    evaluate: async () => ({ exists: false, disabled: false, count: 0, label: '' }),
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    () => waitForSendReady(mockPage, 50),
+    (err) => err.code === 'COMPOSER_SUBMIT_CONTROL_UNVERIFIED'
+  );
+});
+
+test('waitForSendReady: throws COMPOSER_SUBMIT_CONTROL_AMBIGUOUS when multiple candidate buttons match', async () => {
+  const mockPage = {
+    evaluate: async () => ({ exists: true, ambiguous: true, count: 2, disabled: false, label: '' }),
+    waitForTimeout: async () => {},
+  };
+
+  await assert.rejects(
+    () => waitForSendReady(mockPage, 50),
+    (err) => err.code === 'COMPOSER_SUBMIT_CONTROL_AMBIGUOUS' && err.message.includes('2 candidate')
   );
 });
