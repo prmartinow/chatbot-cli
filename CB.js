@@ -2267,17 +2267,22 @@ async function getConversationTurns(page) {
     const extracted = [];
     let idx = 0;
 
-    // Auto-expand any collapsed turn buttons if present
+    // Auto-expand collapsed user bubbles only (strictly scoped to user containers, never clicking table controls)
     try {
-      const expandButtons = document.querySelectorAll(
-        'button[aria-label*="more" i], button[aria-label*="expand" i], [data-testid*="expand"], [data-testid*="show-more"]'
+      const userContainers = document.querySelectorAll(
+        '[data-user-message-bubble="true"], [data-message-author-role="user"]'
       );
-      expandButtons.forEach((btn) => {
-        const txt = (btn.textContent || '').toLowerCase();
-        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
-        if (txt.includes('more') || txt.includes('expand') || aria.includes('more') || aria.includes('expand')) {
-          btn.click();
-        }
+      userContainers.forEach((u) => {
+        const expandButtons = u.querySelectorAll('button');
+        expandButtons.forEach((btn) => {
+          if (btn.closest('table')) return;
+          const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+          const txt = (btn.textContent || '').trim().toLowerCase();
+          if (aria.includes('table') || txt.includes('table')) return;
+          if (txt === 'show more' || aria === 'show more' || btn.getAttribute('data-testid') === 'show-more-button') {
+            btn.click();
+          }
+        });
       });
     } catch {}
 
