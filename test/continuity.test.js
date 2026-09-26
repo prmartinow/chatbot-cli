@@ -3249,6 +3249,7 @@ test('autoRecoverConversationTurn: stage2_running restart reconciles existing ro
     id: 'round-s2-test',
     recoveryIncidentId: incidentId,
     recoveryStage: 2,
+    status: 'done',
     dispatchState: 'accepted',
     assistantOutcome: 'succeeded',
     expectedSessionId: parentId,
@@ -5077,21 +5078,70 @@ test('findComposerRootLocator: isolates to composer container and avoids widenin
   assert.notEqual(root, null);
 });
 
-test('composerDraftMatchesMessage: accepts long message converted into composer attachment card', () => {
+test('composerDraftMatchesMessage: enforces complete canonical text match and rejects preview-only attachments', () => {
   const longPrompt = '# Big prompt header\n' + 'x'.repeat(2500);
-  const draftState = {
+
+  // 1. Preview-only attachment is rejected fail-closed
+  const previewDraftState = {
     text: '',
     attachments: [
-      { text: 'Remove CB.js' },
-      { text: 'Remove continuity.test.js' },
       { text: '# Big prompt header preview...' },
     ],
   };
+  const previewMatch = composerDraftMatchesMessage(previewDraftState, longPrompt);
+  assert.equal(previewMatch.ok, false);
 
-  const match = composerDraftMatchesMessage(draftState, longPrompt);
-  assert.equal(match.ok, true);
-  assert.equal(match.kind, 'composer_attachment');
+  // 2. Full-content attachment card is accepted
+  const fullDraftState = {
+    text: '',
+    attachments: [
+      { text: longPrompt },
+    ],
+  };
+  const fullMatch = composerDraftMatchesMessage(fullDraftState, longPrompt);
+  assert.equal(fullMatch.ok, true);
+  assert.equal(fullMatch.kind, 'composer_attachment_full');
+
+  // 3. Complete inline text is accepted
+  const inlineDraftState = {
+    text: longPrompt,
+    attachments: [],
+  };
+  const inlineMatch = composerDraftMatchesMessage(inlineDraftState, longPrompt);
+  assert.equal(inlineMatch.ok, true);
+  assert.equal(inlineMatch.kind, 'composer_text');
 });
+
+test('branchConversationTurn: fails closed with CONVERSATION_BUSY on active generation before reload', async () => {
+  const testSession = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  let reloadCalled = false;
+
+  const fakePage = {
+    url: () => `https://chatgpt.com/c/${testSession}`,
+    reload: async () => { reloadCalled = true; },
+    waitForTimeout: async () => {},
+    evaluate: async () => ({
+      url: `https://chatgpt.com/c/${testSession}`,
+      isGenerating: true,
+      generationControls: [{ text: 'Stop' }],
+      activityTexts: ['Thinking'],
+    }),
+  };
+
+  const args = {
+    expectedSessionId: testSession,
+    branchTurn: 'latest',
+  };
+
+  await assert.rejects(
+    async () => branchConversationTurn(fakePage, args),
+    (err) => err.code === 'CONVERSATION_BUSY'
+  );
+
+  // Assert reload was NOT called before aborting
+  assert.equal(reloadCalled, false);
+});
+
 
 test('watchTargetAppState: returns cleanly when generation ceases into idle phase even if assistant turn count did not advance', async () => {
   const testSession = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';

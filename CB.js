@@ -2227,48 +2227,46 @@ async function getConversationTurns(page) {
       clone.querySelectorAll('button, [role="button"]').forEach((b) => b.remove());
       return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
     };
-    let classicEls = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
+    const extracted = [];
+    let idx = 0;
+    const classicEls = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')];
     if (classicEls.length) {
-      return classicEls
-        .map((turn, index) => {
-          const roleEls = turn.matches('[data-message-author-role]')
-            ? [turn]
-            : [...turn.querySelectorAll('[data-message-author-role]')];
-          let role = roleEls[0]?.getAttribute('data-message-author-role')
-            || turn.getAttribute('data-turn')
-            || '';
-          const roleTexts = roleEls.map(textOf).filter(Boolean);
-          const messageId = turn.getAttribute('data-message-id')
-            || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
-            || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
-            || '';
-          return {
-            index,
+      classicEls.forEach((turn) => {
+        const roleEls = turn.matches('[data-message-author-role]')
+          ? [turn]
+          : [...turn.querySelectorAll('[data-message-author-role]')];
+        let role = roleEls[0]?.getAttribute('data-message-author-role')
+          || turn.getAttribute('data-turn')
+          || '';
+        const roleTexts = roleEls.map(textOf).filter(Boolean);
+        const messageId = turn.getAttribute('data-message-id')
+          || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
+          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+          || '';
+        if (role && (roleTexts[0] || textOf(turn))) {
+          extracted.push({
+            index: idx++,
             testid: turn.getAttribute('data-testid') || '',
             messageId,
             role,
             text: roleTexts[0] || textOf(turn),
             roleTexts,
             turnText: textOf(turn),
-          };
-        })
-        .filter((turn) => turn.role && (turn.text || turn.turnText));
+          });
+        }
+      });
     }
 
     const turnKeyEls = [...document.querySelectorAll('[data-turn-key]')];
-    const extracted = [];
-    let idx = 0;
     for (const roundEl of turnKeyEls) {
+      // Skip if this roundEl is inside an already-extracted classic turn
+      if (classicEls.some((c) => c.contains(roundEl))) continue;
       const turnKey = roundEl.getAttribute('data-turn-key') || '';
 
       // Separate DOM subtrees: ensure assistant root is disjoint from user subtree
       const userUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
-      const candidateAsstUnits = [...roundEl.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"]')];
+      const candidateAsstUnits = [...roundEl.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], [data-turn="assistant"]')];
       let asstUnit = candidateAsstUnits.find(u => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit))) || null;
-      if (!asstUnit) {
-        const candidateMarkdowns = [...roundEl.querySelectorAll('.markdown')];
-        asstUnit = candidateMarkdowns.find(m => !userUnit || (!userUnit.contains(m) && !m.contains(userUnit))) || null;
-      }
 
       const userMessageId = (userUnit?.getAttribute('data-chatgpt-search-message-ids') || userUnit?.getAttribute('data-message-id') || '').split(' ')[0];
       const asstMessageId = (asstUnit?.getAttribute('data-chatgpt-search-message-ids') || asstUnit?.getAttribute('data-message-id') || '').split(' ')[0];
@@ -2662,27 +2660,18 @@ async function getComposerDraftState(page) {
 function composerDraftMatchesMessage(state, message) {
   const normState = normalizeTurnText(state?.text || '');
   const normMsg = normalizeTurnText(message);
-  if (normState === normMsg || (normMsg.length && normState.startsWith(normMsg) && normState.length === normMsg.length)) {
+  if (!normMsg) return { ok: false, kind: '' };
+  if (normState === normMsg || (normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
-  // For long prompts (>= 1000 chars), ProseMirror collapses whitespace/markdown rendering.
-  // Match using normalized head and tail!
-  if (normMsg.length >= 1000 && normState.length >= 500) {
-    const head = normMsg.slice(0, 150);
-    const tail = normMsg.slice(-150);
-    if (normState.includes(head) && normState.includes(tail)) {
-      return { ok: true, kind: 'composer_text_head_tail' };
-    }
-  }
-  // Handle long prompts that ChatGPT auto-converts into composer attachments
-  if (normMsg.length >= 1000 && state?.attachments && state.attachments.length) {
-    const firstLine = normalizeTurnText(message.split('\n').map((s) => s.trim()).filter(Boolean)[0] || '').slice(0, 30);
-    const hasPastedAttachment = state.attachments.some((att) => {
-      const attText = normalizeTurnText(att.text || att.title || att.aria || '').toLowerCase();
-      return attText.includes('pasted text') || (firstLine && attText.includes(firstLine.toLowerCase()));
+  // If prompt is in an attachment card, require complete canonical text match (fail-closed)
+  if (state?.attachments && state.attachments.length) {
+    const hasFullMatch = state.attachments.some((att) => {
+      const attText = normalizeTurnText(att.text || att.title || att.aria || '');
+      return attText === normMsg;
     });
-    if (hasPastedAttachment) {
-      return { ok: true, kind: 'composer_attachment' };
+    if (hasFullMatch) {
+      return { ok: true, kind: 'composer_attachment_full' };
     }
   }
   return { ok: false, kind: '' };
@@ -3515,12 +3504,6 @@ function turnMatchesMessage(turnText, message) {
     const head = renderedMessage.slice(0, 200);
     const tail = renderedMessage.slice(-200);
     if (renderedTurn.includes(head) && renderedTurn.includes(tail)) return true;
-    const startsWithHead = renderedTurn.startsWith(head) || renderedTurn.slice(0, 300).includes(head);
-    const hasTruncationMarker = renderedTurn.endsWith('…') || renderedTurn.endsWith('...') || renderedTurn.includes('…') || renderedTurn.includes('Show more');
-    if (startsWithHead && hasTruncationMarker) {
-      const longerHead = renderedMessage.slice(0, 500);
-      if (renderedTurn.includes(longerHead)) return true;
-    }
   }
   return false;
 }
@@ -8480,17 +8463,17 @@ async function autoRecoverConversationTurn(page, args) {
         if (existingStage2Round.dispatchState === 'prepared' || existingStage2Round.dispatchState === 'aborted_precommit') {
           info(`[auto-recover] Prior Stage 2 attempt ${existingStage2Round.id} aborted precommit; re-attempting Stage 2 preparation`);
           safeToRetryStage2 = true;
+        } else if (isPositivelyCompletedRound(existingStage2Round)) {
+          incident = updateRecoveryIncident(incidentId, {
+            state: 'completed_stage2',
+            stage2RoundId: existingStage2Round.id,
+            finalSessionId: incident.parentSessionId,
+            finalOutcome: 'stage2_succeeded',
+          }) || incident;
+          info(`[auto-recover] Reconciled Stage 2 round ${existingStage2Round.id} as completed`);
+          return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId, responseText: existingStage2Round.responseText };
         } else if (existingStage2Round.dispatchState === 'accepted') {
-          if (existingStage2Round.assistantOutcome === 'succeeded') {
-            incident = updateRecoveryIncident(incidentId, {
-              state: 'completed_stage2',
-              stage2RoundId: existingStage2Round.id,
-              finalSessionId: incident.parentSessionId,
-              finalOutcome: 'stage2_succeeded',
-            }) || incident;
-            info(`[auto-recover] Reconciled Stage 2 round ${existingStage2Round.id} as completed`);
-            return { incident, state: 'completed_stage2', sessionId: incident.parentSessionId };
-          } else if (existingStage2Round.assistantOutcome === 'terminal_error') {
+          if (existingStage2Round.assistantOutcome === 'terminal_error') {
             incident = updateRecoveryIncident(incidentId, {
               state: 'stage2_terminal_failed',
               stage2RoundId: existingStage2Round.id,
@@ -8534,23 +8517,18 @@ async function autoRecoverConversationTurn(page, args) {
         const stage2Message = stage2Args.message;
 
         try {
-          const convLease = await acquireConversationLease(stage2Args.expectedSessionId, randomId('stage2-prep'));
+          const convLease = await acquireConversationLease(stage2Args.expectedSessionId, randomId('stage2-conv'));
+          stage2Args._conversationLease = convLease;
+          let responseText;
           try {
-            await withBrowserLaneLease(stage2Args, randomId('stage2-prep-lane'), async () => {
-              await prepareConversationForRead(page, stage2Args);
-              if (stage2Args.expectedSessionId && sessionIdFromUrl(page.url()) !== stage2Args.expectedSessionId) {
-                await openConversationBySessionId(page, stage2Args.expectedSessionId);
-              }
-              await reloadExactConversation(page, stage2Args.expectedSessionId, 'auto-recovery-stage2-reload');
-              await assertThreadIdentity(page, stage2Args.expectedSessionId, 'before stage2 resend');
-              await syncTranscriptFromPage(page, stage2Args);
-            });
+            // ask() adopts convLease and holds it continuously across prepareRecoveryResendTarget and send!
+            responseText = await ask(page, stage2Message, stage2Args);
           } finally {
-            await releaseConversationLease(convLease);
+            if (stage2Args._conversationLease) {
+              await releaseConversationLease(stage2Args._conversationLease);
+              stage2Args._conversationLease = null;
+            }
           }
-
-          // ask() acquires and owns the browser lane lease internally!
-          const responseText = await ask(page, stage2Message, stage2Args);
 
           const postState = loadRoundState();
           const round = [...postState.rounds].reverse().find(r => r.recoveryIncidentId === incidentId && r.recoveryStage === 2);
@@ -9456,43 +9434,11 @@ async function branchConversationTurn(page, args) {
       }
 
       // POSITIVELY ESTABLISH RELOAD-SAFE LIFECYCLE STATE BEFORE RELOADING!
+      // Strict fail-closed rule: generation active -> CONVERSATION_BUSY -> no reload -> abort
       const initialPreState = await getTargetAppState(page);
       const initialGen = await getCombinedGenerationState(page, initialPreState);
-
-      const isStrandedAtCapacity = async (currentState, currentGen) => {
-        if (!currentState?.maxLengthReached) return false;
-        if (currentGen.hasStopControl) return false;
-        if (currentGen.activity && /thinking|thought|searching|reading|analyzing|running|tool|generating/i.test(currentGen.activity)) {
-          return false;
-        }
-        // Positively assert stop button absence without swallowing errors
-        const stopLoc = page.locator('button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[aria-label="Stop"]');
-        const count = await stopLoc.count().catch(() => 1);
-        if (count > 0) return false;
-        try {
-          const t1 = await getConversationTurns(page);
-          if (!t1 || !t1.length) return false;
-          const s1 = t1.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
-          if (typeof page.waitForTimeout === 'function') {
-            await page.waitForTimeout(600);
-          } else {
-            await new Promise((r) => setTimeout(r, 600));
-          }
-          const t2 = await getConversationTurns(page);
-          if (!t2 || !t2.length) return false;
-          const s2 = t2.map(t => `${t.logicalTurnId || t.testid}:${t.text}`).join('|');
-          return s1 === s2;
-        } catch {
-          return false;
-        }
-      };
-
       if (initialGen.isGenerating) {
-        const stranded = await isStrandedAtCapacity(initialPreState, initialGen);
-        if (!stranded) {
-          throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while active token generation is in progress');
-        }
-        info('[stage3] Notice: Tail generation control is stranded at capacity limit (quiescent); verified safe to reload');
+        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active in parent conversation');
       }
 
       await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
@@ -9501,11 +9447,7 @@ async function branchConversationTurn(page, args) {
       const preState = await getTargetAppState(page);
       const generation = await getCombinedGenerationState(page, preState);
       if (generation.isGenerating) {
-        const stranded = await isStrandedAtCapacity(preState, generation);
-        if (!stranded) {
-          throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while active token generation is in progress');
-        }
-        info('[stage3] Notice: Post-reload tail generation control is stranded at capacity limit (quiescent); proceeding with Stage 3 branch recovery');
+        throw cbError('CONVERSATION_BUSY', 'Cannot perform Stage 3 branching while generation is active in parent conversation');
       }
 
       await syncTranscriptFromPage(page, args);
@@ -10840,6 +10782,13 @@ async function ask(page, message, args) {
 
   try {
     laneLease = takeBrowserLaneLease(args, args.jobId || randomId('lane-op'));
+    if (!isNewChat && expectedSessionId) {
+      // Adopt caller-supplied conversation lease or acquire immediately before any preparation/reload
+      leaseHandle = args._conversationLease || acquireConversationLease(expectedSessionId, args.roundId || randomId('round-conv'));
+      if (args._conversationLease) {
+        args._conversationLease = null; // Adopted!
+      }
+    }
     if (isNewChat) {
       bootstrapLease = acquireBootstrapLease(args, args.jobId || randomId('bootstrap-op'));
       await openNewConversation(page);
@@ -10922,7 +10871,7 @@ async function ask(page, message, args) {
       throw cbError('ROUND_ALREADY_DISPATCHED', `Reserved round "${round.id}" is in post-dispatch state "${round.dispatchState}" (status: ${round.status || 'unknown'}) and cannot be re-dispatched`);
     }
 
-    if (!isNewChat && expectedSessionId) {
+    if (!isNewChat && expectedSessionId && !leaseHandle) {
       try {
         leaseHandle = acquireConversationLease(expectedSessionId, round.id);
       } catch (leaseError) {
