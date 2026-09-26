@@ -2158,11 +2158,12 @@ async function getConversationTurns(page) {
         if (!el) return '';
         const clone = el.cloneNode(true);
         clone.querySelectorAll('[role="separator"], button, [role="button"], .sr-only, h4.sr-only').forEach((b) => b.remove());
-        const blocks = clone.querySelectorAll('p, div, li, h1, h2, h3, h4, h5, h6, pre, blockquote');
-        if (blocks.length) {
-          return [...blocks].map(b => (b.innerText || b.textContent || '').trim()).filter(Boolean).join('\n');
-        }
-        return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+        clone.querySelectorAll('br').forEach(br => br.replaceWith('\n'));
+        clone.querySelectorAll('p, div, li, tr').forEach(block => {
+          block.prepend('\n');
+          block.append('\n');
+        });
+        return (clone.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n\n').trim();
       };
 
       const userText = cleanTextOf(userUnit);
@@ -3305,7 +3306,9 @@ function turnMatchesMessage(turnText, message) {
     const head = renderedMessage.slice(0, 200);
     const tail = renderedMessage.slice(-200);
     if (renderedTurn.includes(head) && renderedTurn.includes(tail)) return true;
-    if (renderedTurn.includes(head) && (renderedTurn.includes('…') || renderedTurn.includes('...') || renderedTurn.length >= 800)) {
+    const startsWithHead = renderedTurn.startsWith(head) || renderedTurn.slice(0, 300).includes(head);
+    const hasTruncationMarker = renderedTurn.endsWith('…') || renderedTurn.endsWith('...') || renderedTurn.includes('…') || renderedTurn.includes('Show more');
+    if (startsWithHead && hasTruncationMarker) {
       return true;
     }
   }
@@ -8947,10 +8950,18 @@ async function branchWithContextCarryForward(page, args) {
       }
     }
 
+    if (!childSessionId && incident.state === 'branch_started') {
+      throw cbError('BRANCH_OPERATION_UNCERTAIN', `Carry-forward branch operation "${incident.branchOperationId}" is uncertain and requires manual reconciliation before retry`);
+    }
+
     if (!childSessionId) {
       updateRecoveryIncident(incident.id, { state: 'branch_started' }, 'carry_forward_branch_started');
       info(`[stage3-carry] Branching from parent session ${parentSessionId}...`);
-      branchResult = await branchConversationTurn(page, args);
+      const branchArgs = {
+        ...args,
+        branchId: incident.branchOperationId,
+      };
+      branchResult = await branchConversationTurn(page, branchArgs);
       childSessionId = branchResult.childSessionId;
       childPage = branchResult.childPage;
       updateRecoveryIncident(incident.id, {
@@ -8960,7 +8971,6 @@ async function branchWithContextCarryForward(page, args) {
       }, 'carry_forward_branched');
     } else {
       info(`[stage3-carry] Reusing established child session ${childSessionId} for incident ${incident.id}...`);
-      // Resolve child page explicitly without repurposing parent page
       const browser = page.context ? (typeof page.context === 'function' ? page.context().browser() : page.context.browser?.()) : null;
       if (browser) {
         for (const ctx of browser.contexts()) {
@@ -8974,12 +8984,16 @@ async function branchWithContextCarryForward(page, args) {
         }
       }
       if (!childPage && browser) {
-        childPage = await findTargetAppPage(browser, {
+        // Clear parent target IDs before allocating dedicated child page
+        const newPageArgs = {
           ...args,
           conversation: childSessionId,
           expectedSessionId: childSessionId,
+          pageTargetId: '',
+          targetId: '',
           newTab: true,
-        });
+        };
+        childPage = await findTargetAppPage(browser, newPageArgs);
       }
       if (!childPage) {
         childPage = page;
@@ -9031,15 +9045,25 @@ async function branchWithContextCarryForward(page, args) {
       }
     }
 
+    if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
+      const roundsState = loadRoundState();
+      const existingRound = roundsState.rounds.find(r => r.id === incident.continuationRoundId);
+      if (existingRound && existingRound.status !== 'completed') {
+        throw cbError('CONTINUATION_ROUND_UNCERTAIN', `Carry-forward continuation round "${incident.continuationRoundId}" is in uncertain state "${existingRound.status || 'unknown'}" and requires reconciliation`);
+      }
+    }
+
     const childArgs = {
       ...args,
       conversation: childSessionId,
       expectedSessionId: childSessionId,
       pageTargetId: childTid,
       targetId: childTid,
+      roundId: incident.continuationRoundId,
       branchTurn: '',
       branchCarryForward: false,
       message: continuityPrompt,
+      _laneLease: childPage?._laneLease || args._laneLease || null,
     };
 
     updateRecoveryIncident(incident.id, {
@@ -9074,13 +9098,13 @@ async function branchConversationTurn(page, args) {
   }
 
   const action = async () => {
+    const provisionalBranchId = args.branchId || randomId('branch');
+    const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
+
     if (sessionIdFromUrl(page.url()) !== expectedParentSessionId) {
       await openConversationBySessionId(page, expectedParentSessionId);
     }
     await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
-
-    const provisionalBranchId = randomId('branch');
-    const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
 
     let branchRecord = null;
     let localDispatchState = 'unregistered';

@@ -4605,3 +4605,39 @@ test('getOrCreateCarryForwardIncident: throws INCIDENT_BINDING_MISMATCH when reu
     (err) => err.code === 'INCIDENT_BINDING_MISMATCH' && err.message.includes('payload hash')
   );
 });
+
+test('branchWithContextCarryForward: halts with BRANCH_OPERATION_UNCERTAIN when branch_started cannot be reconciled', async () => {
+  const parentId = '33333333-3333-4333-8333-333333333333';
+  const incidentId = 'INC-CAPACITY-UNCERTAIN-BRANCH';
+
+  const mockPage = {
+    url: () => `https://chatgpt.com/c/${parentId}`,
+  };
+
+  const args = {
+    expectedSessionId: parentId,
+    recoveryIncidentId: incidentId,
+    carryRequest: 'Test req',
+    carryResponse: 'Test res',
+    branchCarryForward: true,
+  };
+
+  const payloadHash = canonicalCarryForwardPayloadHash({
+    parentSessionId: parentId,
+    request: 'Test req',
+    response: 'Test res',
+    prompt: '',
+    anchor: 'latest',
+  });
+
+  getOrCreateCarryForwardIncident(args, parentId, payloadHash);
+  updateRecoveryIncident(incidentId, {
+    state: 'branch_started',
+    childSessionId: '',
+  });
+
+  await assert.rejects(
+    () => branchWithContextCarryForward(mockPage, args),
+    (err) => err.code === 'BRANCH_OPERATION_UNCERTAIN'
+  );
+});
