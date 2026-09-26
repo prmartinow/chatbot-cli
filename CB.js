@@ -1453,6 +1453,23 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
   });
 }
 
+function isPositivelyBoundBranch(branch, expectedParentSessionId = '') {
+  if (!branch) return false;
+  if (branch.status !== 'done' || branch.dispatchState !== 'bound') {
+    return false;
+  }
+  if (!branch.childSessionId || !STABLE_SESSION_ID_RE.test(branch.childSessionId)) {
+    return false;
+  }
+  if (expectedParentSessionId && branch.parentSessionId !== expectedParentSessionId) {
+    return false;
+  }
+  if (branch.childSessionId === branch.parentSessionId) {
+    return false;
+  }
+  return Boolean(branch.parentAttestation || branch.lineageAttestation);
+}
+
 function isPositivelyCompletedRound(round) {
   if (!round) return false;
   if (round.status === 'failed' || round.dispatchState === 'aborted_precommit' || round.dispatchState === 'uncertain') {
@@ -5486,7 +5503,7 @@ async function getModelMenuState(page) {
     const slider = document.querySelector('[role="slider"]')
       || document.querySelector('[aria-valuenow]')
       || document.querySelector('[data-model-reasoning-effort-slider-thumb]');
-    const announcementText = textOf(document.querySelector('.d1BZWq_KeyboardAnnouncement') || document.querySelector('.d1BZWq_ViewToggle'));
+    const announcementText = textOf(document.querySelector('[class*="KeyboardAnnouncement"], .d1BZWq_KeyboardAnnouncement') || document.querySelector('[class*="ViewToggle"], .d1BZWq_ViewToggle') || document.querySelector('[aria-label="Power"]'));
     const hasSlider = Boolean(slider);
     let sliderVal = slider && slider.hasAttribute('aria-valuenow')
       ? parseInt(slider.getAttribute('aria-valuenow'), 10)
@@ -6304,8 +6321,8 @@ async function applySliderModelSelection(page, selection, menuState, label) {
     if (!targetModelRegex.test(currentChecked)) {
       // Ensure advanced view is open
       await page.evaluate(() => {
-        const menu = document.querySelector('.d1BZWq_Menu');
-        const toggle = document.querySelector('.d1BZWq_ViewToggle, [aria-label="Select model"]');
+        const menu = document.querySelector('.d1BZWq_Menu, [role="menu"]');
+        const toggle = document.querySelector('[class*="ViewToggle"], [aria-label="Select model"], [aria-label*="model" i]');
         if (menu && menu.getAttribute('data-view') !== 'advanced' && toggle) {
           toggle.click();
         }
@@ -6340,18 +6357,19 @@ async function applySliderModelSelection(page, selection, menuState, label) {
     if (targetIndex !== undefined) {
       // Ensure simple view is open
       await page.evaluate(() => {
-        const menu = document.querySelector('.d1BZWq_Menu');
-        const toggle = document.querySelector('.d1BZWq_ViewToggle, [aria-label="Select model"]');
+        const menu = document.querySelector('.d1BZWq_Menu, [role="menu"]');
+        const toggle = document.querySelector('[class*="ViewToggle"], [aria-label="Select model"], [aria-label*="model" i]');
         if (menu && menu.getAttribute('data-view') === 'advanced' && toggle) {
           toggle.click();
         }
       });
       await page.waitForTimeout(400);
 
-      const sliderControl = page.locator('.d1BZWq_SliderControl');
+      const sliderControl = page.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
       const slider = page.locator('[role="slider"]');
-      if (await sliderControl.count() && await slider.count()) {
-        await sliderControl.first().focus();
+      if (await slider.count()) {
+        const controlToFocus = (await sliderControl.count()) ? sliderControl.first() : slider.first();
+        await controlToFocus.focus().catch(() => {});
         let currentVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '0', 10);
         let steps = 0;
         while (currentVal !== targetIndex && steps < 10) {
@@ -9099,13 +9117,22 @@ async function branchWithContextCarryForward(page, args) {
     let childSessionId = incident.childSessionId;
     let childPage = null;
     let branchResult = null;
-    let childLaneLease = null;
+
+    const childArgs = {
+      ...args,
+      conversation: childSessionId,
+      expectedSessionId: childSessionId,
+      roundId: incident.continuationRoundId,
+      branchTurn: '',
+      branchCarryForward: false,
+      _laneLease: null,
+    };
 
     // Reconcile branch_started using lower-level lineage if child was not recorded
     if (!childSessionId && incident.state === 'branch_started' && incident.branchOperationId) {
       const lineageState = loadLineageState();
       const existingBranch = lineageState.branches.find(b => b.id === incident.branchOperationId || b.id === incident.id);
-      if (existingBranch && existingBranch.childSessionId) {
+      if (isPositivelyBoundBranch(existingBranch, parentSessionId)) {
         childSessionId = existingBranch.childSessionId;
         updateRecoveryIncident(incident.id, {
           state: 'branched',
@@ -9149,20 +9176,8 @@ async function branchWithContextCarryForward(page, args) {
         }
       }
       if (!childPage && browser) {
-        // Clear parent target IDs before allocating dedicated child page
-        const newPageArgs = {
-          cdp: args.cdp,
-          browserProfileDir: args.browserProfileDir,
-          browserLane: args.browserLane,
-          conversation: childSessionId,
-          expectedSessionId: childSessionId,
-          newTab: true,
-        };
-        childPage = await findTargetAppPage(browser, newPageArgs);
-        if (newPageArgs._laneLease) {
-          childLaneLease = newPageArgs._laneLease;
-          newPageArgs._laneLease = null;
-        }
+        childArgs.newTab = true;
+        childPage = await findTargetAppPage(browser, childArgs);
       }
       if (!childPage) {
         childPage = page;
@@ -9197,33 +9212,22 @@ async function branchWithContextCarryForward(page, args) {
 
       updateRecoveryIncident(incident.id, { childPageTargetId: childTid });
 
-      if (targetPage._laneLease) {
-        childLaneLease = targetPage._laneLease;
+      if (targetPage._laneLease && !childArgs._laneLease) {
+        childArgs._laneLease = targetPage._laneLease;
         targetPage._laneLease = null;
       }
 
-      const childArgs = {
-        ...args,
-        conversation: childSessionId,
-        expectedSessionId: childSessionId,
-        pageTargetId: childTid,
-        targetId: childTid,
-        roundId: incident.continuationRoundId,
-        branchTurn: '',
-        branchCarryForward: false,
-        message: continuityPrompt,
-        _laneLease: childLaneLease,
-      };
+      childArgs.pageTargetId = childTid;
+      childArgs.targetId = childTid;
+      childArgs.message = continuityPrompt;
 
       updateRecoveryIncident(incident.id, {
         state: 'continuation_dispatching',
         continuityPrompt,
       }, 'carry_forward_dispatching');
 
-      // Ownership transferred to childArgs; ask() will release it
-      childLaneLease = null;
-
       info(`[stage3-carry] Dispatching continuity prompt to child ${childSessionId}...`);
+      // Ownership adopted by ask() via takeBrowserLaneLease(childArgs), setting childArgs._laneLease = null
       const askResult = await ask(targetPage, continuityPrompt, childArgs);
 
       updateRecoveryIncident(incident.id, {
@@ -9238,8 +9242,9 @@ async function branchWithContextCarryForward(page, args) {
         continuationResponse: askResult,
       };
     } finally {
-      if (childLaneLease) {
-        try { releaseBrowserLaneLease(childLaneLease); } catch {}
+      if (childArgs._laneLease) {
+        try { releaseBrowserLaneLease(childArgs._laneLease); } catch {}
+        childArgs._laneLease = null;
       }
     }
   } finally {
@@ -9256,6 +9261,23 @@ async function branchConversationTurn(page, args) {
 
   const action = async () => {
     const provisionalBranchId = args.branchId || randomId('branch');
+
+    // Preflight disposition check: validate existing branch before acquiring parent lease or reloading
+    if (args.branchId) {
+      const existingBranch = loadLineageState().branches.find((b) => b.id === args.branchId);
+      if (existingBranch && existingBranch.dispatchState !== 'prepared') {
+        if (isPositivelyBoundBranch(existingBranch, expectedParentSessionId)) {
+          info(`[stage3] Branch "${existingBranch.id}" already resolved to child ${existingBranch.childSessionId}`);
+          return {
+            childSessionId: existingBranch.childSessionId,
+            childUrl: targetConversationUrl(existingBranch.childSessionId),
+            branchRecord: existingBranch,
+          };
+        }
+        throw cbError('BRANCH_OPERATION_UNCERTAIN', `Branch operation "${existingBranch.id}" is in state "${existingBranch.dispatchState}" (status: ${existingBranch.status || 'unknown'}) and cannot be re-dispatched`);
+      }
+    }
+
     const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
 
     let branchRecord = null;
@@ -9306,10 +9328,7 @@ async function branchConversationTurn(page, args) {
       });
 
       if (branchRecord.dispatchState !== 'prepared') {
-        const isVerifiedBranch = branchRecord.childSessionId
-          && (branchRecord.dispatchState === 'branched' || branchRecord.dispatchState === 'stable_candidate')
-          && branchRecord.status !== 'failed';
-        if (isVerifiedBranch) {
+        if (isPositivelyBoundBranch(branchRecord, expectedParentSessionId)) {
           info(`[stage3] Branch "${branchRecord.id}" already resolved to child ${branchRecord.childSessionId}`);
           return {
             childSessionId: branchRecord.childSessionId,
@@ -10567,6 +10586,22 @@ async function watchTargetAppState(page, args, options = {}) {
 }
 
 async function ask(page, message, args) {
+  // Preflight disposition check for reserved round before any browser preparation
+  if (args.roundId) {
+    const existingRound = loadRoundState().rounds.find((r) => r.id === args.roundId);
+    if (existingRound) {
+      if (isPositivelyCompletedRound(existingRound)) {
+        info(`[ask] Round "${existingRound.id}" was already completed; returning existing result without browser preparation`);
+        const resp = extractRoundResponseFromTranscript(existingRound.transcript, existingRound) || existingRound.responseText || '';
+        if (resp) return resp;
+        throw cbError('ROUND_RESPONSE_UNAVAILABLE', `Completed round "${existingRound.id}" response could not be attributed from transcript "${existingRound.transcript}"`);
+      }
+      if (existingRound.dispatchState !== 'prepared') {
+        throw cbError('ROUND_ALREADY_DISPATCHED', `Reserved round "${existingRound.id}" is in post-dispatch state "${existingRound.dispatchState}" (status: ${existingRound.status || 'unknown'}) and cannot be re-dispatched`);
+      }
+    }
+  }
+
   let laneLease = null;
   let bootstrapLease = null;
   let leaseHandle = null;
@@ -12034,6 +12069,7 @@ module.exports = {
   getConversationTurns,
   resolveBranchableTurn,
   openBranchMenu,
+  isPositivelyBoundBranch,
   isPositivelyCompletedRound,
   extractRoundResponseFromTranscript,
   waitForSendReady,

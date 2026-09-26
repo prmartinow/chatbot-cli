@@ -49,6 +49,7 @@ const {
   waitForSendReady,
   getSendButtonState,
   composerDraftMatchesMessage,
+  isPositivelyBoundBranch,
   isPositivelyCompletedRound,
   extractRoundResponseFromTranscript,
   canonicalCarryForwardPayloadHash,
@@ -4780,4 +4781,28 @@ test('isPositivelyCompletedRound: rejects terminal_error, uncertain outcome, fai
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'uncertain' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'prepared' }), false);
   assert.equal(isPositivelyCompletedRound({ status: 'done', dispatchState: 'dispatching' }), false);
+});
+
+test('isPositivelyBoundBranch: validates done/bound status, child session identity, and attestations', () => {
+  const validBranch = {
+    status: 'done',
+    dispatchState: 'bound',
+    childSessionId: '6ab67303-2184-83ec-adec-c20355220c99',
+    parentSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c',
+    parentAttestation: 'parent-attest-hash',
+  };
+  assert.equal(isPositivelyBoundBranch(validBranch, '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c'), true);
+
+  // Rejects wrong dispatch state or status
+  assert.equal(isPositivelyBoundBranch({ ...validBranch, dispatchState: 'branched' }), false);
+  assert.equal(isPositivelyBoundBranch({ ...validBranch, status: 'failed' }), false);
+
+  // Rejects child === parent
+  assert.equal(isPositivelyBoundBranch({ ...validBranch, childSessionId: '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c' }), false);
+
+  // Rejects parent mismatch
+  assert.equal(isPositivelyBoundBranch(validBranch, 'other-parent-id'), false);
+
+  // Rejects missing attestation
+  assert.equal(isPositivelyBoundBranch({ ...validBranch, parentAttestation: null, lineageAttestation: null }), false);
 });
