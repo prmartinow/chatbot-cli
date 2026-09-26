@@ -5275,7 +5275,7 @@ function parseModelSelection(text) {
   }
 
   let effort = '';
-  if (/\b(extra high|extended)\b/i.test(normalized)) {
+  if (/\b(e?xtra\s*high|extended)\b/i.test(normalized)) {
     effort = 'Extra High';
   } else if (/\b(medium|light|low)\b/i.test(normalized)) {
     effort = 'Medium';
