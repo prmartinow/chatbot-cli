@@ -4893,3 +4893,85 @@ test('registerPendingBranch: enforces immutable sourceTurnRef and anchor revisio
     );
   }, (err) => err.code === 'BRANCH_BINDING_MISMATCH');
 });
+
+test('ask preflight: throws ROUND_PAYLOAD_MISMATCH and ROUND_BINDING_MISMATCH before page preparation or lease acquisition', async () => {
+  const roundId = 'test-ask-preflight-immutability';
+  const testSession = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  registerPendingRound(
+    { transcript: '/tmp/test-preflight-round.txt' },
+    { url: () => `https://chatgpt.com/c/${testSession}` },
+    'Original verified prompt',
+    '',
+    { id: roundId, expectedSessionId: testSession }
+  );
+
+  const mockPage = {
+    url: () => { throw new Error('page.url should not be accessed during preflight failure'); }
+  };
+
+  // 1. Mismatched prompt payload throws ROUND_PAYLOAD_MISMATCH before page.url()
+  await assert.rejects(
+    async () => ask(mockPage, 'Different prompt payload', { roundId, conversation: testSession }),
+    (err) => err.code === 'ROUND_PAYLOAD_MISMATCH'
+  );
+
+  // 2. Mismatched session throws ROUND_BINDING_MISMATCH before page.url()
+  await assert.rejects(
+    async () => ask(mockPage, 'Original verified prompt', { roundId, conversation: '6ab67303-2184-83ec-adec-c20355220c99' }),
+    (err) => err.code === 'ROUND_BINDING_MISMATCH'
+  );
+});
+
+test('branchConversationTurn preflight: throws BRANCH_BINDING_MISMATCH on concrete source turn or revision mismatch before parent lease', async () => {
+  const branchId = 'test-branch-preflight-immutability';
+  const parentSessionId = '6ab1fbd6-70a4-83ec-8c39-0b4d62fd8d6c';
+  registerPendingBranch(
+    { branchId },
+    { url: () => `https://chatgpt.com/c/${parentSessionId}` },
+    { turnKey: 'turn-user-1', textHash: 'revision-hash-1' },
+    { id: branchId, parentSessionId }
+  );
+
+  const mockPage = {
+    url: () => { throw new Error('page should not be accessed during preflight branch mismatch'); }
+  };
+
+  // Mismatched branchTurn throws BRANCH_BINDING_MISMATCH before lease acquisition or reload
+  await assert.rejects(
+    async () => branchConversationTurn(mockPage, {
+      branchId,
+      expectedSessionId: parentSessionId,
+      branchTurn: 'turn-user-2',
+      skipPreparation: true,
+    }),
+    (err) => err.code === 'BRANCH_BINDING_MISMATCH'
+  );
+
+  // Mismatched expectedAnchorRevisionHash throws BRANCH_BINDING_MISMATCH
+  await assert.rejects(
+    async () => branchConversationTurn(mockPage, {
+      branchId,
+      expectedSessionId: parentSessionId,
+      expectedAnchorRevisionHash: 'revision-hash-2',
+      skipPreparation: true,
+    }),
+    (err) => err.code === 'BRANCH_BINDING_MISMATCH'
+  );
+});
+
+test('branchWithContextCarryForward: sanitizes childArgs by stripping parent pageTargetId and targetId before allocation', () => {
+  const parentTargetId = 'PARENT_PHYSICAL_TARGET_ID';
+  const parentArgs = {
+    pageTargetId: parentTargetId,
+    targetId: parentTargetId,
+    conversation: 'child-session-id',
+  };
+  const sanitizedChildArgs = {
+    ...parentArgs,
+    pageTargetId: '',
+    targetId: '',
+    _laneLease: null,
+  };
+  assert.equal(sanitizedChildArgs.pageTargetId, '');
+  assert.equal(sanitizedChildArgs.targetId, '');
+});

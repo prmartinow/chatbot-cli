@@ -6394,16 +6394,24 @@ async function applySliderModelSelection(page, selection, menuState, label) {
       });
       await page.waitForTimeout(400);
 
-      const menu = page.locator('[role="menu"][data-state="open"], [role="menu"]').first();
-      const slider = menu.locator('[role="slider"]');
-      const sliderCount = await slider.count();
-      if (sliderCount !== 1) {
-        throw cbError('REASONING_SELECTION_UNVERIFIED', `Expected exactly 1 slider in model menu, found ${sliderCount}`);
+      const openMenus = page.locator('[role="menu"][data-state="open"], [data-radix-popper-content-wrapper] [role="menu"]');
+      const menuCount = await openMenus.count();
+      let targetMenu = null;
+      for (let i = 0; i < menuCount; i++) {
+        const candidate = openMenus.nth(i);
+        if (await candidate.locator('[role="slider"]').count() === 1) {
+          targetMenu = candidate;
+          break;
+        }
+      }
+      if (!targetMenu) {
+        throw cbError('REASONING_SELECTION_UNVERIFIED', 'Could not locate active open model menu containing exactly one reasoning slider');
       }
 
-      const sliderControl = menu.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
+      const slider = targetMenu.locator('[role="slider"]');
+      const sliderControl = targetMenu.locator('[aria-label="Power"], [class*="SliderKeyboardControl"], [role="menuitem"]:has([role="slider"]), [role="slider"]');
       const controlToFocus = (await sliderControl.count()) ? sliderControl.first() : slider.first();
-      await controlToFocus.focus().catch(() => {});
+      await controlToFocus.focus();
       let currentVal = parseInt(await slider.first().getAttribute('aria-valuenow') || '-1', 10);
       let steps = 0;
       while (currentVal !== targetIndex && steps < 10) {
@@ -9180,6 +9188,8 @@ async function branchWithContextCarryForward(page, args) {
 
     const childArgs = {
       ...args,
+      pageTargetId: '',
+      targetId: '',
       conversation: childSessionId,
       expectedSessionId: childSessionId,
       roundId: incident.continuationRoundId,
@@ -9337,6 +9347,16 @@ async function branchConversationTurn(page, args) {
           if (existingBranch.sourceTurnRef.textHash !== args.expectedAnchorRevisionHash) {
             throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" anchor revision mismatch: expected "${existingBranch.sourceTurnRef.textHash}", got "${args.expectedAnchorRevisionHash}"`);
           }
+        }
+        if (args.branchTurn && existingBranch.sourceTurnRef) {
+          const reqTurn = String(args.branchTurn).trim();
+          const existingKey = existingBranch.sourceTurnRef.turnKey || existingBranch.sourceTurnRef.logicalTurnId || existingBranch.sourceTurnRef.testid || existingBranch.sourceTurnRef.messageId || '';
+          if (reqTurn && !['latest', 'prior-assistant', ''].includes(reqTurn) && existingKey && reqTurn !== existingKey) {
+            throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" source turn mismatch: expected "${existingKey}", got "${reqTurn}"`);
+          }
+        }
+        if (args.recoveryIncidentId && existingBranch.recoveryIncidentId && args.recoveryIncidentId !== existingBranch.recoveryIncidentId) {
+          throw cbError('BRANCH_BINDING_MISMATCH', `Reserved branch "${existingBranch.id}" recovery incident mismatch: expected "${existingBranch.recoveryIncidentId}", got "${args.recoveryIncidentId}"`);
         }
         if (existingBranch.dispatchState !== 'prepared') {
           if (isPositivelyBoundBranch(existingBranch, expectedParentSessionId)) {
@@ -10673,6 +10693,9 @@ async function ask(page, message, args) {
         if (existingRound.messageHash !== incomingHash) {
           throw cbError('ROUND_PAYLOAD_MISMATCH', `Reserved round "${args.roundId}" message hash mismatch: expected "${existingRound.messageHash}", got "${incomingHash}"`);
         }
+      }
+      if (args.recoveryIncidentId && existingRound.recoveryIncidentId && args.recoveryIncidentId !== existingRound.recoveryIncidentId) {
+        throw cbError('ROUND_BINDING_MISMATCH', `Reserved round "${args.roundId}" recovery incident mismatch: expected "${existingRound.recoveryIncidentId}", got "${args.recoveryIncidentId}"`);
       }
       if (isPositivelyCompletedRound(existingRound)) {
         info(`[ask] Round "${existingRound.id}" was already completed; returning existing result without browser preparation`);
