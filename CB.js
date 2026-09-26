@@ -2368,44 +2368,103 @@ async function findComposer(page) {
   throw new Error('No visible target app composer input found');
 }
 
-async function getSendButtonState(page) {
-  return page.evaluate((sendButtonSelectors) => {
-    const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-    const buttons = [...document.querySelectorAll(sendButtonSelectors.join(','))].filter(isVisible);
-
-    if (!buttons.length) return { exists: false, disabled: false, count: 0, label: '' };
-    if (buttons.length > 1) {
-      return { exists: true, ambiguous: true, count: buttons.length, disabled: false, label: '' };
-    }
-    const button = buttons[0];
-    return {
-      exists: true,
-      ambiguous: false,
-      count: 1,
-      disabled: Boolean(button.disabled || button.getAttribute('aria-disabled') === 'true'),
-      label: [
-        button.getAttribute('data-testid') || '',
-        button.getAttribute('aria-label') || '',
-        button.getAttribute('title') || '',
-        button.innerText || '',
-      ].join(' ').replace(/\s+/g, ' ').trim(),
-    };
-  }, SEND_BUTTON_SELECTORS).catch((err) => ({ exists: false, disabled: false, error: String(err?.message || err) }));
+async function findComposerRootLocator(page, composerLocator) {
+  if (!composerLocator) return page;
+  try {
+    const form = composerLocator.locator('xpath=ancestor::form[1]');
+    if ((await form.count().catch(() => 0)) > 0) return form;
+    const composerDiv = composerLocator.locator('xpath=ancestor::*[@data-testid and contains(@data-testid, "composer")][1]');
+    if ((await composerDiv.count().catch(() => 0)) > 0) return composerDiv;
+    return composerLocator.locator('..');
+  } catch {
+    return page;
+  }
 }
 
-async function waitForSendReady(page, timeout = SEND_READY_TIMEOUT_MS) {
+async function getSendButtonState(page, composerLocator = null) {
+  // If page.evaluate mock is returned in test environment
+  if (page && typeof page.evaluate === 'function' && (!composerLocator || !composerLocator.locator)) {
+    try {
+      const evalRes = await page.evaluate((sendButtonSelectors) => {
+        const isVisible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        const buttons = [...document.querySelectorAll(sendButtonSelectors.join(','))].filter(isVisible);
+        if (!buttons.length) return { exists: false, disabled: false, count: 0, label: '' };
+        if (buttons.length > 1) {
+          return { exists: true, ambiguous: true, count: buttons.length, disabled: false, label: '' };
+        }
+        const b = buttons[0];
+        return {
+          exists: true,
+          ambiguous: false,
+          count: 1,
+          disabled: Boolean(b.disabled || b.getAttribute('aria-disabled') === 'true'),
+          label: [b.getAttribute('data-testid') || '', b.getAttribute('aria-label') || '', b.innerText || ''].join(' ').trim(),
+        };
+      }, SEND_BUTTON_SELECTORS);
+      if (evalRes && typeof evalRes === 'object') return evalRes;
+    } catch {}
+  }
+
+  const root = await findComposerRootLocator(page, composerLocator);
+  const candidateLocator = root && typeof root.locator === 'function'
+    ? root.locator(SEND_BUTTON_SELECTORS.join(', '))
+    : page.locator(SEND_BUTTON_SELECTORS.join(', '));
+
+  const count = await candidateLocator.count().catch(() => 0);
+  if (count === 0) return { exists: false, count: 0, disabled: false, label: '' };
+
+  let visibleCount = 0;
+  let singleVisible = null;
+  for (let i = 0; i < count; i++) {
+    const btn = candidateLocator.nth(i);
+    if (await btn.isVisible().catch(() => false)) {
+      visibleCount++;
+      singleVisible = btn;
+    }
+  }
+
+  if (visibleCount === 0) return { exists: false, count: 0, disabled: false, label: '' };
+  if (visibleCount > 1) {
+    return { exists: true, ambiguous: true, count: visibleCount, disabled: false, label: '' };
+  }
+
+  const disabled = (await singleVisible.isDisabled().catch(() => false))
+    || (await singleVisible.getAttribute('aria-disabled').catch(() => null)) === 'true';
+  const label = (await singleVisible.getAttribute('aria-label').catch(() => ''))
+    || (await singleVisible.getAttribute('data-testid').catch(() => ''))
+    || (await singleVisible.innerText().catch(() => ''));
+
+  return {
+    exists: true,
+    ambiguous: false,
+    count: 1,
+    disabled,
+    locator: singleVisible,
+    label,
+  };
+}
+
+async function waitForSendReady(page, composerLocatorOrTimeout = null, timeoutArg = SEND_READY_TIMEOUT_MS) {
+  let composerLocator = null;
+  let timeout = timeoutArg;
+  if (typeof composerLocatorOrTimeout === 'number') {
+    timeout = composerLocatorOrTimeout;
+  } else if (composerLocatorOrTimeout) {
+    composerLocator = composerLocatorOrTimeout;
+  }
+
   const start = Date.now();
   let lastState = null;
   let lastButton = null;
 
   while (Date.now() - start < timeout) {
-    lastButton = await getSendButtonState(page);
+    lastButton = await getSendButtonState(page, composerLocator);
     lastState = await getTargetAppState(page).catch(() => null);
     if (lastState?.blockingModal) {
       await ensureNoBlockingModal(page, 'while waiting for the send button');
     }
     if (lastButton.exists && !lastButton.disabled && !lastButton.ambiguous) {
-      return { button: lastButton, state: lastState };
+      return { button: lastButton, locator: lastButton.locator, state: lastState };
     }
     await page.waitForTimeout(1000);
   }
@@ -2612,7 +2671,19 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
     await assertThreadIdentity(page, expectedSessionId, 'after composer insertion');
   }
 
-  const ready = await waitForSendReady(page);
+  let ready;
+  try {
+    ready = await waitForSendReady(page, composer);
+  } catch (precommitError) {
+    if (roundId) {
+      updateRound(roundId, {
+        status: 'failed',
+        dispatchState: 'aborted_precommit',
+        lastError: precommitError.message || String(precommitError),
+      }, 'round_aborted');
+    }
+    throw precommitError;
+  }
 
   if (requireNewChatRoot) {
     assertNewChatBootstrapRoute(page);
@@ -2635,9 +2706,8 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
     } else if (expectedSessionId) {
       await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
     }
-    await page.locator(SEND_BUTTON_SELECTORS.join(', '))
-      .first()
-      .click({ timeout: 5000 });
+    const buttonLocator = ready.locator || page.locator(SEND_BUTTON_SELECTORS.join(', ')).first();
+    await buttonLocator.click({ timeout: 5000 });
 
     await page.waitForTimeout(700);
     acceptedUserTurn = await waitForPromptAccepted(page, message, baselineLastTurnId, PROMPT_ACCEPTED_TIMEOUT_MS, { expectedSessionId });
