@@ -1456,51 +1456,68 @@ async function indexCurrentConversation(page, args, event = 'conversation_observ
 function registerPendingRound(args, page, message, baselineLastTurnId, extra = {}) {
   const sessionId = extra.expectedSessionId || sessionIdFromUrl(page.url());
   const transcript = args.transcript || (sessionId ? transcriptPathForSession(sessionId) : '');
-  const id = randomId('round');
+  const id = extra.id || extra.roundId || args.roundId || randomId('round');
   const now = nowIso();
-  const round = {
-    id,
-    operationKind: extra.operationKind || 'prompt',
-    recoveryStage: Number(extra.recoveryStage) || 0,
-    recoveryIncidentId: extra.recoveryIncidentId || '',
-    sourceUserTurn: extra.sourceUserTurn || null,
-    sourceAssistantTurn: extra.sourceAssistantTurn || null,
-    originalMessageHash: extra.originalMessageHash || '',
-    editedMessageHash: extra.editedMessageHash || '',
-    editSuffix: extra.editSuffix || '',
-    editAttestation: extra.editAttestation || null,
-    versionBaseline: extra.versionBaseline || null,
-    versionAttestation: extra.versionAttestation || null,
-    assistantOutcome: extra.assistantOutcome || null,
-    lastErrorCode: extra.lastErrorCode || '',
-    status: 'pending',
-    dispatchState: extra.dispatchState || 'prepared',
-    sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
-    candidateSessionId: '',
-    sessionAttestation: null,
-    createdAt: now,
-    updatedAt: now,
-    pid: process.pid,
-    sessionId,
-    expectedSessionId: extra.expectedSessionId || sessionId,
-    jobId: extra.jobId || '',
-    url: page.url(),
-    transcript,
-    cdp: args.cdp,
-    baselineLastTurnId,
-    acceptedUserTurn: extra.acceptedUserTurn || null,
-    dispatchStartedAt: '',
-    dispatchAcceptedAt: '',
-    messageHash: messageHash(canonicalRawPrompt(message)),
-    messageChars: message.length,
-    messageHead: normalizeIdentityText(message).slice(0, 240),
-    messageTail: normalizeIdentityText(message).slice(-240),
-    responseChars: 0,
-    lastError: '',
-  };
 
-  withSchedulerLock(() => {
+  return withSchedulerLock(() => {
     const state = loadRoundState();
+    let existing = state.rounds.find((item) => item.id === id);
+    if (existing) {
+      Object.assign(existing, {
+        updatedAt: now,
+        sessionId: existing.sessionId || sessionId,
+        transcript: existing.transcript || transcript,
+        baselineLastTurnId: existing.baselineLastTurnId || baselineLastTurnId,
+        messageChars: message ? message.length : existing.messageChars,
+        messageHash: message ? messageHash(canonicalRawPrompt(message)) : existing.messageHash,
+        ...extra,
+      });
+      saveRoundState(state);
+      return existing;
+    }
+
+    const round = {
+      id,
+      operationKind: extra.operationKind || 'prompt',
+      recoveryStage: Number(extra.recoveryStage) || 0,
+      recoveryIncidentId: extra.recoveryIncidentId || '',
+      sourceUserTurn: extra.sourceUserTurn || null,
+      sourceAssistantTurn: extra.sourceAssistantTurn || null,
+      originalMessageHash: extra.originalMessageHash || '',
+      editedMessageHash: extra.editedMessageHash || '',
+      editSuffix: extra.editSuffix || '',
+      editAttestation: extra.editAttestation || null,
+      versionBaseline: extra.versionBaseline || null,
+      versionAttestation: extra.versionAttestation || null,
+      assistantOutcome: extra.assistantOutcome || null,
+      lastErrorCode: extra.lastErrorCode || '',
+      status: 'pending',
+      dispatchState: extra.dispatchState || 'prepared',
+      sessionBindingState: extra.sessionBindingState || (sessionId ? 'not_applicable' : 'unbound'),
+      candidateSessionId: '',
+      sessionAttestation: null,
+      createdAt: now,
+      updatedAt: now,
+      pid: process.pid,
+      sessionId,
+      expectedSessionId: extra.expectedSessionId || sessionId,
+      jobId: extra.jobId || '',
+      url: page.url(),
+      transcript,
+      cdp: args.cdp,
+      baselineLastTurnId,
+      acceptedUserTurn: extra.acceptedUserTurn || null,
+      dispatchStartedAt: '',
+      dispatchAcceptedAt: '',
+      messageHash: messageHash(canonicalRawPrompt(message)),
+      messageChars: message.length,
+      messageHead: normalizeIdentityText(message).slice(0, 240),
+      messageTail: normalizeIdentityText(message).slice(-240),
+      responseChars: 0,
+      lastError: '',
+      ...extra,
+    };
+
     state.rounds.push(round);
     saveRoundState(state);
     appendJsonl(ROUND_EVENTS_PATH, {
@@ -1508,8 +1525,8 @@ function registerPendingRound(args, page, message, baselineLastTurnId, extra = {
       at: now,
       round,
     });
+    return round;
   });
-  return round;
 }
 
 function updateRound(roundId, patch, eventType = 'round_updated') {
@@ -1552,32 +1569,46 @@ function saveLineageState(state) {
 
 function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
   const parentSessionId = extra.parentSessionId || sessionIdFromUrl(page.url());
-  const id = randomId('branch');
+  const id = extra.id || extra.branchId || args.branchId || randomId('branch');
   const now = nowIso();
-  const record = {
-    id,
-    operationKind: 'native_branch',
-    recoveryStage: 3,
-    recoveryIncidentId: args.recoveryIncidentId || '',
-    parentSessionId,
-    sourceTurnRef,
-    dispatchState: 'prepared',
-    status: 'pending',
-    sourceUrl: page.url(),
-    provisionalRoute: '',
-    candidateChildSessionId: '',
-    childSessionId: '',
-    parentAttestation: null,
-    lineageAttestation: null,
-    createdAt: now,
-    updatedAt: now,
-    pid: process.pid,
-    cdp: args.cdp,
-    lastError: '',
-  };
 
-  withSchedulerLock(() => {
+  return withSchedulerLock(() => {
     const state = loadLineageState();
+    let existing = state.branches.find((b) => b.id === id);
+    if (existing) {
+      Object.assign(existing, {
+        updatedAt: now,
+        parentSessionId: existing.parentSessionId || parentSessionId,
+        sourceTurnRef: existing.sourceTurnRef || sourceTurnRef,
+        ...extra,
+      });
+      saveLineageState(state);
+      return existing;
+    }
+
+    const record = {
+      id,
+      operationKind: 'native_branch',
+      recoveryStage: 3,
+      recoveryIncidentId: args.recoveryIncidentId || '',
+      parentSessionId,
+      sourceTurnRef,
+      dispatchState: 'prepared',
+      status: 'pending',
+      sourceUrl: page.url(),
+      provisionalRoute: '',
+      candidateChildSessionId: '',
+      childSessionId: '',
+      parentAttestation: null,
+      lineageAttestation: null,
+      createdAt: now,
+      updatedAt: now,
+      pid: process.pid,
+      cdp: args.cdp,
+      lastError: '',
+      ...extra,
+    };
+
     state.branches.push(record);
     saveLineageState(state);
     appendJsonl(LINEAGE_EVENTS_PATH, {
@@ -1585,8 +1616,8 @@ function registerPendingBranch(args, page, sourceTurnRef, extra = {}) {
       at: now,
       branch: record,
     });
+    return record;
   });
-  return record;
 }
 
 function updateBranchLineage(branchId, patch, eventType = 'branch_updated') {
@@ -2145,10 +2176,10 @@ async function getConversationTurns(page) {
       // Separate DOM subtrees: ensure assistant root is disjoint from user subtree
       const userUnit = roundEl.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
       const candidateAsstUnits = [...roundEl.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"]')];
-      let asstUnit = candidateAsstUnits.find(u => !userUnit || !userUnit.contains(u)) || null;
+      let asstUnit = candidateAsstUnits.find(u => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit))) || null;
       if (!asstUnit) {
         const candidateMarkdowns = [...roundEl.querySelectorAll('.markdown')];
-        asstUnit = candidateMarkdowns.find(m => !userUnit || !userUnit.contains(m)) || null;
+        asstUnit = candidateMarkdowns.find(m => !userUnit || (!userUnit.contains(m) && !m.contains(userUnit))) || null;
       }
 
       const userMessageId = (userUnit?.getAttribute('data-chatgpt-search-message-ids') || userUnit?.getAttribute('data-message-id') || '').split(' ')[0];
@@ -2213,6 +2244,8 @@ async function getConversationTurns(page) {
 
 function turnRef(turn) {
   return {
+    logicalTurnId: turn?.logicalTurnId || '',
+    turnKey: turn?.turnKey || '',
     messageId: turn?.messageId || '',
     testid: turn?.testid || '',
     role: turn?.role || '',
@@ -2537,7 +2570,9 @@ async function getComposerDraftState(page) {
 }
 
 function composerDraftMatchesMessage(state, message) {
-  if (turnMatchesMessage(state?.text || '', message)) {
+  const normState = normalizeTurnText(state?.text || '');
+  const normMsg = normalizeTurnText(message);
+  if (normState === normMsg || (normMsg.length && normState.startsWith(normMsg) && normState.length === normMsg.length)) {
     return { ok: true, kind: 'composer_text' };
   }
 
@@ -9059,14 +9094,17 @@ async function branchWithContextCarryForward(page, args) {
       if (!childPage && browser) {
         // Clear parent target IDs before allocating dedicated child page
         const newPageArgs = {
-          ...args,
+          cdp: args.cdp,
+          browserProfileDir: args.browserProfileDir,
+          browserLane: args.browserLane,
           conversation: childSessionId,
           expectedSessionId: childSessionId,
-          pageTargetId: '',
-          targetId: '',
           newTab: true,
         };
         childPage = await findTargetAppPage(browser, newPageArgs);
+        if (newPageArgs._laneLease && childPage) {
+          childPage._laneLease = newPageArgs._laneLease;
+        }
       }
       if (!childPage) {
         childPage = page;
@@ -9103,8 +9141,15 @@ async function branchWithContextCarryForward(page, args) {
     if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
       const roundsState = loadRoundState();
       const existingRound = roundsState.rounds.find(r => r.id === incident.continuationRoundId);
-      if (existingRound && existingRound.status === 'completed') {
-        const askResult = { text: existingRound.responseText || '', roundId: existingRound.id };
+      const isCompleted = existingRound && (existingRound.status === 'done' || existingRound.status === 'completed' || existingRound.assistantOutcome === 'succeeded');
+      if (isCompleted) {
+        let respText = existingRound.responseText || '';
+        if (!respText && existingRound.transcript && fs.existsSync(existingRound.transcript)) {
+          try {
+            respText = fs.readFileSync(existingRound.transcript, 'utf8');
+          } catch {}
+        }
+        const askResult = { text: respText, roundId: existingRound.id };
         updateRecoveryIncident(incident.id, {
           state: 'completed',
           continuationResponse: askResult,
@@ -9116,14 +9161,7 @@ async function branchWithContextCarryForward(page, args) {
           continuationResponse: askResult,
         };
       }
-    }
-
-    if (incident.state === 'continuation_dispatching' && incident.continuationRoundId) {
-      const roundsState = loadRoundState();
-      const existingRound = roundsState.rounds.find(r => r.id === incident.continuationRoundId);
-      if (existingRound && existingRound.status !== 'completed') {
-        throw cbError('CONTINUATION_ROUND_UNCERTAIN', `Carry-forward continuation round "${incident.continuationRoundId}" is in uncertain state "${existingRound.status || 'unknown'}" and requires reconciliation`);
-      }
+      throw cbError('CONTINUATION_ROUND_UNCERTAIN', `Carry-forward continuation round "${incident.continuationRoundId}" is in uncertain state "${existingRound?.status || 'missing'}" and requires reconciliation`);
     }
 
     const childArgs = {
@@ -9136,7 +9174,7 @@ async function branchWithContextCarryForward(page, args) {
       branchTurn: '',
       branchCarryForward: false,
       message: continuityPrompt,
-      _laneLease: childPage?._laneLease || args._laneLease || null,
+      _laneLease: targetPage._laneLease || null,
     };
 
     updateRecoveryIncident(incident.id, {
@@ -9174,16 +9212,15 @@ async function branchConversationTurn(page, args) {
     const provisionalBranchId = args.branchId || randomId('branch');
     const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
 
-    if (sessionIdFromUrl(page.url()) !== expectedParentSessionId) {
-      await openConversationBySessionId(page, expectedParentSessionId);
-    }
-    await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
-
     let branchRecord = null;
     let localDispatchState = 'unregistered';
     let childLease = null;
     let childPageLane = null;
     try {
+      if (sessionIdFromUrl(page.url()) !== expectedParentSessionId) {
+        await openConversationBySessionId(page, expectedParentSessionId);
+      }
+      await reloadExactConversation(page, expectedParentSessionId, 'stage3-branch-reload');
       await assertThreadIdentity(page, expectedParentSessionId, 'before stage3 branch preparation');
 
       const preState = await getTargetAppState(page);
@@ -9218,6 +9255,7 @@ async function branchConversationTurn(page, args) {
 
       const sourceAssistant = await resolveBranchableTurn(page, args.branchTurn || 'latest', args.expectedAnchorRevisionHash);
       branchRecord = registerPendingBranch(args, page, sourceAssistant, {
+        id: args.branchId || provisionalBranchId,
         parentSessionId: expectedParentSessionId,
       });
       localDispatchState = 'prepared';
@@ -10553,6 +10591,9 @@ async function ask(page, message, args) {
       roundExtra.operationKind = 'recovery_resend';
       roundExtra.recoveryStage = 2;
       roundExtra.recoveryIncidentId = args.recoveryIncidentId || '';
+    }
+    if (args.roundId) {
+      roundExtra.id = args.roundId;
     }
     const round = registerPendingRound(args, page, message, baselineLastTurnId, roundExtra);
 
@@ -11922,6 +11963,7 @@ module.exports = {
   openBranchMenu,
   waitForSendReady,
   getSendButtonState,
+  composerDraftMatchesMessage,
   formatCarryForwardPrompt,
   extractLastTurnFromTranscript,
   branchWithContextCarryForward,

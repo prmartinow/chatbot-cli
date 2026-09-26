@@ -48,6 +48,7 @@ const {
   branchWithContextCarryForward,
   waitForSendReady,
   getSendButtonState,
+  composerDraftMatchesMessage,
   canonicalCarryForwardPayloadHash,
   getOrCreateCarryForwardIncident,
   releaseBrowserLaneLease,
@@ -4666,4 +4667,30 @@ test('waitForSendReady: throws COMPOSER_SUBMIT_CONTROL_AMBIGUOUS when multiple c
     () => waitForSendReady(mockPage, 50),
     (err) => err.code === 'COMPOSER_SUBMIT_CONTROL_AMBIGUOUS' && err.message.includes('2 candidate')
   );
+});
+
+test('registerPendingRound: consumes reserved id and is idempotent', async () => {
+  const reservedId = 'round-test-reserved-123';
+  const pageStub = { url: () => 'https://chatgpt.com/c/test-session-id' };
+  const r1 = registerPendingRound({ transcript: '' }, pageStub, 'hello world', '', {
+    roundId: reservedId,
+  });
+  assert.equal(r1.id, reservedId);
+
+  const r2 = registerPendingRound({ transcript: '' }, pageStub, 'hello world updated', '', {
+    roundId: reservedId,
+  });
+  assert.equal(r2.id, reservedId);
+  assert.equal(r2.messageChars, 19);
+});
+
+test('composerDraftMatchesMessage: strictly rejects prefix-only truncation markers', () => {
+  const fullMessage = 'A'.repeat(200) + 'B'.repeat(1000) + 'END';
+  const truncatedComposer = { text: 'A'.repeat(200) + '...' };
+  const res = composerDraftMatchesMessage(truncatedComposer, fullMessage);
+  assert.equal(res.ok, false);
+
+  const exactComposer = { text: fullMessage };
+  const resExact = composerDraftMatchesMessage(exactComposer, fullMessage);
+  assert.equal(resExact.ok, true);
 });
