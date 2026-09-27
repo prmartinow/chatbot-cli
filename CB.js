@@ -317,6 +317,7 @@ function parseArgs(argv) {
     carryPrompt: '',
     lane: '',
     targetId: '',
+    workerId: '',
     autoRecover: false,
     downloadArtifacts: false,
     showArtifacts: false,
@@ -403,6 +404,7 @@ function parseArgs(argv) {
     else if (arg === '--auto-recover') args.autoRecover = true;
     else if (arg === '--lane') args.lane = next();
     else if (arg === '--target-id') args.targetId = next();
+    else if (arg === '--worker-id') args.workerId = next();
     else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -1050,12 +1052,63 @@ function bootstrapLeasePath(args) {
   );
 }
 
+function getProcessStartTime(pid) {
+  try {
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const lastParen = stat.lastIndexOf(')');
+      if (lastParen !== -1) {
+        const rest = stat.slice(lastParen + 2).split(' ');
+        return rest[19] || null;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function targetLeasePath(cdpUrl, targetId) {
+  if (!targetId) throw cbError('TARGET_ID_REQUIRED', 'Physical target lease requires a valid targetId');
+  const normalizedCdp = normalizeCdpUrl(cdpUrl || DEFAULT_CDP);
+  const scope = ['page-lane', TARGET_APP_BASE.origin, normalizedCdp, targetId].join('|');
+  const hash = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 24);
+  return path.join(CONVERSATION_LEASES_DIR, `lane-${hash}.lock`);
+}
+
+function acquireTargetLease(cdpUrl, targetId, transactionId) {
+  return acquireNamedLease(
+    targetLeasePath(cdpUrl, targetId),
+    {
+      kind: 'target_lane',
+      transactionId,
+      cdp: normalizeCdpUrl(cdpUrl || DEFAULT_CDP),
+      targetId,
+      targetOrigin: TARGET_APP_BASE.origin,
+    },
+    'BROWSER_LANE_BUSY',
+    `Browser target tab ${targetId} is held by active process`
+  );
+}
+
+function releaseTargetLease(leaseHandle) {
+  return releaseConversationLease(leaseHandle);
+}
+
+function conversationLeasePath(cdpUrl, conversationId) {
+  const convId = extractConversationId(conversationId);
+  if (!convId || !STABLE_SESSION_ID_RE.test(convId)) throw cbError('CONVERSATION_ID_REQUIRED', 'Conversation lease requires a valid conversation UUID');
+  const normalizedCdp = normalizeCdpUrl(cdpUrl || DEFAULT_CDP);
+  const scope = ['conversation-lane', TARGET_APP_BASE.origin, normalizedCdp, convId].join('|');
+  const hash = crypto.createHash('sha256').update(scope).digest('hex').slice(0, 24);
+  return path.join(CONVERSATION_LEASES_DIR, `lane-${hash}.lock`);
+}
+
 function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
   fs.mkdirSync(path.dirname(leasePath), { recursive: true });
   const token = randomId('lease');
   const next = {
     ...payload,
     pid: process.pid,
+    startTime: getProcessStartTime(process.pid),
     token,
     createdAt: nowIso(),
   };
@@ -1073,7 +1126,9 @@ function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
         current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
       } catch {}
 
-      if (current?.pid && !processExists(current.pid)) {
+      const isDead = current?.pid && !processExists(current.pid);
+      const isRecycled = current?.pid && current?.startTime && getProcessStartTime(current.pid) && current.startTime !== getProcessStartTime(current.pid);
+      if (isDead || isRecycled) {
         fs.writeFileSync(leasePath, JSON.stringify(next, null, 2), 'utf8');
         return { leasePath, token };
       }
@@ -1152,15 +1207,18 @@ async function withTopologyLease(args, transactionId, fn) {
 
 function browserLaneLeasePath(args) {
   const normalizedCdp = normalizeCdpUrl(args?.cdp || DEFAULT_CDP);
-  let laneScope;
   if (args?.pageTargetId || args?.targetId) {
-    const tid = args.pageTargetId || args.targetId;
-    laneScope = ['page-lane', TARGET_APP_BASE.origin, normalizedCdp, tid].join('|');
-  } else if (args?.expectedSessionId || args?.conversation) {
+    return targetLeasePath(normalizedCdp, args.pageTargetId || args.targetId);
+  }
+  if (args?.expectedSessionId || args?.conversation) {
     const rawConv = args.expectedSessionId || args.conversation;
     const convId = extractConversationId(rawConv);
-    laneScope = ['conversation-lane', TARGET_APP_BASE.origin, normalizedCdp, convId].join('|');
-  } else if (args?.lane) {
+    if (convId && STABLE_SESSION_ID_RE.test(convId)) {
+      return conversationLeasePath(normalizedCdp, convId);
+    }
+  }
+  let laneScope;
+  if (args?.lane) {
     laneScope = ['explicit-lane', args.lane, normalizedCdp].join('|');
   } else {
     laneScope = ['bootstrap-lane', TARGET_APP_BASE.origin, normalizedCdp].join('|');
@@ -1937,6 +1995,28 @@ function isDoneScheduledJob(job) {
   return job?.status === 'done' || job?.status === 'skipped';
 }
 
+function computeJobSerializationKey(job, index = null) {
+  if (job?.serializationKey) return job.serializationKey;
+  const target = job?.target || {};
+  if (target.sessionId) {
+    const rec = index ? findConversationBySessionId(index, target.sessionId) : null;
+    const streamId = rec?.streamId || target.sessionId;
+    return `convstream:${streamId}`;
+  }
+  if (target.alias) {
+    const rec = index ? findConversationByAlias(index, target.alias) : null;
+    if (rec?.sessionId) {
+      const streamId = rec.streamId || rec.sessionId;
+      return `convstream:${streamId}`;
+    }
+    return `alias:${target.alias}`;
+  }
+  if (target.newConversation) {
+    return `newchat:${job?.id || 'pending'}`;
+  }
+  return `job:${job?.id || 'pending'}`;
+}
+
 function enqueueScheduledJob(args, page = null) {
   const message = String(args.message || '').trim();
   if (!message) throw new Error('No message provided');
@@ -1997,12 +2077,20 @@ function enqueueScheduledJob(args, page = null) {
       }
     }
 
+    const workerLane = args.lane || 'default';
+    const serializationKey = computeJobSerializationKey({ id: jobId, target }, index);
+    const laneSeq = queue.jobs.filter((j) => (j.serializationKey || computeJobSerializationKey(j, index)) === serializationKey).length + 1;
     const seq = queue.jobs.reduce((max, job) => Math.max(max, Number(job.seq) || 0), 0) + 1;
     const now = nowIso();
     const job = {
       id: jobId,
       seq,
+      laneSeq,
+      workerLane,
+      serializationKey,
+      targetId: args.targetId || args.pageTargetId || null,
       status: 'pending',
+      claim: null,
       createdAt: now,
       updatedAt: now,
       target,
@@ -2160,8 +2248,17 @@ async function findTargetAppPage(browser, args = {}) {
     });
   }
 
-  const expectedId = args.expectedSessionId || args.conversation;
-  const normalizedExpectedId = expectedId ? extractConversationId(expectedId) : null;
+  let expectedId = args.expectedSessionId || args.conversation;
+  let normalizedExpectedId = expectedId ? extractConversationId(expectedId) : null;
+  if (!normalizedExpectedId && expectedId && !isCurrentConversationRef(expectedId)) {
+    try {
+      const index = loadConversationIndex();
+      const rec = findConversationByAlias(index, expectedId);
+      if (rec?.sessionId) {
+        normalizedExpectedId = extractConversationId(rec.sessionId);
+      }
+    } catch {}
+  }
 
   if (normalizedExpectedId && STABLE_SESSION_ID_RE.test(normalizedExpectedId)) {
     const matchingPages = [];
@@ -2202,25 +2299,56 @@ async function findTargetAppPage(browser, args = {}) {
     }));
   }
 
+  let totalOpenPages = 0;
   for (const candidateContext of browser.contexts()) {
-    const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
-    if (page) return await assignPage(page);
+    totalOpenPages += candidateContext.pages().length;
   }
 
-  return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
-    const context = browser.contexts()[0] || await browser.newContext();
-    const page = await context.newPage();
-    const tid = await getPageTargetId(page);
-    if (!tid) {
-      throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for fallback page');
+  if (totalOpenPages === 0) {
+    return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
+      const context = browser.contexts()[0] || await browser.newContext();
+      const page = await context.newPage();
+      const tid = await getPageTargetId(page);
+      if (!tid) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for fallback page');
+      }
+      args.pageTargetId = tid;
+      if (!args._laneLease) {
+        args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
+      }
+      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      return page;
+    });
+  }
+
+  if (args.message || args.newConversation) {
+    return await withTopologyLease(args, randomId('unpinned-mutation-alloc'), async () => {
+      const context = browser.contexts()[0] || await browser.newContext();
+      const page = await context.newPage();
+      const tid = await getPageTargetId(page);
+      if (!tid) {
+        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for new prompt page');
+      }
+      args.pageTargetId = tid;
+      if (!args._laneLease) {
+        args._laneLease = acquireBrowserLaneLease(args, randomId('unpinned-mutation-op'));
+      }
+      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      return page;
+    });
+  }
+
+  if (args.conversation && isCurrentConversationRef(args.conversation)) {
+    for (const candidateContext of browser.contexts()) {
+      const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
+      if (page) return await assignPage(page);
     }
-    args.pageTargetId = tid;
-    if (!args._laneLease) {
-      args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
-    }
-    await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    return page;
-  });
+  }
+
+  throw cbError(
+    'TARGET_BINDING_REQUIRED',
+    'Unpinned status or inspection requires --target-id or --conversation to prevent attaching to a foreign tab'
+  );
 }
 
 async function getConversationTurns(page) {
@@ -10248,54 +10376,132 @@ function resolveRunnableTarget(job, index) {
   return { action: 'blocked', reason: 'job has no conversation target' };
 }
 
-function takeNextScheduledJob() {
+function takeNextScheduledJob(workerOptions = {}) {
+  const workerLane = workerOptions?.lane || workerOptions?.workerLane || '';
+  const workerId = workerOptions?.workerId || `worker-${process.pid}`;
+
   return withSchedulerLock(() => {
     const queue = loadQueueState();
     const index = loadConversationIndex();
     const ordered = queue.jobs.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
-    const next = ordered.find((job) => !isDoneScheduledJob(job)) || null;
-    if (!next) return { job: null, blocked: null };
-    if (next.status !== 'pending') {
-      return {
-        job: null,
-        blocked: {
-          job: next,
-          reason: `job #${next.seq} is ${next.status}; recover or reset it before continuing`,
-        },
+
+    const activeKeys = new Set();
+    const blockedKeys = new Map();
+
+    for (const job of ordered) {
+      if (isDoneScheduledJob(job)) continue;
+
+      const sKey = job.serializationKey || computeJobSerializationKey(job, index);
+
+      if (job.status === 'running' || job.status === 'claimed') {
+        activeKeys.add(sKey);
+        continue;
+      }
+
+      if (job.status !== 'pending') {
+        if (!blockedKeys.has(sKey)) {
+          blockedKeys.set(sKey, {
+            job,
+            reason: `job #${job.seq} in lane "${sKey}" is ${job.status}; recover or reset it before continuing`,
+          });
+        }
+        continue;
+      }
+
+      if (activeKeys.has(sKey) || blockedKeys.has(sKey)) {
+        continue;
+      }
+
+      if (workerLane && job.workerLane && job.workerLane !== workerLane) {
+        continue;
+      }
+
+      const target = resolveRunnableTarget(job, index);
+      if (target.action === 'blocked') {
+        blockedKeys.set(sKey, { job, reason: target.reason });
+        continue;
+      }
+
+      const now = nowIso();
+      const claimToken = randomId('claim');
+      const currentFence = Number(job.claim?.fence || 0) + 1;
+      job.status = 'claimed';
+      job.updatedAt = now;
+      job.attempts = (job.attempts || 0) + 1;
+      job.lastError = '';
+      job.claim = {
+        workerId,
+        token: claimToken,
+        fence: currentFence,
+        pid: process.pid,
+        claimedAt: now,
       };
+      job.run = {
+        startedAt: now,
+        pid: process.pid,
+        target,
+        claimToken,
+        fence: currentFence,
+      };
+
+      saveQueueState(queue);
+      appendJsonl(QUEUE_EVENTS_PATH, {
+        type: 'job_claimed',
+        at: now,
+        jobId: job.id,
+        seq: job.seq,
+        laneSeq: job.laneSeq,
+        serializationKey: sKey,
+        workerLane: job.workerLane || 'default',
+        claimToken,
+        fence: currentFence,
+        target,
+      });
+
+      return { job, blocked: null };
     }
 
-    const target = resolveRunnableTarget(next, index);
-    if (target.action === 'blocked') {
-      return { job: null, blocked: { job: next, reason: target.reason } };
+    if (blockedKeys.size > 0) {
+      const firstBlocked = blockedKeys.values().next().value;
+      return { job: null, blocked: firstBlocked };
     }
 
-    next.status = 'running';
-    next.updatedAt = nowIso();
-    next.attempts = (next.attempts || 0) + 1;
-    next.lastError = '';
-    next.run = {
-      startedAt: next.updatedAt,
-      pid: process.pid,
-      target,
-    };
-    saveQueueState(queue);
-    appendJsonl(QUEUE_EVENTS_PATH, {
-      type: 'job_started',
-      at: next.updatedAt,
-      jobId: next.id,
-      seq: next.seq,
-      target,
-    });
-    return { job: next, blocked: null };
+    return { job: null, blocked: null };
   });
 }
 
-function finishScheduledJob(jobId, patch, eventType) {
+function markJobRunning(jobId, claimToken = null) {
   return withSchedulerLock(() => {
     const queue = loadQueueState();
     const job = queue.jobs.find((item) => item.id === jobId);
     if (!job) throw new Error(`Scheduled job disappeared: ${jobId}`);
+    if (claimToken && job.claim?.token && job.claim.token !== claimToken) {
+      throw cbError('STALE_JOB_CLAIM', `Cannot transition job ${jobId} to running: claim token mismatch`);
+    }
+    job.status = 'running';
+    job.updatedAt = nowIso();
+    if (job.run) job.run.startedAt = job.updatedAt;
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, {
+      type: 'job_started',
+      at: job.updatedAt,
+      jobId,
+      seq: job.seq,
+      serializationKey: job.serializationKey || '',
+      target: job.run?.target || null,
+    });
+    return job;
+  });
+}
+
+function finishScheduledJob(jobId, patch, eventType, claimToken = null) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find((item) => item.id === jobId);
+    if (!job) throw new Error(`Scheduled job disappeared: ${jobId}`);
+    if (claimToken && job.claim?.token && job.claim.token !== claimToken) {
+      throw cbError('STALE_JOB_CLAIM', `Cannot finish job ${jobId}: claim token mismatch (job owned by newer claim)`);
+    }
     Object.assign(job, patch, { updatedAt: nowIso() });
     saveQueueState(queue);
     appendJsonl(QUEUE_EVENTS_PATH, {
@@ -10715,25 +10921,24 @@ async function runScheduledJob(page, job, runnerArgs) {
   };
 }
 
-async function runScheduledQueue(page, args) {
+async function runScheduledQueue(pageOrBrowser, args) {
   let completed = 0;
+  const isBrowser = Boolean(pageOrBrowser && typeof pageOrBrowser.contexts === 'function');
+  const browser = isBrowser ? pageOrBrowser : (typeof pageOrBrowser?.context === 'function' ? pageOrBrowser.context()?.browser?.() || null : null);
+  let staticPage = isBrowser ? null : pageOrBrowser;
+
   while (true) {
     if (args.queueLimit && completed >= args.queueLimit) return;
 
-    const { job, blocked } = takeNextScheduledJob();
+    const { job, blocked } = takeNextScheduledJob({ lane: args.lane, workerId: args.workerId });
     if (!job) {
       if (blocked) {
         if (args.skipFailed && blocked.job.status === 'failed') {
-          // A failed job should not pin the whole queue forever. When the
-          // operator opts in with --skip-failed, auto-skip the blocking failed
-          // job (journaled), then loop to the next pending job. The default
-          // remains that a failed job blocks until manually reset, so genuine
-          // failures are not silently dropped.
           finishScheduledJob(blocked.job.id, {
             status: 'skipped',
             lastError: blocked.job.lastError || '',
             result: { ...(blocked.job.result || {}), skippedAt: nowIso(), skippedReason: 'auto-skipped by --skip-failed (blocking failed job)' },
-          }, 'job_skipped_auto');
+          }, 'job_skipped_auto', blocked.job.claim?.token);
           info(`[queue] #${blocked.job.seq} ${blocked.job.id}: auto-skipped (failed; --skip-failed)`);
           continue;
         }
@@ -10747,17 +10952,40 @@ async function runScheduledQueue(page, args) {
         info('[queue] no pending jobs');
         return;
       }
-      await page.waitForTimeout(args.stateInterval);
+      if (staticPage && typeof staticPage.waitForTimeout === 'function') {
+        await staticPage.waitForTimeout(args.stateInterval);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, args.stateInterval));
+      }
       continue;
     }
 
+    const claimToken = job.claim?.token || null;
+    markJobRunning(job.id, claimToken);
+
+    let targetPage = staticPage;
+    let targetLease = null;
+
     try {
-      const result = await runScheduledJob(page, job, args);
+      if (!targetPage && browser) {
+        const jobPageArgs = {
+          ...args,
+          conversation: job.target?.sessionId || (job.target?.newConversation ? '' : (job.target?.alias || '')),
+          expectedSessionId: job.target?.sessionId || '',
+          newConversation: Boolean(job.target?.newConversation),
+          targetId: job.targetId || args.targetId || '',
+          lane: job.workerLane || args.lane || '',
+        };
+        targetPage = await findTargetAppPage(browser, jobPageArgs);
+        targetLease = jobPageArgs._laneLease || null;
+      }
+
+      const result = await runScheduledJob(targetPage, job, args);
       finishScheduledJob(job.id, {
         status: 'done',
         result,
         lastError: '',
-      }, 'job_completed');
+      }, 'job_completed', claimToken);
       completed += 1;
       info(`[queue] #${job.seq} ${job.id}: done session=${result.sessionId || '(none)'} transcript=${result.transcript}`);
     } catch (error) {
@@ -10769,12 +10997,17 @@ async function runScheduledQueue(page, args) {
         lastError: message,
         result: {
           heldAt: nowIso(),
-          url: page.url(),
+          url: targetPage && typeof targetPage.url === 'function' ? targetPage.url() : '',
           recoverable: status !== 'failed',
         },
-      }, eventType);
+      }, eventType, claimToken);
       console.error(`[queue] #${job.seq} ${job.id}: ${status}: ${message}`);
       return;
+    } finally {
+      if (targetLease) {
+        releaseBrowserLaneLease(targetLease);
+        targetLease = null;
+      }
     }
   }
 }
@@ -12210,6 +12443,11 @@ async function main() {
 
   const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
   try {
+    if (args.runQueue && !args.targetId && !args.conversation) {
+      await runScheduledQueue(browser, args);
+      return;
+    }
+
     const page = await findTargetAppPage(browser, args);
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
     refreshSessionTranscript(page, args);
@@ -12604,4 +12842,19 @@ module.exports = {
   formatTranscriptEntry,
   parseTranscriptEntries,
   cbError,
+  targetLeasePath,
+  acquireTargetLease,
+  releaseTargetLease,
+  conversationLeasePath,
+  getProcessStartTime,
+  computeJobSerializationKey,
+  takeNextScheduledJob,
+  markJobRunning,
+  finishScheduledJob,
+  enqueueScheduledJob,
+  runScheduledQueue,
+  loadQueueState,
+  saveQueueState,
+  loadConversationIndex,
+  saveConversationIndex,
 };

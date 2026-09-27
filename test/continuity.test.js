@@ -62,6 +62,20 @@ const {
   withBrowserLaneLease,
   takeBrowserLaneLease,
   findTargetAppPage,
+  targetLeasePath,
+  acquireTargetLease,
+  releaseTargetLease,
+  conversationLeasePath,
+  getProcessStartTime,
+  computeJobSerializationKey,
+  takeNextScheduledJob,
+  markJobRunning,
+  finishScheduledJob,
+  enqueueScheduledJob,
+  loadQueueState,
+  saveQueueState,
+  loadConversationIndex,
+  saveConversationIndex,
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
@@ -5790,4 +5804,240 @@ test('watchTargetAppState: quiescent target blocked by preview dialog with lates
     }),
     (err) => err.code === 'WATCH_COMPLETION_UNVERIFIED'
   );
+});
+
+
+// ============================================================================
+// Concurrency v2: Multi-Agent Isolation, Strict Allocation & Queue Partitioning
+// ============================================================================
+
+test('computeJobSerializationKey: resolves streamId, alias, newchat, and custom serialization keys', () => {
+  const index = {
+    conversations: [
+      {
+        alias: 'res-alias',
+        sessionId: '11111111-1111-4111-8111-111111111111',
+        streamId: 'stream-res-42',
+      },
+      {
+        alias: 'other-alias',
+        sessionId: '22222222-2222-4222-8222-222222222222',
+      },
+    ],
+  };
+
+  // Direct sessionId with streamId in index
+  const key1 = computeJobSerializationKey({
+    target: { sessionId: '11111111-1111-4111-8111-111111111111' },
+  }, index);
+  assert.equal(key1, 'convstream:stream-res-42');
+
+  // Direct sessionId without streamId in index falls back to sessionId
+  const key2 = computeJobSerializationKey({
+    target: { sessionId: '22222222-2222-4222-8222-222222222222' },
+  }, index);
+  assert.equal(key2, 'convstream:22222222-2222-4222-8222-222222222222');
+
+  // Alias mapped in index
+  const key3 = computeJobSerializationKey({
+    target: { alias: 'res-alias' },
+  }, index);
+  assert.equal(key3, 'convstream:stream-res-42');
+
+  // Unmapped alias
+  const key4 = computeJobSerializationKey({
+    target: { alias: 'unmapped-topic' },
+  }, index);
+  assert.equal(key4, 'alias:unmapped-topic');
+
+  // New conversation
+  const key5 = computeJobSerializationKey({
+    id: 'job-999',
+    target: { newConversation: true },
+  }, index);
+  assert.equal(key5, 'newchat:job-999');
+
+  // Explicit pre-computed key preserved
+  const key6 = computeJobSerializationKey({
+    serializationKey: 'custom-lane:manual',
+  }, index);
+  assert.equal(key6, 'custom-lane:manual');
+});
+
+test('targetLeasePath & conversationLeasePath: strictly isolate physical targets and logical threads with parity', () => {
+  const cdp = 'http://127.0.0.1:9241';
+  const targetIdA = 'TARGET-PAGE-AAA';
+  const targetIdB = 'TARGET-PAGE-BBB';
+  const convId = '33333333-3333-4333-8333-333333333333';
+
+  // Physical target leases isolate distinct tabs
+  const pathA = targetLeasePath(cdp, targetIdA);
+  const pathB = targetLeasePath(cdp, targetIdB);
+  assert.notEqual(pathA, pathB);
+
+  // Parity with browserLaneLeasePath
+  const pathFromLaneTarget = browserLaneLeasePath({ cdp, pageTargetId: targetIdA });
+  assert.equal(pathA, pathFromLaneTarget);
+
+  // Logical conversation leases parity with browserLaneLeasePath
+  const convPath = conversationLeasePath(cdp, convId);
+  const pathFromLaneConv = browserLaneLeasePath({ cdp, expectedSessionId: convId });
+  assert.equal(convPath, pathFromLaneConv);
+
+  // Fails closed if IDs missing
+  assert.throws(
+    () => targetLeasePath(cdp, ''),
+    (err) => err.code === 'TARGET_ID_REQUIRED'
+  );
+  assert.throws(
+    () => conversationLeasePath(cdp, 'not-a-uuid'),
+    (err) => err.code === 'CONVERSATION_ID_REQUIRED'
+  );
+});
+
+test('findTargetAppPage: fails closed with TARGET_BINDING_REQUIRED on unpinned inspection when tabs exist', async () => {
+  const foreignUrl = 'https://chatgpt.com/c/55555555-5555-4555-8555-555555555555';
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [{
+        _targetId: 'TARGET-FOREIGN',
+        url: () => foreignUrl,
+      }],
+    }],
+  };
+
+  // Passive status check without --target-id or --conversation must FAIL CLOSED
+  await assert.rejects(
+    async () => findTargetAppPage(mockBrowser, { status: true }),
+    (err) => err.code === 'TARGET_BINDING_REQUIRED'
+  );
+});
+
+test('findTargetAppPage: unpinned message allocates dedicated page instead of hijacking open tab', async () => {
+  const foreignUrl = 'https://chatgpt.com/c/55555555-5555-4555-8555-555555555555';
+  let createdUrl = '';
+  const mockBrowser = {
+    contexts: () => [{
+      pages: () => [{
+        _targetId: 'TARGET-FOREIGN',
+        url: () => foreignUrl,
+      }],
+      newPage: async () => ({
+        _targetId: 'TARGET-DEDICATED',
+        goto: async (url) => { createdUrl = url; },
+        url: () => createdUrl,
+      }),
+    }],
+  };
+
+  const args = { message: 'hello world unpinned', cdp: 'http://127.0.0.1:9241' };
+  const page = await findTargetAppPage(mockBrowser, args);
+  assert.ok(page);
+  // Must have allocated fresh page and bound target ID
+  assert.equal(args.pageTargetId, 'TARGET-DEDICATED');
+  assert.equal(createdUrl, 'https://chatgpt.com/');
+  // Cleans up acquired lane lease
+  if (args._laneLease) {
+    releaseBrowserLaneLease(args._laneLease);
+    args._laneLease = null;
+  }
+});
+
+test('Queue v2: Non-blocking parallel lane dispatching preserves FIFO per lane and unblocks distinct lanes', () => {
+  const queue = {
+    jobs: [
+      {
+        id: 'job-lane-a1',
+        seq: 1,
+        serializationKey: 'convstream:thread-A',
+        workerLane: 'default',
+        status: 'running',
+        claim: { workerId: 'worker-1', token: 'claim-1', fence: 1 },
+      },
+      {
+        id: 'job-lane-a2',
+        seq: 2,
+        serializationKey: 'convstream:thread-A',
+        workerLane: 'default',
+        status: 'pending',
+        target: { sessionId: 'thread-A' },
+      },
+      {
+        id: 'job-lane-b1',
+        seq: 3,
+        serializationKey: 'convstream:thread-B',
+        workerLane: 'default',
+        status: 'pending',
+        target: { sessionId: 'thread-B' },
+      },
+    ],
+  };
+
+  saveQueueState(queue);
+
+  // Worker claims next job. Even though Job #2 is older, it belongs to thread-A which is RUNNING.
+  // Thread-B (Job #3) MUST be claimed immediately without head-of-line blocking!
+  const { job: claimedJob, blocked } = takeNextScheduledJob({ workerId: 'worker-2' });
+
+  assert.ok(claimedJob, 'Should claim eligible job on thread-B');
+  assert.equal(claimedJob.id, 'job-lane-b1');
+  assert.equal(claimedJob.seq, 3);
+  assert.equal(claimedJob.status, 'claimed');
+  assert.ok(claimedJob.claim?.token);
+  assert.equal(claimedJob.claim?.fence, 1);
+  assert.equal(claimedJob.claim?.workerId, 'worker-2');
+  assert.equal(blocked, null);
+
+  // Verify transition to running under claimToken
+  const runningJob = markJobRunning(claimedJob.id, claimedJob.claim.token);
+  assert.equal(runningJob.status, 'running');
+
+  // Verify second worker cannot claim anything now (thread-A active, thread-B active)
+  const { job: noJob } = takeNextScheduledJob({ workerId: 'worker-3' });
+  assert.equal(noJob, null);
+});
+
+test('finishScheduledJob: protects against split-brain execution using fencing token', () => {
+  const queue = {
+    jobs: [
+      {
+        id: 'job-fence-test',
+        seq: 10,
+        status: 'running',
+        claim: { workerId: 'worker-1', token: 'claim-valid-token', fence: 2 },
+      },
+    ],
+  };
+  saveQueueState(queue);
+
+  // Stale claim token rejection
+  assert.throws(
+    () => finishScheduledJob('job-fence-test', { status: 'done' }, 'job_completed', 'claim-STALE-token'),
+    (err) => err.code === 'STALE_JOB_CLAIM'
+  );
+
+  // Valid claim token succeeds
+  const finished = finishScheduledJob('job-fence-test', { status: 'done', result: { test: true } }, 'job_completed', 'claim-valid-token');
+  assert.equal(finished.status, 'done');
+  assert.equal(finished.result?.test, true);
+});
+
+test('acquireNamedLease: safely reclaims stale lease when holder PID is dead', () => {
+  const cdp = 'http://127.0.0.1:9241';
+  const dummyTargetId = 'STALE-TARGET-' + Date.now();
+  const leaseP = targetLeasePath(cdp, dummyTargetId);
+
+  fs.mkdirSync(path.dirname(leaseP), { recursive: true });
+  fs.writeFileSync(leaseP, JSON.stringify({
+    pid: 9999999, // Guaranteed non-existent dead PID
+    token: 'old-dead-token',
+    createdAt: new Date().toISOString(),
+  }, null, 2));
+
+  // Should NOT throw BROWSER_LANE_BUSY; should reclaim stale lock
+  const handle = acquireTargetLease(cdp, dummyTargetId, 'reclaim-test');
+  assert.ok(handle);
+  assert.equal(handle.leasePath, leaseP);
+  releaseTargetLease(handle);
+  assert.equal(fs.existsSync(leaseP), false);
 });
