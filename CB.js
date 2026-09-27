@@ -796,6 +796,16 @@ async function syncTranscriptFromPage(page, args, options = {}) {
 
   if (startIndex === -1) {
     const stale = args.transcript;
+    try {
+      const reconDir = path.join(path.dirname(stale), 'reconciliation');
+      fs.mkdirSync(reconDir, { recursive: true });
+      const candidatePath = path.join(reconDir, `${path.basename(stale, '.txt')}.${nowIso().replace(/[:.]/g, '-')}.candidate.txt`);
+      fs.writeFileSync(candidatePath, turns.map((t) => formatTranscriptEntry(t.role, t.text)).join('\n\n') + '\n', 'utf8');
+      info(`[sync] TRANSCRIPT_DIVERGENCE recorded -> candidate preserved at ${path.basename(candidatePath)}`);
+    } catch (divErr) {
+      warn(`[sync] Could not record divergence candidate: ${divErr.message}`);
+    }
+
     const quarantined = `${stale}.stale-${new Date().toISOString().replace(/[:.]/g, '-')}`;
     try {
       fs.renameSync(stale, quarantined);
@@ -1989,6 +1999,10 @@ function targetDescription(target) {
   if (target.sessionId) return target.sessionId;
   if (target.alias) return `${target.alias} (pending)`;
   return 'current';
+}
+
+function jobStagingDir(jobId) {
+  return path.join(SCHEDULER_DIR, 'staging', jobId);
 }
 
 function isDoneScheduledJob(job) {
@@ -10416,6 +10430,11 @@ function takeNextScheduledJob(workerOptions = {}) {
         continue;
       }
 
+      const workerCdp = workerOptions?.cdp || '';
+      if (workerCdp && job.cdp && normalizeCdpUrl(job.cdp) !== normalizeCdpUrl(workerCdp)) {
+        continue;
+      }
+
       const target = resolveRunnableTarget(job, index);
       if (target.action === 'blocked') {
         blockedKeys.set(sKey, { job, reason: target.reason });
@@ -10892,13 +10911,22 @@ async function runScheduledJob(page, job, runnerArgs) {
     : scheduledTimeoutExplicit
       ? scheduledTimeout
       : 0;
+  let stagingDir = null;
+  let stagedTranscript = null;
+  if (target.action === 'new') {
+    stagingDir = jobStagingDir(job.id);
+    fs.mkdirSync(stagingDir, { recursive: true });
+    stagedTranscript = path.join(stagingDir, 'transcript.pending.txt');
+  }
+
   const jobArgs = {
     ...runnerArgs,
     jobId: job.id,
+    stagingDir,
     newConversation: target.action === 'new',
     expectedSessionId: target.action === 'open' ? target.sessionId : '',
-    transcript: null,
-    transcriptOverride: false,
+    transcript: stagedTranscript || null,
+    transcriptOverride: Boolean(stagedTranscript),
     attachments: job.attachments || [],
     model: job.model || '',
     reasoning: job.reasoning || '',
@@ -10909,6 +10937,12 @@ async function runScheduledJob(page, job, runnerArgs) {
   };
   const response = await ask(page, job.message, jobArgs);
   const sessionId = jobArgs.expectedSessionId || sessionIdFromUrl(page.url());
+  if (jobArgs.stagingDir && jobArgs.transcript && fs.existsSync(jobArgs.transcript) && sessionId) {
+    const canonicalTranscript = transcriptPathForSession(sessionId);
+    fs.mkdirSync(path.dirname(canonicalTranscript), { recursive: true });
+    fs.copyFileSync(jobArgs.transcript, canonicalTranscript);
+    jobArgs.transcript = canonicalTranscript;
+  }
   const conversation = recordResolvedConversation(job, page, response, sessionId);
   return {
     completedAt: nowIso(),
@@ -10930,7 +10964,7 @@ async function runScheduledQueue(pageOrBrowser, args) {
   while (true) {
     if (args.queueLimit && completed >= args.queueLimit) return;
 
-    const { job, blocked } = takeNextScheduledJob({ lane: args.lane, workerId: args.workerId });
+    const { job, blocked } = takeNextScheduledJob({ lane: args.lane, workerId: args.workerId, cdp: args.cdp });
     if (!job) {
       if (blocked) {
         if (args.skipFailed && blocked.job.status === 'failed') {
@@ -12441,6 +12475,28 @@ async function main() {
     }
   }
 
+  if (args.recoverQueue && !args.targetId && !args.conversation && !args.expectedSessionId) {
+    const recoveredRounds = reconcilePendingRoundsFromTranscript(args, {});
+    const queueRecovery = recoverQueueStateFromRounds(null, args, {
+      activeSessionId: '',
+      isGenerating: false,
+      url: '',
+    });
+    const result = {
+      type: 'queue_recovery_ledger_only',
+      at: nowIso(),
+      sessionId: '',
+      url: '',
+      generating: false,
+      transcript: '',
+      sync: { appended: [], skipped: [] },
+      recoveredRounds: recoveredRounds.map((r) => ({ id: r.id, sessionId: r.sessionId, responseChars: r.responseChars })),
+      ...queueRecovery,
+    };
+    printQueueRecovery(result, args.stateJsonl);
+    return;
+  }
+
   const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
   try {
     if (args.runQueue && !args.targetId && !args.conversation) {
@@ -12842,6 +12898,7 @@ module.exports = {
   formatTranscriptEntry,
   parseTranscriptEntries,
   cbError,
+  jobStagingDir,
   targetLeasePath,
   acquireTargetLease,
   releaseTargetLease,
