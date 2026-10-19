@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Local queue integration fixture</title></head>
+<body><main id="turns"></main>
+<form><div id="prompt-textarea" role="textbox" contenteditable="true" style="width:600px;min-height:80px;border:1px solid"></div>
+<button type="submit" data-testid="send-button" aria-label="Send prompt">Send</button></form>
+<script>
+// Deterministic local fixture; this never calls a model or external API.
+const form = document.querySelector('form');
+const composer = document.querySelector('#prompt-textarea');
+let count = 0;
+function turn(role, text) {
+  const container = document.createElement('article');
+  container.dataset.testid = `conversation-turn-${count++}`;
+  container.dataset.turn = role;
+  const message = document.createElement('div');
+  message.dataset.messageAuthorRole = role;
+  message.dataset.messageId = crypto.randomUUID();
+  message.className = 'markdown';
+  message.textContent = text;
+  container.append(message);
+  document.querySelector('#turns').append(container);
+}
+form.addEventListener('submit', event => {
+  event.preventDefault();
+  const text = composer.innerText.trim();
+  if (!text) return;
+  turn('user', text);
+  composer.innerText = '';
+  if (!location.pathname.startsWith('/c/')) history.replaceState({}, '', `/c/${crypto.randomUUID()}`);
+  turn('assistant', `Fixture completed: ${text}`);
+});
+</script></body></html>

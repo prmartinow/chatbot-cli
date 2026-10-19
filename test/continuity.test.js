@@ -7,6 +7,7 @@ const os = require('node:os');
 // Strictly isolate test ledger and outputs to temp dir before CB.js path initialization
 const testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-continuity-tests-'));
 process.env.CHATBOT_TRANSCRIPT_DIR = testIsolationDir;
+process.env.CHATBOT_STATE_DIR = path.join(testIsolationDir, 'scheduler');
 
 test.after(() => {
   try {
@@ -62,6 +63,7 @@ const {
   withBrowserLaneLease,
   takeBrowserLaneLease,
   findTargetAppPage,
+  releasePageBinding,
   targetLeasePath,
   acquireTargetLease,
   releaseTargetLease,
@@ -730,6 +732,7 @@ test('findTargetAppPage: Acquires and assigns browserLaneLease before creating n
     contexts: () => [{
       newPage: async () => ({
         goto: async () => {},
+        url: () => 'https://chatgpt.com/',
     reload: async () => {},
     bringToFront: async () => {},
     waitForLoadState: async () => {},
@@ -739,6 +742,7 @@ test('findTargetAppPage: Acquires and assigns browserLaneLease before creating n
     newContext: async () => ({
       newPage: async () => ({
         goto: async () => {},
+        url: () => 'https://chatgpt.com/',
     reload: async () => {},
     bringToFront: async () => {},
     waitForLoadState: async () => {},
@@ -785,6 +789,7 @@ test('findTargetAppPage: Acquires browserLaneLease for fallback page creation wh
       pages: () => [],
       newPage: async () => ({
         goto: async () => {},
+        url: () => 'https://chatgpt.com/',
     reload: async () => {},
     bringToFront: async () => {},
     waitForLoadState: async () => {},
@@ -795,6 +800,7 @@ test('findTargetAppPage: Acquires browserLaneLease for fallback page creation wh
       pages: () => [],
       newPage: async () => ({
         goto: async () => {},
+        url: () => 'https://chatgpt.com/',
     reload: async () => {},
     bringToFront: async () => {},
     waitForLoadState: async () => {},
@@ -4155,6 +4161,7 @@ test('findTargetAppPage: allocates dedicated page when requested conversation is
   assert.ok(page);
   // Must NOT steal tab 11111111! Must create dedicated tab navigating to 22222222
   assert.equal(createdUrl, 'https://chatgpt.com/c/22222222-2222-4222-8222-222222222222');
+  releasePageBinding(page);
 });
 
 test('withTopologyLease: enforces mutual exclusion and releases cleanly', async () => {
@@ -4268,6 +4275,7 @@ test('findTargetAppPage: binds args.pageTargetId from page CDP target ID', async
   const page = await findTargetAppPage(mockBrowser, args);
   assert.ok(page);
   assert.equal(args.pageTargetId, 'TARGET-BOUND-1');
+  releasePageBinding(page);
 });
 
 test('findTargetAppPage: fails closed with PAGE_TARGET_ID_UNVERIFIED when page target ID cannot be derived', async () => {
@@ -4480,13 +4488,14 @@ test('branchWithContextCarryForward: rejects if payload cannot be resolved from 
   );
 });
 
-test('routeSessionIdFromUrl: normalizes local-chatgpt: prefix to stable UUID while preserving WEB: prefix', () => {
+test('routeSessionIdFromUrl: preserves provisional prefixes and excludes them from stable identity', () => {
   const localUrl = 'https://chatgpt.com/c/local-chatgpt%3A5418843d-ee1e-4461-926f-78c7a8a5ef5a';
   const webUrl = 'https://chatgpt.com/c/WEB:5418843d-ee1e-4461-926f-78c7a8a5ef5a';
   const plainUrl = 'https://chatgpt.com/c/5418843d-ee1e-4461-926f-78c7a8a5ef5a';
 
-  assert.equal(routeSessionIdFromUrl(localUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
-  assert.equal(sessionIdFromUrl(localUrl), '5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+  assert.equal(routeSessionIdFromUrl(localUrl), 'local-chatgpt:5418843d-ee1e-4461-926f-78c7a8a5ef5a');
+  assert.equal(sessionIdFromUrl(localUrl), '');
+  assert.equal(isEphemeralRouteId(routeSessionIdFromUrl(localUrl)), true);
 
   assert.equal(routeSessionIdFromUrl(webUrl), 'WEB:5418843d-ee1e-4461-926f-78c7a8a5ef5a');
   assert.equal(sessionIdFromUrl(webUrl), '');
@@ -5830,7 +5839,7 @@ test('computeJobSerializationKey: resolves streamId, alias, newchat, and custom 
   const key1 = computeJobSerializationKey({
     target: { sessionId: '11111111-1111-4111-8111-111111111111' },
   }, index);
-  assert.equal(key1, 'convstream:stream-res-42');
+  assert.equal(key1, 'convstream:11111111-1111-4111-8111-111111111111');
 
   // Direct sessionId without streamId in index falls back to sessionId
   const key2 = computeJobSerializationKey({
@@ -5842,7 +5851,7 @@ test('computeJobSerializationKey: resolves streamId, alias, newchat, and custom 
   const key3 = computeJobSerializationKey({
     target: { alias: 'res-alias' },
   }, index);
-  assert.equal(key3, 'convstream:stream-res-42');
+  assert.equal(key3, key1, 'aliases and UUIDs must share the same durable domain');
 
   // Unmapped alias
   const key4 = computeJobSerializationKey({
@@ -5989,7 +5998,7 @@ test('Queue v2: Non-blocking parallel lane dispatching preserves FIFO per lane a
   assert.equal(blocked, null);
 
   // Verify transition to running under claimToken
-  const runningJob = markJobRunning(claimedJob.id, claimedJob.claim.token);
+  const runningJob = markJobRunning(claimedJob.id, claimedJob.claim);
   assert.equal(runningJob.status, 'running');
 
   // Verify second worker cannot claim anything now (thread-A active, thread-B active)
@@ -6004,7 +6013,7 @@ test('finishScheduledJob: protects against split-brain execution using fencing t
         id: 'job-fence-test',
         seq: 10,
         status: 'running',
-        claim: { workerId: 'worker-1', token: 'claim-valid-token', fence: 2 },
+        claim: { workerId: 'worker-1', token: 'claim-valid-token', fence: 2, pid: process.pid },
       },
     ],
   };
@@ -6017,7 +6026,7 @@ test('finishScheduledJob: protects against split-brain execution using fencing t
   );
 
   // Valid claim token succeeds
-  const finished = finishScheduledJob('job-fence-test', { status: 'done', result: { test: true } }, 'job_completed', 'claim-valid-token');
+  const finished = finishScheduledJob('job-fence-test', { status: 'done', result: { test: true } }, 'job_completed', 'claim-valid-token', 2);
   assert.equal(finished.status, 'done');
   assert.equal(finished.result?.test, true);
 });

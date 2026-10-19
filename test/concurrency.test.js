@@ -8,6 +8,7 @@ const { fork } = require('node:child_process');
 // Strictly isolate test ledger to temp directory
 const testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-concurrency-tests-'));
 process.env.CHATBOT_TRANSCRIPT_DIR = testIsolationDir;
+process.env.CHATBOT_STATE_DIR = path.join(testIsolationDir, 'scheduler');
 
 test.after(() => {
   try {
@@ -73,7 +74,7 @@ test('Multi-process: Concurrent workers claim distinct lanes without head-of-lin
     const workerId = process.argv[2];
     const { job, blocked } = takeNextScheduledJob({ workerId });
     if (job) {
-      markJobRunning(job.id, job.claim.token);
+      markJobRunning(job.id, job.claim);
       process.send({ success: true, job });
     } else {
       process.send({ success: false, blocked });
@@ -111,7 +112,7 @@ test('Multi-process: Concurrent workers claim distinct lanes without head-of-lin
   assert.equal(jobA2.status, 'pending');
 });
 
-test('Multi-process: Strict FIFO execution per serialization key under concurrent children', async () => {
+test('Scheduler: Strict FIFO execution per serialization key', async () => {
   const queue = {
     jobs: [
       {
@@ -137,20 +138,21 @@ test('Multi-process: Strict FIFO execution per serialization key under concurren
   // Claim first job
   const { job: job1 } = takeNextScheduledJob({ workerId: 'worker-fifo-1' });
   assert.equal(job1.id, 'job-fifo-1');
-  markJobRunning(job1.id, job1.claim.token);
+  markJobRunning(job1.id, job1.claim);
 
   // Second worker tries to claim immediately
   const { job: job2Blocked } = takeNextScheduledJob({ workerId: 'worker-fifo-2' });
   assert.equal(job2Blocked, null, 'Second job on same serialization key must NOT be claimable while first is running');
 
   // Finish first job
-  finishScheduledJob(job1.id, { status: 'done' }, 'job_completed', job1.claim.token);
+  finishScheduledJob(job1.id, { status: 'done' }, 'job_completed', job1.claim);
 
   // Second worker can now claim job 2
   const { job: job2Claimed } = takeNextScheduledJob({ workerId: 'worker-fifo-2' });
   assert.ok(job2Claimed);
   assert.equal(job2Claimed.id, 'job-fifo-2');
-  finishScheduledJob(job2Claimed.id, { status: 'done' }, 'job_completed', job2Claimed.claim.token);
+  markJobRunning(job2Claimed.id, job2Claimed.claim);
+  finishScheduledJob(job2Claimed.id, { status: 'done' }, 'job_completed', job2Claimed.claim);
 });
 
 test('Multi-process: Child SIGKILL cleanly allows subsequent worker to reclaim target lease', async () => {

@@ -44,9 +44,59 @@ taking over an already-running conversation:
 node CB.js --cdp http://127.0.0.1:9241 --new-tab --new-conversation --message "hello"
 ```
 
+## Concurrent workers and exact tab ownership
+
+Discover targets without activating, navigating, or attaching automation to every page:
+
+```bash
+node CB.js --cdp "$CDP_ENDPOINT" --list-targets
+node CB.js --cdp "$CDP_ENDPOINT" --target-id "$TARGET_ID" --status --state-jsonl
+node CB.js --cdp "$CDP_ENDPOINT" --target-id "$TARGET_ID" --conversation "$SESSION_ID" --message "Follow up"
+```
+
+Discovery returns the browser instance, physical target IDs, window IDs, URLs and titles.
+Use `--window-id <number>` as an additional assertion, not a focus selector. CDP operates
+on the owned target even when an unrelated tab is selected. CB does not select the first
+open tab as a fallback. `--conversation current` is rejected if multiple app tabs qualify;
+use an exact target ID, and optionally a conversation UUID to check both identities.
+
+- Physical target ownership lasts through allocation, execution, transcript publication
+  and cleanup. Reads also acquire ownership and return a busy error if another CB process
+  owns the target; they cannot commandeer an active writer's tab.
+- Logical conversation leases serialize the same conversation across different profiles
+  and CDP endpoints. Independent conversations can run on separate tabs concurrently.
+- Unbound prompts allocate their own tabs; existing unrelated tabs are not repurposed.
+- Queue workers claim the head of each conversation stream before filtering lane/CDP
+  affinity. Each transition requires the claim token **and** fence. A dead pre-dispatch
+  claimant can be reclaimed; a dead running worker is held for recovery, never blindly resent.
+- All cooperating workers must share `CHATBOT_STATE_DIR` (legacy alias:
+  `CHATBOT_LEDGER_DIR`). The default is the installation's `outputs/scheduler`, independent
+  of `CHATBOT_TRANSCRIPT_DIR`. Different state directories are isolated schedulers and do
+  **not** coordinate ownership. Use the same CDP endpoint spelling for a browser rather
+  than alternate proxies to it. This is a single-host, local-filesystem protocol.
+  Scheduler locking requires Linux/util-linux `flock`; the guard inode is persistent
+  and must not be deleted while workers run. Stop old-version workers before upgrading
+  (do not mix locking protocols). Kernel ownership releases automatically on process death;
+  malformed legacy lock metadata fails closed rather than being guessed stale.
+- Unpinned `--recover-queue` repairs only local ledgers. Browser recovery requires an explicit
+  conversation or target. Divergent transcript sync preserves the canonical file and emits
+  `TRANSCRIPT_DIVERGENCE` with a separate reconciliation candidate. Staged publication is
+  atomic and refuses to overwrite a canonical history it does not extend.
+
+Run regressions with `npm test`. The disposable two-profile browser test is opt-in:
+
+```bash
+CB_TEST_CHROMIUM_PATH=/path/to/chromium npm test
+```
+
+It uses local fixture pages, temporary profiles, separate windows, and child processes;
+no logged-in browser or external chat is needed. An unset executable skips that test.
+
 ## Commands
 
-Inspect the current target app page:
+For commands operating on an existing page below, append `--target-id "$TARGET_ID"`
+from discovery (or `--conversation "$SESSION_ID"` for an unambiguous conversation).
+Unpinned inspection fails closed rather than guessing the current tab.
 
 ```bash
 node CB.js --status

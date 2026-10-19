@@ -28,7 +28,7 @@ const TARGET_APP_BASE_URL = normalizeTargetAppUrl(process.env.CHATBOT_WEB_URL ||
 const TARGET_APP_BASE = new URL(TARGET_APP_BASE_URL);
 const CDP_CONNECT_TIMEOUT_MS = Number(process.env.CHATBOT_CDP_CONNECT_TIMEOUT_MS || 60000);
 const STABLE_SESSION_ID_RE = /^[a-f0-9-]{20,}$/i;
-const ROUTE_SESSION_ID_RE = /^(?:WEB:)?[a-f0-9-]{20,}$/i;
+const ROUTE_SESSION_ID_RE = /^(?:(?:WEB|local-chatgpt):)?[a-f0-9-]{20,}$/i;
 const SESSION_ID_RE = STABLE_SESSION_ID_RE;
 const PASTE_SETTLE_MS = 1000;
 
@@ -56,7 +56,7 @@ const SEARCH_BOTTOM_CONFIRMATIONS_REQUIRED = 2;
 const SEARCH_BOTTOM_CONFIRMATION_MAX_PROBES = 6;
 const SEARCH_ALL_MAX_SCROLLS = 60;
 const ARTIFACT_ROOT = path.join(OUTPUT_DIR, 'artifacts');
-const SCHEDULER_DIR = path.join(OUTPUT_DIR, 'scheduler');
+const SCHEDULER_DIR = process.env.CHATBOT_STATE_DIR || process.env.CHATBOT_LEDGER_DIR || path.join(APP_DIR, 'outputs', 'scheduler');
 const QUEUE_STATE_PATH = path.join(SCHEDULER_DIR, 'queue.json');
 const QUEUE_EVENTS_PATH = path.join(SCHEDULER_DIR, 'queue.jsonl');
 const CONVERSATION_INDEX_PATH = path.join(SCHEDULER_DIR, 'conversation-index.json');
@@ -318,6 +318,8 @@ function parseArgs(argv) {
     lane: '',
     targetId: '',
     workerId: '',
+    listTargets: false,
+    windowId: null,
     autoRecover: false,
     downloadArtifacts: false,
     showArtifacts: false,
@@ -405,6 +407,8 @@ function parseArgs(argv) {
     else if (arg === '--lane') args.lane = next();
     else if (arg === '--target-id') args.targetId = next();
     else if (arg === '--worker-id') args.workerId = next();
+    else if (arg === '--list-targets') args.listTargets = true;
+    else if (arg === '--window-id') args.windowId = Number(next());
     else if (arg === '--edit-suffix') args.editSuffix = next();
     else if (arg === '--recover-interrupted') args.recoverInterrupted = true;
     else if (arg === '--download-artifacts') args.downloadArtifacts = true;
@@ -717,6 +721,15 @@ async function getBranchInfo(page, index = null) {
 }
 
 async function syncTranscriptFromPage(page, args, options = {}) {
+  const sessionId = args.expectedSessionId || sessionIdFromUrl(page.url());
+  const lease = sessionId ? takeConversationLease(args, sessionId, randomId('sync-transcript')) : null;
+  const previous = args._activeConversationLease;
+  if (lease) args._activeConversationLease = lease;
+  try { return await syncTranscriptUnderLease(page, args, options); }
+  finally { args._activeConversationLease = previous; releaseConversationLease(lease); }
+}
+
+async function syncTranscriptUnderLease(page, args, options = {}) {
   if (args.expectedSessionId) {
     await assertThreadIdentity(page, args.expectedSessionId, 'before transcript synchronization');
     if (!args.transcriptOverride) {
@@ -788,36 +801,23 @@ async function syncTranscriptFromPage(page, args, options = {}) {
       turns = postDividerTurns;
     } else {
       info('[sync] Known post-divider turn IDs are not yet rendered in live DOM; pausing sync until mounted.');
-      return { appended: 0, total: entries.length, skipped };
+      return { transcript: args.transcript, sessionId: sessionIdFromUrl(page.url()), appended: [], total: entries.length, skipped };
     }
   }
 
-  let startIndex = findTranscriptSyncStart(entries, turns);
-
-  if (startIndex === -1) {
-    const stale = args.transcript;
-    try {
-      const reconDir = path.join(path.dirname(stale), 'reconciliation');
-      fs.mkdirSync(reconDir, { recursive: true });
-      const candidatePath = path.join(reconDir, `${path.basename(stale, '.txt')}.${nowIso().replace(/[:.]/g, '-')}.candidate.txt`);
-      fs.writeFileSync(candidatePath, turns.map((t) => formatTranscriptEntry(t.role, t.text)).join('\n\n') + '\n', 'utf8');
-      info(`[sync] TRANSCRIPT_DIVERGENCE recorded -> candidate preserved at ${path.basename(candidatePath)}`);
-    } catch (divErr) {
-      warn(`[sync] Could not record divergence candidate: ${divErr.message}`);
-    }
-
-    const quarantined = `${stale}.stale-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    try {
-      fs.renameSync(stale, quarantined);
-      info(`[sync] Quarantined stale transcript ${path.basename(stale)} -> ${path.basename(quarantined)}`);
-      ensureTranscript(args.transcript);
-      entries = [];
-      startIndex = 0;
-    } catch (error) {
-      warn(`[sync] Failed to quarantine stale transcript: ${error.message}`);
-      return { appended: 0, total: entries.length, skipped };
-    }
+  const currentText = fs.readFileSync(args.transcript, 'utf8');
+  const startIndex = findTranscriptSyncStart(entries, turns);
+  if (startIndex === -1 || currentText !== transcriptText) {
+    const reconDir = path.join(path.dirname(args.transcript), 'reconciliation');
+    fs.mkdirSync(reconDir, { recursive: true });
+    const candidatePath = path.join(reconDir, `${path.basename(args.transcript)}.${randomId('candidate')}.txt`);
+    fs.writeFileSync(candidatePath, turns.map(t => formatTranscriptEntry(t.role, t.text)).join(''), { flag: 'wx' });
+    return { transcript: args.transcript, sessionId: sessionIdFromUrl(page.url()), turnCount: turns.length, appended: [], skipped,
+      divergence: { code: 'TRANSCRIPT_DIVERGENCE', reason: currentText !== transcriptText ? 'version_changed' : 'no_overlap',
+        candidatePath, canonicalEntriesCount: entries.length, pageTurnsCount: turns.length } };
   }
+  if (args._activeConversationLease) assertLeaseCurrent(args._activeConversationLease);
+  if (args.jobId && args.jobClaim) assertJobClaimCurrent(args.jobId, args.jobClaim);
 
   const appended = [];
   for (const turn of turns.slice(startIndex)) {
@@ -858,7 +858,7 @@ function routeSessionIdFromUrl(url) {
     const cIndex = parts.indexOf('c');
     if (cIndex !== -1 && parts[cIndex + 1]) {
       const decoded = decodeURIComponent(parts[cIndex + 1]);
-      if (/^WEB:[a-f0-9-]{20,}$/i.test(decoded)) {
+      if (/^(?:WEB:|local-chatgpt:)[a-f0-9-]{20,}$/i.test(decoded)) {
         return decoded;
       }
       const match = decoded.match(/^(?:local-chatgpt:)?([a-f0-9-]{20,})$/i);
@@ -884,7 +884,7 @@ function extractConversationId(val) {
 }
 
 function isEphemeralRouteId(id) {
-  return /^WEB:/i.test(String(id || ''));
+  return /^(?:WEB:|local-chatgpt:)/i.test(String(id || ''));
 }
 
 function isCanonicalTargetRoot(rawUrl, targetBase = TARGET_APP_BASE) {
@@ -949,7 +949,9 @@ function refreshSessionTranscript(page, args) {
   if (args.transcriptOverride) return args.transcript;
 
   const sessionId = sessionIdFromUrl(page.url());
-  const nextTranscript = transcriptPathForSession(sessionId);
+  if (!sessionId && !args._stagingId) args._stagingId = args.jobId || randomId('unbound');
+  const nextTranscript = sessionId ? transcriptPathForSession(sessionId)
+    : path.join(jobStagingDir(args._stagingId), 'transcript.pending.txt');
 
   if (args.transcript !== nextTranscript) {
     args.transcript = nextTranscript;
@@ -1046,6 +1048,7 @@ function bootstrapLeaseKey(args) {
     'new-chat-v1',
     TARGET_APP_BASE.origin,
     normalizedCdp,
+    args?.pageTargetId || args?.targetId || 'unbound',
   ].join('|');
 
   return crypto
@@ -1113,46 +1116,20 @@ function conversationLeasePath(cdpUrl, conversationId) {
 }
 
 function acquireNamedLease(leasePath, payload, busyCode, busyMessage) {
-  fs.mkdirSync(path.dirname(leasePath), { recursive: true });
-  const token = randomId('lease');
-  const next = {
-    ...payload,
-    pid: process.pid,
-    startTime: getProcessStartTime(process.pid),
-    token,
-    createdAt: nowIso(),
-  };
-
   return withSchedulerLock(() => {
-    try {
-      const fd = fs.openSync(leasePath, 'wx');
-      fs.writeFileSync(fd, JSON.stringify(next, null, 2), 'utf8');
-      fs.closeSync(fd);
-      return { leasePath, token };
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      let current = null;
-      try {
-        current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
-      } catch {}
-
-      const isDead = current?.pid && !processExists(current.pid);
-      const isRecycled = current?.pid && current?.startTime && getProcessStartTime(current.pid) && current.startTime !== getProcessStartTime(current.pid);
-      if (isDead || isRecycled) {
-        fs.writeFileSync(leasePath, JSON.stringify(next, null, 2), 'utf8');
-        return { leasePath, token };
-      }
-
-      const holderPid = current?.pid || 'unknown';
-      throw cbError(
-        busyCode,
-        busyMessage || `Lease is held by active process ${holderPid}`,
-        {
-          holderPid,
-          leasePath,
-        }
-      );
+    fs.mkdirSync(path.dirname(leasePath), { recursive: true });
+    const current = readJsonFile(leasePath, null);
+    if (current && (!current.pid || isProcessAlive(Number(current.pid), current.startTime))) {
+      throw cbError(busyCode, busyMessage || 'Resource is owned by another process', { holderPid: current.pid, leasePath });
     }
+    const epochPath = `${leasePath}.epoch`;
+    const fence = Math.max(Number(readJsonFile(epochPath, { fence: 0 }).fence || 0), Number(current?.fence || 0)) + 1;
+    atomicWriteJson(epochPath, { fence });
+    const token = randomId('lease');
+    const next = { ...payload, pid: process.pid, startTime: getProcessStartTime(process.pid), token, fence,
+      createdAt: nowIso(), heartbeatAt: nowIso() };
+    atomicWriteJson(leasePath, next);
+    return { leasePath, token, fence, sessionId: payload.sessionId || payload.conversationId || '' };
   });
 }
 
@@ -1268,6 +1245,11 @@ function releaseBrowserLaneLease(leaseHandle) {
 }
 
 function takeBrowserLaneLease(args, operationId) {
+  const binding = args._pageBinding;
+  if (binding && !binding.released && binding.targetId === (args.pageTargetId || args.targetId)) {
+    assertLeaseCurrent(binding.targetLease);
+    return { ...binding.targetLease, borrowed: true };
+  }
   if (args._laneLease) {
     const lease = args._laneLease;
     args._laneLease = null;
@@ -1317,13 +1299,15 @@ function acquireConversationLease(sessionId, roundId) {
 }
 
 function releaseConversationLease(leaseHandle) {
+  if (leaseHandle?.borrowed) return;
+  if (leaseHandle?._ownerArgs?._activeConversationLease === leaseHandle) leaseHandle._ownerArgs._activeConversationLease = null;
   if (!leaseHandle?.leasePath || !leaseHandle?.token) return;
   const { leasePath, token } = leaseHandle;
   return withSchedulerLock(() => {
     try {
       if (fs.existsSync(leasePath)) {
         const current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
-        if (current.token === token) {
+        if (current.token === token && current.fence === leaseHandle.fence) {
           fs.unlinkSync(leasePath);
         }
       }
@@ -1341,34 +1325,64 @@ function processExists(pid) {
   }
 }
 
-function acquireSchedulerLock() {
-  ensureSchedulerDir();
-  try {
-    const fd = fs.openSync(SCHEDULER_LOCK_PATH, 'wx');
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: nowIso() }), 'utf8');
-    return () => {
-      try { fs.closeSync(fd); } catch {}
-      try { fs.unlinkSync(SCHEDULER_LOCK_PATH); } catch {}
-    };
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    let stale = false;
-    try {
-      const lock = JSON.parse(fs.readFileSync(SCHEDULER_LOCK_PATH, 'utf8'));
-      stale = !processExists(Number(lock.pid));
-    } catch {
-      stale = true;
+function isProcessAlive(pid, startTime = null) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  if (!processExists(pid)) return false;
+  if (startTime) {
+    const currentStartTime = getProcessStartTime(pid);
+    if (currentStartTime && currentStartTime !== startTime) {
+      return false;
     }
-    if (!stale) {
-      throw new Error(`Scheduler state is locked by another CB process (${SCHEDULER_LOCK_PATH})`);
-    }
-    fs.unlinkSync(SCHEDULER_LOCK_PATH);
-    return acquireSchedulerLock();
   }
+  return true;
 }
 
-function withSchedulerLock(fn) {
-  const release = acquireSchedulerLock();
+function acquireSchedulerLock(options = {}) {
+  ensureSchedulerDir();
+  const timeoutMs = options.timeoutMs ?? 5000;
+  // flock belongs to the open file description inherited by the helper. The
+  // parent retains that description; close/SIGKILL releases it in the kernel.
+  // Never unlink this guard inode, including during stale metadata recovery.
+  const fd = fs.openSync(`${SCHEDULER_LOCK_PATH}.guard`, 'a+', 0o600);
+  const token = randomId('schedlock');
+  const data = { pid: process.pid, startTime: getProcessStartTime(process.pid), token, at: nowIso() };
+  let handedOff = false;
+  try {
+    const result = require('node:child_process').spawnSync('flock', ['-w', String(timeoutMs / 1000), '3'], {
+      stdio: ['ignore', 'ignore', 'pipe', fd], timeout: timeoutMs + 1000,
+    });
+    if (result.error || (result.status !== 0 && result.status !== 1)) {
+      throw cbError('SCHEDULER_LOCK_UNAVAILABLE', 'Scheduler requires util-linux flock and a local shared state directory');
+    }
+    if (result.status !== 0) throw cbError('SCHEDULER_LOCK_BUSY', 'Scheduler state is locked by another CB process');
+    // Legacy metadata with unknown/live ownership fails closed. Stop all old
+    // workers before upgrading; do not mix locking protocol versions.
+    const deadline = Date.now() + timeoutMs;
+    while (fs.existsSync(SCHEDULER_LOCK_PATH)) {
+      let owner = null;
+      try { owner = readJsonFile(SCHEDULER_LOCK_PATH, null); } catch {}
+      if (owner?.pid && !isProcessAlive(Number(owner.pid), owner.startTime)) break;
+      if (Date.now() >= deadline) throw cbError('SCHEDULER_LOCK_BUSY', 'Scheduler state is locked by another CB process (legacy or unknown owner)');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, options.retryIntervalMs ?? 20);
+    }
+    atomicWriteJson(SCHEDULER_LOCK_PATH, data);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      try {
+        if (readJsonFile(SCHEDULER_LOCK_PATH, null)?.token === token) fs.unlinkSync(SCHEDULER_LOCK_PATH);
+      } finally { fs.closeSync(fd); }
+    };
+    release.token = token;
+    release.lockData = data;
+    handedOff = true;
+    return release;
+  } finally { if (!handedOff) fs.closeSync(fd); }
+}
+
+function withSchedulerLock(fn, options = {}) {
+  const release = acquireSchedulerLock(options);
   try {
     return fn();
   } finally {
@@ -1442,6 +1456,7 @@ function upsertConversation(index, patch) {
     record = {
       alias,
       sessionId,
+      streamId: sessionRecord?.streamId || randomId('stream'),
       status: sessionId ? 'active' : 'pending',
       createdAt: now,
       updatedAt: now,
@@ -1470,10 +1485,14 @@ function upsertConversation(index, patch) {
     index.conversations = index.conversations.filter((item) => !duplicates.includes(item));
   }
 
+  const resolvedSessionId = sessionId || record.sessionId || '';
+  const streamId = record.streamId || sessionRecord?.streamId || randomId('stream');
+
   Object.assign(record, patch, {
     alias: alias || record.alias || '',
-    sessionId: sessionId || record.sessionId || '',
-    status: patch.status || (sessionId || record.sessionId ? 'active' : 'pending'),
+    sessionId: resolvedSessionId,
+    streamId,
+    status: patch.status || (resolvedSessionId ? 'active' : 'pending'),
     updatedAt: now,
   });
   return record;
@@ -2002,7 +2021,39 @@ function targetDescription(target) {
 }
 
 function jobStagingDir(jobId) {
+  if (!/^[A-Za-z0-9._:-]+$/.test(String(jobId || '')) || jobId === '.' || jobId === '..') throw cbError('INVALID_JOB_ID', 'Invalid staging identifier');
   return path.join(SCHEDULER_DIR, 'staging', jobId);
+}
+
+function publishStagedTranscript(stagedPath, canonicalPath, sessionId, args = {}) {
+  if (!STABLE_SESSION_ID_RE.test(sessionId || '')) throw cbError('NEW_SESSION_ID_UNCERTAIN', 'Publication requires stable session attestation');
+  const lease = takeConversationLease(args, sessionId, randomId('publish'));
+  let temporary = '';
+  try {
+    assertLeaseCurrent(lease);
+    if (args.jobId && args.jobClaim) assertJobClaimCurrent(args.jobId, args.jobClaim);
+    const staged = fs.readFileSync(stagedPath, 'utf8');
+    const canonical = fs.existsSync(canonicalPath) ? fs.readFileSync(canonicalPath, 'utf8') : '';
+    if (canonical === staged) return { published: true, updated: false };
+    const oldEntries = parseTranscriptEntries(canonical);
+    const newEntries = parseTranscriptEntries(staged);
+    if (!newEntries.length || oldEntries.some((entry, i) => !newEntries[i] || entry.role !== newEntries[i].role || normalizeTurnText(entry.text) !== normalizeTurnText(newEntries[i].text))) {
+      throw cbError('TRANSCRIPT_DIVERGENCE', 'Staged transcript does not extend the canonical history');
+    }
+    fs.mkdirSync(path.dirname(canonicalPath), { recursive: true });
+    temporary = `${canonicalPath}.${randomId('publish')}.tmp`;
+    fs.writeFileSync(temporary, staged, { flag: 'wx', mode: 0o600 });
+    assertLeaseCurrent(lease);
+    if (args.jobId && args.jobClaim) assertJobClaimCurrent(args.jobId, args.jobClaim);
+    const current = fs.existsSync(canonicalPath) ? fs.readFileSync(canonicalPath, 'utf8') : '';
+    if (current !== canonical) throw cbError('TRANSCRIPT_DIVERGENCE', 'Canonical transcript changed during publication');
+    fs.renameSync(temporary, canonicalPath);
+    temporary = '';
+    return { published: true, updated: true, entriesCount: newEntries.length };
+  } finally {
+    if (temporary && fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    releaseConversationLease(lease);
+  }
 }
 
 function isDoneScheduledJob(job) {
@@ -2010,25 +2061,15 @@ function isDoneScheduledJob(job) {
 }
 
 function computeJobSerializationKey(job, index = null) {
-  if (job?.serializationKey) return job.serializationKey;
   const target = job?.target || {};
-  if (target.sessionId) {
-    const rec = index ? findConversationBySessionId(index, target.sessionId) : null;
-    const streamId = rec?.streamId || target.sessionId;
-    return `convstream:${streamId}`;
-  }
-  if (target.alias) {
-    const rec = index ? findConversationByAlias(index, target.alias) : null;
-    if (rec?.sessionId) {
-      const streamId = rec.streamId || rec.sessionId;
-      return `convstream:${streamId}`;
-    }
-    return `alias:${target.alias}`;
-  }
-  if (target.newConversation) {
-    return `newchat:${job?.id || 'pending'}`;
-  }
-  return `job:${job?.id || 'pending'}`;
+  const alias = target.alias || (job?.serializationKey?.startsWith('alias:') ? job.serializationKey.slice(6) : '');
+  const record = index && ((target.sessionId && findConversationBySessionId(index, target.sessionId))
+    || (alias && findConversationByAlias(index, alias)));
+  if (record?.sessionId || target.sessionId) return `convstream:${record?.sessionId || target.sessionId}`;
+  if (record?.streamId) return `convstream:${record.streamId}`;
+  if (alias) return `alias:${alias}`;
+  if (job?.serializationKey) return job.serializationKey;
+  return target.newConversation ? `newchat:${job.id}` : `job:${job?.id || 'pending'}`;
 }
 
 function enqueueScheduledJob(args, page = null) {
@@ -2215,154 +2256,38 @@ function printQueueStatus(args) {
 }
 
 async function findTargetAppPage(browser, args = {}) {
-  const assignPage = async (page) => {
-    if (page) {
-      const tid = await getPageTargetId(page);
-      if (!tid) {
-        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for selected page');
-      }
-      args.pageTargetId = tid;
-    }
-    return page;
-  };
+  return require('./lib/page-binding').acquirePageBinding(browser, args, {
+    cbError, getPageTargetId, acquireTargetLease, acquireConversationLease,
+    releaseConversationLease, withTopologyLease, normalizeCdpUrl,
+    sessionIdFromUrl, isTargetAppUrl, targetAppUrl, targetConversationUrl,
+    parseConversationRef, loadConversationIndex, randomId, assertLeaseCurrent,
+  });
+}
 
-  if (args.targetId || args.pageTargetId) {
-    const requestedTid = args.targetId || args.pageTargetId;
-    let foundPage = null;
-    for (const candidateContext of browser.contexts()) {
-      for (const p of candidateContext.pages()) {
-        const tid = await getPageTargetId(p);
-        if (tid === requestedTid) {
-          foundPage = p;
-          break;
-        }
-      }
-      if (foundPage) break;
-    }
-    if (!foundPage) {
-      throw cbError('PAGE_TARGET_NOT_FOUND', `No page matches target ID "${requestedTid}"`);
-    }
-    return await assignPage(foundPage);
+function releasePageBinding(binding) {
+  return require('./lib/page-binding').releasePageBinding(binding, releaseConversationLease);
+}
+
+function assertLeaseCurrent(lease) {
+  const current = lease?.leasePath ? readJsonFile(lease.leasePath, null) : null;
+  if (!current || current.token !== lease.token || (lease.fence != null && current.fence !== lease.fence)) {
+    throw cbError('LEASE_LOST', 'Operation no longer owns its resource lease');
   }
+  return lease;
+}
 
-  if (args.newTab) {
-    return await withTopologyLease(args, randomId('new-tab-alloc'), async () => {
-      const context = browser.contexts()[0] || await browser.newContext();
-      const page = await context.newPage();
-      const tid = await getPageTargetId(page);
-      if (!tid) {
-        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for new page');
-      }
-      args.pageTargetId = tid;
-      if (!args._laneLease) {
-        args._laneLease = acquireBrowserLaneLease(args, randomId('new-tab-op'));
-      }
-      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      return page;
-    });
+function takeConversationLease(args, sessionId, operationId) {
+  const binding = args?._pageBinding;
+  const held = binding && !binding.released && binding.conversationId === sessionId
+    ? binding.conversationLease : args?._activeConversationLease;
+  if (held && (held.sessionId === sessionId || binding?.conversationId === sessionId)) {
+    assertLeaseCurrent(held);
+    return { ...held, borrowed: true };
   }
-
-  let expectedId = args.expectedSessionId || args.conversation;
-  let normalizedExpectedId = expectedId ? extractConversationId(expectedId) : null;
-  if (!normalizedExpectedId && expectedId && !isCurrentConversationRef(expectedId)) {
-    try {
-      const index = loadConversationIndex();
-      const rec = findConversationByAlias(index, expectedId);
-      if (rec?.sessionId) {
-        normalizedExpectedId = extractConversationId(rec.sessionId);
-      }
-    } catch {}
-  }
-
-  if (normalizedExpectedId && STABLE_SESSION_ID_RE.test(normalizedExpectedId)) {
-    const matchingPages = [];
-    for (const candidateContext of browser.contexts()) {
-      for (const p of candidateContext.pages()) {
-        if (sessionIdFromUrl(p.url()) === normalizedExpectedId) {
-          matchingPages.push(p);
-        }
-      }
-    }
-    if (matchingPages.length > 1) {
-      throw cbError('PAGE_TARGET_AMBIGUOUS', `Multiple open pages match conversation "${normalizedExpectedId}". Disambiguate with --target-id.`);
-    }
-    if (matchingPages.length === 1) {
-      return await assignPage(matchingPages[0]);
-    }
-    // Dedicated page under topology lease — NEVER hijack another conversation's tab!
-    return await assignPage(await withTopologyLease(args, randomId('dedicated-page-alloc'), async () => {
-      // Re-scan under topology lock using full count check (TOCTOU protection)
-      const matchingUnderLock = [];
-      for (const candidateContext of browser.contexts()) {
-        for (const p of candidateContext.pages()) {
-          if (sessionIdFromUrl(p.url()) === normalizedExpectedId) {
-            matchingUnderLock.push(p);
-          }
-        }
-      }
-      if (matchingUnderLock.length > 1) {
-        throw cbError('PAGE_TARGET_AMBIGUOUS', `Multiple open pages match conversation "${normalizedExpectedId}". Disambiguate with --target-id.`);
-      }
-      if (matchingUnderLock.length === 1) {
-        return matchingUnderLock[0];
-      }
-      const context = browser.contexts()[0] || await browser.newContext();
-      const page = await context.newPage();
-      await page.goto(`${TARGET_APP_BASE.origin}/c/${normalizedExpectedId}`, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      return page;
-    }));
-  }
-
-  let totalOpenPages = 0;
-  for (const candidateContext of browser.contexts()) {
-    totalOpenPages += candidateContext.pages().length;
-  }
-
-  if (totalOpenPages === 0) {
-    return await withTopologyLease(args, randomId('fallback-page-alloc'), async () => {
-      const context = browser.contexts()[0] || await browser.newContext();
-      const page = await context.newPage();
-      const tid = await getPageTargetId(page);
-      if (!tid) {
-        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for fallback page');
-      }
-      args.pageTargetId = tid;
-      if (!args._laneLease) {
-        args._laneLease = acquireBrowserLaneLease(args, randomId('fallback-page-op'));
-      }
-      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      return page;
-    });
-  }
-
-  if (args.message || args.newConversation) {
-    return await withTopologyLease(args, randomId('unpinned-mutation-alloc'), async () => {
-      const context = browser.contexts()[0] || await browser.newContext();
-      const page = await context.newPage();
-      const tid = await getPageTargetId(page);
-      if (!tid) {
-        throw cbError('PAGE_TARGET_ID_UNVERIFIED', 'Could not establish physical CDP target identity for new prompt page');
-      }
-      args.pageTargetId = tid;
-      if (!args._laneLease) {
-        args._laneLease = acquireBrowserLaneLease(args, randomId('unpinned-mutation-op'));
-      }
-      await page.goto(targetAppUrl(), { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      return page;
-    });
-  }
-
-  if (args.conversation && isCurrentConversationRef(args.conversation)) {
-    for (const candidateContext of browser.contexts()) {
-      const page = candidateContext.pages().find((candidate) => isTargetAppUrl(candidate.url()));
-      if (page) return await assignPage(page);
-    }
-  }
-
-  throw cbError(
-    'TARGET_BINDING_REQUIRED',
-    'Unpinned status or inspection requires --target-id or --conversation to prevent attaching to a foreign tab'
-  );
+  const acquired = acquireConversationLease(sessionId, operationId);
+  args._activeConversationLease = acquired;
+  if (acquired) Object.defineProperty(acquired, '_ownerArgs', { value: args });
+  return acquired;
 }
 
 async function getConversationTurns(page) {
@@ -3018,6 +2943,7 @@ async function confirmNewConversationAccepted(page, message, baselineLastTurnId)
 
 async function sendMessage(page, message, baselineLastTurnId = '', options = {}) {
   const { expectedSessionId = '', roundId = '', requireNewChatRoot = false } = options;
+  options.assertOwnership?.();
   if (requireNewChatRoot) {
     assertNewChatBootstrapRoute(page);
   } else if (expectedSessionId) {
@@ -3034,6 +2960,7 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
     if (modal) throw new Error(blockingModalErrorMessage(modal, 'while focusing the composer'));
     throw error;
   }
+  options.assertOwnership?.();
   await page.keyboard.insertText(message);
   await waitForComposerInsertion(page, message);
 
@@ -3081,6 +3008,7 @@ async function sendMessage(page, message, baselineLastTurnId = '', options = {})
       await assertThreadIdentity(page, expectedSessionId, 'immediately before click dispatch');
     }
     await ready.locator.waitFor({ state: 'visible', timeout: 5000 });
+    options.assertOwnership?.();
     await ready.locator.click({ timeout: 5000 });
 
     await page.waitForTimeout(700);
@@ -3927,7 +3855,7 @@ async function getGenerationState(page) {
       if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
       if (/^cancel$/i.test(visibleText.trim())) return false;
 
-      const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+      const turn = button.closest?.('[data-testid^="conversation-turn-"], [data-turn-key]');
       if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
         return false;
       }
@@ -4113,7 +4041,7 @@ async function getTargetAppState(page) {
       if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
       if (/^cancel$/i.test(visibleText.trim())) return false;
 
-      const turn = button.closest?.('[data-testid^="conversation-turn-"]');
+      const turn = button.closest?.('[data-testid^="conversation-turn-"], [data-turn-key]');
       if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
         return false;
       }
@@ -4143,45 +4071,101 @@ async function getTargetAppState(page) {
       ].join(' ')))
       .slice(0, 20);
 
-    const turns = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
-      .map((turn, index) => {
-        const roleEls = roleElsOf(turn);
+    const allContainers = [...document.querySelectorAll('[data-testid^="conversation-turn-"], [data-turn-key]')];
+    const topContainers = allContainers.filter((el, index, arr) => {
+      return !arr.some((other, otherIdx) => otherIdx !== index && other.contains(el));
+    });
+
+    const turns = [];
+    let latestAssistantTurn = null;
+    let latestAssistantText = '';
+    let latestAssistantRoleTexts = [];
+    let turnIdx = 0;
+
+    for (const container of topContainers) {
+      if (container.getAttribute('data-testid')?.startsWith('conversation-turn-')) {
+        const roleEls = roleElsOf(container);
         const role = roleEls[0]?.getAttribute('data-message-author-role')
-          || turn.getAttribute('data-turn')
+          || container.getAttribute('data-turn')
           || '';
         const roleTexts = roleEls.map(textOf).filter(Boolean);
-        const turnText = textOf(turn);
+        const turnText = textOf(container);
         const text = role === 'assistant'
           ? assistantTextOf(roleTexts, turnText)
           : (roleTexts[0] || turnText);
-        const messageId = turn.getAttribute('data-message-id')
+        const messageId = container.getAttribute('data-message-id')
           || roleEls.find((el) => el.getAttribute('data-message-id'))?.getAttribute('data-message-id')
-          || turn.querySelector('[data-message-id]')?.getAttribute('data-message-id')
+          || container.querySelector('[data-message-id]')?.getAttribute('data-message-id')
           || '';
-        return {
-          index,
-          testid: turn.getAttribute('data-testid') || '',
-          messageId,
-          role,
-          text,
-          roleNodeCount: roleTexts.length,
-        };
-      })
-      .filter((turn) => turn.role || turn.text);
-
-    const latestAssistantTurn = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')]
-      .reverse()
-      .find((turn) => {
-        const roleEls = roleElsOf(turn);
-        const role = roleEls[0]?.getAttribute('data-message-author-role')
-          || turn.getAttribute('data-turn')
-          || '';
-        return role === 'assistant';
-      });
+        if (role || text) {
+          turns.push({
+            index: turnIdx++,
+            testid: container.getAttribute('data-testid') || '',
+            messageId,
+            role,
+            text,
+            roleNodeCount: roleTexts.length,
+          });
+          if (role === 'assistant') {
+            latestAssistantTurn = container;
+            latestAssistantRoleTexts = roleTexts;
+            latestAssistantText = text;
+          }
+        }
+      } else if (container.hasAttribute('data-turn-key')) {
+        const turnKey = container.getAttribute('data-turn-key') || '';
+        const userUnit = container.querySelector('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"], [data-user-message-bubble="true"]');
+        const explicitAssts = [...container.querySelectorAll('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"], [data-message-author-role="assistant"], [data-turn="assistant"]')]
+          .filter((u) => !userUnit || (!userUnit.contains(u) && !u.contains(userUnit)));
+        let asstUnit = null;
+        if (explicitAssts.length === 1) {
+          asstUnit = explicitAssts[0];
+        } else if (explicitAssts.length > 1) {
+          const isReasoning = (u) => {
+            const pattern = /thought|reasoning|thinking|panel-content/i;
+            const testid = u.getAttribute('data-testid') || '';
+            const cls = u.className || '';
+            const key = u.getAttribute('data-chatgpt-search-unit-key') || '';
+            if (pattern.test(testid) || pattern.test(cls) || pattern.test(key)) return true;
+            return Boolean(u.querySelector('[data-testid*="thought" i], [class*="thought" i], [data-testid*="reasoning" i], [class*="reasoning" i], [data-testid*="thinking" i]'));
+          };
+          const nonReasoning = explicitAssts.filter((u) => !isReasoning(u));
+          if (nonReasoning.length === 1) {
+            asstUnit = nonReasoning[0];
+          } else if (nonReasoning.length > 1) {
+            const markdownAnswers = nonReasoning.filter((u) => u.matches('div.markdown, [data-message-author-role="assistant"]') || u.querySelector('div.markdown'));
+            asstUnit = markdownAnswers.length === 1 ? markdownAnswers[0] : nonReasoning[nonReasoning.length - 1];
+          }
+        }
+        const userText = textOf(userUnit);
+        const asstText = textOf(asstUnit);
+        if (userText) {
+          turns.push({
+            index: turnIdx++,
+            testid: `user-${turnKey}`,
+            messageId: userUnit?.getAttribute('data-message-id') || '',
+            role: 'user',
+            text: userText,
+            roleNodeCount: 1,
+          });
+        }
+        if (asstText) {
+          turns.push({
+            index: turnIdx++,
+            testid: `asst-${turnKey}`,
+            messageId: asstUnit?.getAttribute('data-message-id') || '',
+            role: 'assistant',
+            text: asstText,
+            roleNodeCount: 1,
+          });
+          latestAssistantTurn = asstUnit || container;
+          latestAssistantRoleTexts = [asstText];
+          latestAssistantText = asstText;
+        }
+      }
+    }
 
     const scoped = latestAssistantTurn;
-    const latestAssistantRoleTexts = latestAssistantTurn ? roleElsOf(latestAssistantTurn).map(textOf).filter(Boolean) : [];
-    const latestAssistantText = latestAssistantTurn ? assistantTextOf(latestAssistantRoleTexts, textOf(latestAssistantTurn)) : '';
     const seenImageSrcs = new Set();
     const links = scoped
       ? [...scoped.querySelectorAll('a[href]')]
@@ -4283,8 +4267,9 @@ async function getTargetAppState(page) {
       sendButton: centerPointBlocker(sendButton, 'send button'),
     };
 
-    const activityTexts = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *')]
+    const activityTexts = [...document.querySelectorAll('main *, [data-testid^="conversation-turn-"] *, [data-turn-key] *')]
       .filter((el) => isVisible(el) && (!composerRoot || !composerRoot.contains(el)))
+      .filter((el) => !el.closest('.markdown, [data-message-author-role], [data-user-message-bubble="true"], pre, code') && !el.querySelector('.markdown, [data-message-author-role], [data-user-message-bubble="true"]'))
       .map(textOf)
       .filter((text) => text && text.length <= 180)
       .filter((text) => !/thinking effort/i.test(text))
@@ -7044,7 +7029,7 @@ async function waitForConversationHydration(page, sessionId, timeoutMs = CONVERS
         const cIndex = parts.indexOf('c');
         if (cIndex === -1 || !parts[cIndex + 1]) return '';
         const decoded = decodeURIComponent(parts[cIndex + 1]);
-        if (/^WEB:[a-f0-9-]{20,}$/i.test(decoded)) {
+        if (/^(?:WEB:|local-chatgpt:)[a-f0-9-]{20,}$/i.test(decoded)) {
           return decoded;
         }
         const m = decoded.match(/^(?:local-chatgpt:)?([a-f0-9-]{20,})$/i);
@@ -8206,7 +8191,7 @@ async function retryEditTurn(page, args) {
 
   const action = async () => {
     const provisionalRoundId = randomId('round-edit');
-    const leaseHandle = await acquireConversationLease(expectedSessionId, provisionalRoundId);
+    const leaseHandle = await takeConversationLease(args, expectedSessionId, provisionalRoundId);
 
     let round = null;
     let localDispatchState = 'unregistered';
@@ -8594,45 +8579,15 @@ function recoveryIncidentLeasePath(incidentId) {
   return path.join(RECOVERY_LEASES_DIR, `${incidentId}.lock`);
 }
 
-async function acquireRecoveryIncidentLease(incidentId, token = randomId('incident-lease')) {
-  fs.mkdirSync(RECOVERY_LEASES_DIR, { recursive: true });
-  const leasePath = recoveryIncidentLeasePath(incidentId);
-
-  return withSchedulerLock(() => {
-    if (fs.existsSync(leasePath)) {
-      try {
-        const current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
-        if (current.pid && processExists(current.pid) && current.token !== token) {
-          throw cbError('INCIDENT_BUSY', `Recovery incident ${incidentId} is currently held by active PID ${current.pid}`);
-        }
-      } catch (err) {
-        if (err.code === 'INCIDENT_BUSY') throw err;
-      }
-    }
-    const payload = {
-      incidentId,
-      token,
-      pid: process.pid,
-      acquiredAt: nowIso(),
-    };
-    atomicWriteJson(leasePath, payload);
-    return { incidentId, token, leasePath };
-  });
+async function acquireRecoveryIncidentLease(incidentId) {
+  normalizeAlias(incidentId, 'recovery incident');
+  const lease = acquireNamedLease(recoveryIncidentLeasePath(incidentId),
+    { kind: 'recovery_incident', incidentId }, 'INCIDENT_BUSY', `Recovery incident ${incidentId} is already owned`);
+  return { ...lease, incidentId };
 }
 
 function releaseRecoveryIncidentLease(leaseHandle) {
-  if (!leaseHandle?.leasePath || !leaseHandle?.token) return;
-  const { leasePath, token } = leaseHandle;
-  return withSchedulerLock(() => {
-    try {
-      if (fs.existsSync(leasePath)) {
-        const current = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
-        if (current.token === token) {
-          fs.unlinkSync(leasePath);
-        }
-      }
-    } catch {}
-  });
+  return releaseConversationLease(leaseHandle);
 }
 
 async function captureAndFreezeSourcePrompt(page, sourceUserTurn, incidentId) {
@@ -8723,7 +8678,7 @@ async function autoRecoverConversationTurn(page, args) {
     } else {
       const provisionalId = randomId('incident-init');
       await withBrowserLaneLease(args, provisionalId, async () => {
-        const convLease = await acquireConversationLease(expectedParentSessionId, provisionalId);
+        const convLease = await takeConversationLease(args, expectedParentSessionId, provisionalId);
         try {
           await assertThreadIdentity(page, expectedParentSessionId, 'before auto-recovery initialization');
           await syncTranscriptFromPage(page, args);
@@ -8768,7 +8723,7 @@ async function autoRecoverConversationTurn(page, args) {
           return { incident, state: 'completed_stage1', sessionId: incident.parentSessionId, responseText: existingRound.responseText };
         }
 
-        const convLease = await acquireConversationLease(expectedParentSessionId, randomId('stage1-recon'));
+        const convLease = await takeConversationLease(args, expectedParentSessionId, randomId('stage1-recon'));
         let recon;
         try {
           recon = await withBrowserLaneLease(args, randomId('stage1-recon-lane'), async () => {
@@ -8920,7 +8875,7 @@ async function autoRecoverConversationTurn(page, args) {
         const stage2Message = stage2Args.message;
 
         try {
-          const convLease = await acquireConversationLease(stage2Args.expectedSessionId, randomId('stage2-conv'));
+          const convLease = await takeConversationLease(stage2Args, stage2Args.expectedSessionId, randomId('stage2-conv'));
           stage2Args._conversationLease = convLease;
           let responseText;
           try {
@@ -9341,8 +9296,8 @@ async function recoverCandidateBranchLineage(page, args, branch) {
     let parentLease = null;
     let childLease = null;
     try {
-      parentLease = await acquireConversationLease(parentSessionId, randomId('recover-branch-p'));
-      childLease = await acquireConversationLease(childSessionId, randomId('recover-branch-c'));
+      parentLease = await takeConversationLease(args, parentSessionId, randomId('recover-branch-p'));
+      childLease = await takeConversationLease(args, childSessionId, randomId('recover-branch-c'));
 
       await openConversationBySessionId(page, childSessionId);
       await settlePage(page, 5000).catch(() => {});
@@ -9661,6 +9616,8 @@ async function branchWithContextCarryForward(page, args) {
       branchTurn: '',
       branchCarryForward: false,
       _laneLease: null,
+      _pageBinding: null,
+      _activeConversationLease: null,
     };
 
     // Reconcile branch_started using lower-level lineage if child was not recorded
@@ -9681,6 +9638,8 @@ async function branchWithContextCarryForward(page, args) {
       throw cbError('BRANCH_OPERATION_UNCERTAIN', `Carry-forward branch operation "${incident.branchOperationId}" is uncertain and requires manual reconciliation before retry`);
     }
 
+    let continuityPrompt = '';
+    try {
     if (!childSessionId) {
       updateRecoveryIncident(incident.id, { state: 'branch_started' }, 'carry_forward_branch_started');
       info(`[stage3-carry] Branching from parent session ${parentSessionId}...`);
@@ -9691,6 +9650,7 @@ async function branchWithContextCarryForward(page, args) {
       branchResult = await branchConversationTurn(page, branchArgs);
       childSessionId = branchResult.childSessionId;
       childPage = branchResult.childPage;
+      childArgs._pageBinding = branchResult.childBinding || null;
       childArgs.conversation = childSessionId;
       childArgs.expectedSessionId = childSessionId;
       updateRecoveryIncident(incident.id, {
@@ -9719,7 +9679,8 @@ async function branchWithContextCarryForward(page, args) {
       }
       if (!childPage && browser) {
         childArgs.newTab = true;
-        childPage = await findTargetAppPage(browser, childArgs);
+        const childBinding = await findTargetAppPage(browser, childArgs);
+        childPage = childBinding.page;
       }
       if (!childPage) {
         throw cbError('CHILD_PAGE_UNAVAILABLE', `Could not allocate or locate dedicated page for child conversation "${childSessionId}"`);
@@ -9731,8 +9692,6 @@ async function branchWithContextCarryForward(page, args) {
       };
     }
 
-    let continuityPrompt = '';
-    try {
       info(`[stage3-carry] Synthesizing continuity prompt for child session ${childSessionId}...`);
       continuityPrompt = formatCarryForwardPrompt({
         carryRequest,
@@ -9761,6 +9720,12 @@ async function branchWithContextCarryForward(page, args) {
         targetPage._laneLease = null;
       }
 
+      if (!childArgs._pageBinding && args._pageBinding?.targetId === childTid) {
+        assertLeaseCurrent(args._pageBinding.targetLease);
+        const childLease = acquireConversationLease(childSessionId, randomId('carry-child'));
+        childArgs._pageBinding = { page: targetPage, targetId: childTid, conversationId: childSessionId,
+          targetLease: { ...args._pageBinding.targetLease, borrowed: true }, conversationLease: childLease, released: false };
+      }
       childArgs.pageTargetId = childTid;
       childArgs.targetId = childTid;
       childArgs.message = continuityPrompt;
@@ -9786,6 +9751,7 @@ async function branchWithContextCarryForward(page, args) {
         continuationResponse: askResult,
       };
     } finally {
+      releasePageBinding(childArgs._pageBinding);
       if (childArgs._laneLease) {
         try { releaseBrowserLaneLease(childArgs._laneLease); } catch {}
         childArgs._laneLease = null;
@@ -9847,7 +9813,7 @@ async function branchConversationTurn(page, args) {
       }
     }
 
-    const parentLease = await acquireConversationLease(expectedParentSessionId, provisionalBranchId);
+    const parentLease = await takeConversationLease(args, expectedParentSessionId, provisionalBranchId);
 
     let branchRecord = null;
     let localDispatchState = 'unregistered';
@@ -10096,11 +10062,22 @@ async function branchConversationTurn(page, args) {
         lastError: '',
       }, 'branch_bound') || branchRecord;
 
+      let childBinding = null;
+      if (args.branchCarryForward && (childPageLane || args._pageBinding?.targetLease)) {
+        const targetId = await getPageTargetId(destinationPage);
+        const targetLease = childPageLane || { ...args._pageBinding.targetLease, borrowed: true };
+        assertLeaseCurrent(targetLease);
+        childBinding = { page: destinationPage, targetId, conversationId: childSessionId,
+          targetLease, conversationLease: childLease, released: false };
+        childPageLane = null;
+        childLease = null;
+      }
       info(`[stage3] Successfully branched ${expectedParentSessionId} -> ${childSessionId} at ${sourceAssistant.testid || sourceAssistant.messageId}`);
       return {
         childSessionId,
         childUrl: targetConversationUrl(childSessionId),
         childPage: destinationPage,
+        childBinding,
         branchRecord,
       };
     } catch (err) {
@@ -10391,61 +10368,125 @@ function resolveRunnableTarget(job, index) {
 }
 
 function takeNextScheduledJob(workerOptions = {}) {
-  const workerLane = workerOptions?.lane || workerOptions?.workerLane || '';
+  const workerLane = workerOptions?.lane || workerOptions?.workerLane || 'default';
   const workerId = workerOptions?.workerId || `worker-${process.pid}`;
+  const workerCdp = workerOptions?.cdp || '';
 
   return withSchedulerLock(() => {
     const queue = loadQueueState();
     const index = loadConversationIndex();
-    const ordered = queue.jobs.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
 
-    const activeKeys = new Set();
-    const blockedKeys = new Map();
+    // 1. Reconcile dead owners on non-done jobs
+    let queueDirty = false;
+    const now = nowIso();
+    for (const job of queue.jobs) {
+      if (isDoneScheduledJob(job)) continue;
+
+      if (job.status === 'claimed') {
+        const claimantPid = job.claim?.pid;
+        const claimantStartTime = job.claim?.startTime;
+        if (claimantPid && !isProcessAlive(claimantPid, claimantStartTime)) {
+          // Dead claimed reclaim safe
+          job.status = 'pending';
+          job.fence = Math.max(Number(job.fence || 0), Number(job.claim?.fence || 0));
+          job.claim = null;
+          job.updatedAt = now;
+          queueDirty = true;
+          appendJsonl(QUEUE_EVENTS_PATH, {
+            type: 'job_reclaimed_dead_claim',
+            at: now,
+            jobId: job.id,
+            seq: job.seq,
+            deadPid: claimantPid,
+          });
+        }
+      } else if (job.status === 'running') {
+        const runnerPid = job.run?.pid || job.claim?.pid;
+        const runnerStartTime = job.run?.startTime || job.claim?.startTime;
+        if (runnerPid && !isProcessAlive(runnerPid, runnerStartTime)) {
+          // Running uncertainty needs_recovery
+          job.status = 'needs_recovery';
+          job.lastError = 'Worker process died while job was running; requires recovery';
+          job.updatedAt = now;
+          if (job.result) {
+            job.result.heldAt = now;
+            job.result.recoverable = true;
+          } else {
+            job.result = { heldAt: now, recoverable: true };
+          }
+          queueDirty = true;
+          appendJsonl(QUEUE_EVENTS_PATH, {
+            type: 'job_held',
+            at: now,
+            jobId: job.id,
+            seq: job.seq,
+            status: 'needs_recovery',
+            deadPid: runnerPid,
+            error: job.lastError,
+          });
+        }
+      }
+    }
+    if (queueDirty) {
+      saveQueueState(queue);
+    }
+
+    // 2. Precompute active and blocked domains across ALL non-done jobs
+    const activeDomains = new Set();
+    const blockedDomains = new Map();
+    const ordered = queue.jobs.slice().sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
 
     for (const job of ordered) {
       if (isDoneScheduledJob(job)) continue;
-
-      const sKey = job.serializationKey || computeJobSerializationKey(job, index);
-
+      const sKey = computeJobSerializationKey(job, index);
       if (job.status === 'running' || job.status === 'claimed') {
-        activeKeys.add(sKey);
-        continue;
-      }
-
-      if (job.status !== 'pending') {
-        if (!blockedKeys.has(sKey)) {
-          blockedKeys.set(sKey, {
+        activeDomains.add(sKey);
+      } else if (job.status !== 'pending') {
+        if (!blockedDomains.has(sKey)) {
+          blockedDomains.set(sKey, {
             job,
             reason: `job #${job.seq} in lane "${sKey}" is ${job.status}; recover or reset it before continuing`,
           });
         }
+      }
+    }
+
+    // 3. FIFO head-of-stream before worker affinity
+    const seenDomains = new Set();
+    for (const job of ordered) {
+      if (isDoneScheduledJob(job)) continue;
+      const sKey = computeJobSerializationKey(job, index);
+      if (seenDomains.has(sKey)) continue;
+      seenDomains.add(sKey);
+
+      // This is the earliest non-done job in domain sKey.
+      if (activeDomains.has(sKey)) continue;
+      if (blockedDomains.has(sKey)) continue;
+
+      // Must be pending and head-of-stream
+      if ((job.workerLane || 'default') !== workerLane) {
         continue;
       }
 
-      if (activeKeys.has(sKey) || blockedKeys.has(sKey)) {
-        continue;
-      }
-
-      if (workerLane && job.workerLane && job.workerLane !== workerLane) {
-        continue;
-      }
-
-      const workerCdp = workerOptions?.cdp || '';
       if (workerCdp && job.cdp && normalizeCdpUrl(job.cdp) !== normalizeCdpUrl(workerCdp)) {
         continue;
       }
 
+      if (job.notBefore && Date.parse(job.notBefore) > Date.now()) continue;
       const target = resolveRunnableTarget(job, index);
+      if (workerOptions.targetId && job.targetId && workerOptions.targetId !== job.targetId) continue;
+      if (workerOptions.conversation && target.sessionId !== workerOptions.conversation) continue;
       if (target.action === 'blocked') {
-        blockedKeys.set(sKey, { job, reason: target.reason });
+        blockedDomains.set(sKey, { job, reason: target.reason });
         continue;
       }
 
-      const now = nowIso();
       const claimToken = randomId('claim');
-      const currentFence = Number(job.claim?.fence || 0) + 1;
+      const currentFence = Math.max(Number(job.fence || 0), Number(job.claim?.fence || 0)) + 1;
+      job.fence = currentFence;
+      const claimTime = nowIso();
       job.status = 'claimed';
-      job.updatedAt = now;
+      job.updatedAt = claimTime;
       job.attempts = (job.attempts || 0) + 1;
       job.lastError = '';
       job.claim = {
@@ -10453,11 +10494,13 @@ function takeNextScheduledJob(workerOptions = {}) {
         token: claimToken,
         fence: currentFence,
         pid: process.pid,
-        claimedAt: now,
+        startTime: getProcessStartTime(process.pid),
+        claimedAt: claimTime,
       };
       job.run = {
-        startedAt: now,
+        startedAt: claimTime,
         pid: process.pid,
+        startTime: getProcessStartTime(process.pid),
         target,
         claimToken,
         fence: currentFence,
@@ -10466,7 +10509,7 @@ function takeNextScheduledJob(workerOptions = {}) {
       saveQueueState(queue);
       appendJsonl(QUEUE_EVENTS_PATH, {
         type: 'job_claimed',
-        at: now,
+        at: claimTime,
         jobId: job.id,
         seq: job.seq,
         laneSeq: job.laneSeq,
@@ -10480,59 +10523,104 @@ function takeNextScheduledJob(workerOptions = {}) {
       return { job, blocked: null };
     }
 
-    if (blockedKeys.size > 0) {
-      const firstBlocked = blockedKeys.values().next().value;
-      return { job: null, blocked: firstBlocked };
+    if (blockedDomains.size > 0) {
+      const firstBlocked = [...blockedDomains.values()].find(({ job }) => (job.workerLane || 'default') === workerLane
+        && (!workerCdp || !job.cdp || normalizeCdpUrl(job.cdp) === normalizeCdpUrl(workerCdp)));
+      if (firstBlocked) return { job: null, blocked: firstBlocked };
     }
 
     return { job: null, blocked: null };
   });
 }
 
-function markJobRunning(jobId, claimToken = null) {
+function validateJobClaim(job, claimOrToken, fence = null) {
+  const token = typeof claimOrToken === 'object' ? claimOrToken?.token : claimOrToken;
+  const expectedFence = typeof claimOrToken === 'object' ? claimOrToken?.fence : fence;
+  if (!token) throw cbError('CLAIM_TOKEN_REQUIRED', 'A claim token is required');
+  if (!job?.claim || job.claim.token !== token) throw cbError('STALE_JOB_CLAIM', 'Job claim token changed');
+  if (!job.claim.pid || !isProcessAlive(Number(job.claim.pid), job.claim.startTime)) throw cbError('STALE_JOB_CLAIM', 'Claim owner is dead or unverified');
+  if (expectedFence == null || Number(expectedFence) !== Number(job.claim.fence)) {
+    throw cbError('STALE_JOB_CLAIM', 'A matching claim fence is required');
+  }
+}
+
+function assertJobClaimCurrent(jobId, claim) {
   return withSchedulerLock(() => {
-    const queue = loadQueueState();
-    const job = queue.jobs.find((item) => item.id === jobId);
-    if (!job) throw new Error(`Scheduled job disappeared: ${jobId}`);
-    if (claimToken && job.claim?.token && job.claim.token !== claimToken) {
-      throw cbError('STALE_JOB_CLAIM', `Cannot transition job ${jobId} to running: claim token mismatch`);
-    }
-    job.status = 'running';
-    job.updatedAt = nowIso();
-    if (job.run) job.run.startedAt = job.updatedAt;
-    saveQueueState(queue);
-    appendJsonl(QUEUE_EVENTS_PATH, {
-      type: 'job_started',
-      at: job.updatedAt,
-      jobId,
-      seq: job.seq,
-      serializationKey: job.serializationKey || '',
-      target: job.run?.target || null,
-    });
+    const job = loadQueueState().jobs.find(item => item.id === jobId);
+    validateJobClaim(job, claim);
+    if (!['claimed', 'running'].includes(job.status)) throw cbError('STALE_JOB_CLAIM', 'Job is no longer owned for execution');
     return job;
   });
 }
 
-function finishScheduledJob(jobId, patch, eventType, claimToken = null) {
+function markJobRunning(jobId, claimOrToken, fence = null) {
   return withSchedulerLock(() => {
     const queue = loadQueueState();
-    const job = queue.jobs.find((item) => item.id === jobId);
-    if (!job) throw new Error(`Scheduled job disappeared: ${jobId}`);
-    if (claimToken && job.claim?.token && job.claim.token !== claimToken) {
-      throw cbError('STALE_JOB_CLAIM', `Cannot finish job ${jobId}: claim token mismatch (job owned by newer claim)`);
-    }
-    Object.assign(job, patch, { updatedAt: nowIso() });
+    const job = queue.jobs.find(item => item.id === jobId);
+    validateJobClaim(job, claimOrToken, fence);
+    if (job.status !== 'claimed') throw cbError('INVALID_STATE_TRANSITION', `Cannot start a ${job.status} job`);
+    job.status = 'running';
+    job.updatedAt = nowIso();
+    job.claim.heartbeatAt = job.updatedAt;
+    job.run = { ...job.run, startedAt: job.updatedAt };
     saveQueueState(queue);
-    appendJsonl(QUEUE_EVENTS_PATH, {
-      type: eventType,
-      at: job.updatedAt,
-      jobId,
-      seq: job.seq,
-      status: job.status,
-      result: job.result || null,
-      error: job.lastError || '',
-    });
+    appendJsonl(QUEUE_EVENTS_PATH, { type: 'job_started', at: job.updatedAt, jobId, seq: job.seq, claim: job.claim });
     return job;
+  });
+}
+
+function finishScheduledJob(jobId, patch, eventType, claimOrToken, fence = null) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find(item => item.id === jobId);
+    validateJobClaim(job, claimOrToken, fence);
+    if (job.status === 'done' && patch.status === 'done') return job;
+    const permitted = ['done', 'failed', 'waiting', 'needs_recovery'];
+    if (!permitted.includes(patch.status) || (job.status !== 'running' && !(job.status === 'claimed' && patch.status !== 'done'))) {
+      throw cbError('INVALID_STATE_TRANSITION', `Cannot transition ${job.status} to ${patch.status}`);
+    }
+    Object.assign(job, { status: patch.status, result: patch.result || null, lastError: patch.lastError || '', updatedAt: nowIso() });
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, { type: eventType, at: job.updatedAt, jobId, seq: job.seq, status: job.status, result: job.result, error: job.lastError, claim: job.claim });
+    return job;
+  });
+}
+
+function deferScheduledJob(jobId, claim) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find(item => item.id === jobId);
+    validateJobClaim(job, claim);
+    if (job.status !== 'claimed') throw cbError('INVALID_STATE_TRANSITION', 'Only pre-dispatch claims may be deferred');
+    job.status = 'pending';
+    job.fence = Math.max(Number(job.fence || 0), Number(job.claim.fence));
+    job.claim = null;
+    job.notBefore = new Date(Date.now() + 500).toISOString();
+    job.updatedAt = nowIso();
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, { type: 'job_deferred', jobId, at: job.updatedAt, fence: job.fence });
+  });
+}
+
+function skipFailedScheduledJob(jobId) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find(item => item.id === jobId);
+    if (job?.status !== 'failed') throw cbError('INVALID_STATE_TRANSITION', 'Only failed jobs may be administratively skipped');
+    job.status = 'skipped'; job.updatedAt = nowIso();
+    saveQueueState(queue);
+    appendJsonl(QUEUE_EVENTS_PATH, { type: 'job_skipped_auto', jobId, at: job.updatedAt });
+  });
+}
+
+function heartbeatScheduledJob(jobId, claim) {
+  return withSchedulerLock(() => {
+    const queue = loadQueueState();
+    const job = queue.jobs.find(item => item.id === jobId);
+    validateJobClaim(job, claim);
+    if (!['claimed', 'running'].includes(job.status)) return;
+    job.claim.heartbeatAt = nowIso();
+    saveQueueState(queue);
   });
 }
 
@@ -10617,6 +10705,7 @@ function scheduledJobNeedsReconciliation(status) {
 
 function queueHoldStatusForError(error) {
   switch (error?.code) {
+    case 'SCHEDULER_LOCK_BUSY':
     case 'DISPATCH_UNCERTAIN':
     case 'CONVERSATION_NOT_HYDRATED':
     case 'CONVERSATION_LEASE_BUSY':
@@ -10677,10 +10766,22 @@ function recoverQueueStateFromRounds(page, args, context) {
 
     for (const job of queue.jobs) {
       if (!scheduledJobNeedsReconciliation(job.status)) continue;
+
+      // Do not change state of jobs owned by live active processes
+      if (job.status === 'running' || job.status === 'claimed') {
+        const ownerPid = job.run?.pid || job.claim?.pid;
+        const ownerStartTime = job.run?.startTime || job.claim?.startTime;
+        if (ownerPid && isProcessAlive(ownerPid, ownerStartTime)) {
+          continue;
+        }
+      }
+
       const round = findRoundForJob(roundState.rounds, job, index);
-      if (round && !roundAllowsTranscriptRecovery(round)) continue;
+      // Require a matching round - no round can mark done
+      if (!round) continue;
+      if (!roundAllowsTranscriptRecovery(round)) continue;
       const sessionId = sessionIdFromSchedulerRecord(round) || sessionIdFromSchedulerRecord(job.result) || '';
-      if (!round && !sessionId) continue;
+      if (!sessionId) continue;
 
       if (round && (round.dispatchState === 'aborted_precommit' || round.dispatchState === 'prepared')) {
         continue;
@@ -10734,9 +10835,9 @@ function recoverQueueStateFromRounds(page, args, context) {
         changedRounds.push({ type: 'round_recovered', round });
       }
 
-      if (round && (round.status !== 'done' || !round.responseChars)) continue;
+      if (round.status !== 'done' || !round.responseChars || round.responseChars <= 0) continue;
 
-      const finalResponseChars = round?.responseChars || job.result?.responseChars || 0;
+      const finalResponseChars = round.responseChars;
       const transcript = sessionId === context.activeSessionId
         ? args.transcript
         : (round?.transcript || job.result?.transcript || (sessionId ? transcriptPathForSession(sessionId) : args.transcript));
@@ -10939,8 +11040,7 @@ async function runScheduledJob(page, job, runnerArgs) {
   const sessionId = jobArgs.expectedSessionId || sessionIdFromUrl(page.url());
   if (jobArgs.stagingDir && jobArgs.transcript && fs.existsSync(jobArgs.transcript) && sessionId) {
     const canonicalTranscript = transcriptPathForSession(sessionId);
-    fs.mkdirSync(path.dirname(canonicalTranscript), { recursive: true });
-    fs.copyFileSync(jobArgs.transcript, canonicalTranscript);
+    publishStagedTranscript(jobArgs.transcript, canonicalTranscript, sessionId, jobArgs);
     jobArgs.transcript = canonicalTranscript;
   }
   const conversation = recordResolvedConversation(job, page, response, sessionId);
@@ -10955,93 +11055,60 @@ async function runScheduledJob(page, job, runnerArgs) {
   };
 }
 
-async function runScheduledQueue(pageOrBrowser, args) {
+async function runScheduledQueue(browser, args) {
   let completed = 0;
-  const isBrowser = Boolean(pageOrBrowser && typeof pageOrBrowser.contexts === 'function');
-  const browser = isBrowser ? pageOrBrowser : (typeof pageOrBrowser?.context === 'function' ? pageOrBrowser.context()?.browser?.() || null : null);
-  let staticPage = isBrowser ? null : pageOrBrowser;
-
-  while (true) {
-    if (args.queueLimit && completed >= args.queueLimit) return;
-
-    const { job, blocked } = takeNextScheduledJob({ lane: args.lane, workerId: args.workerId, cdp: args.cdp });
+  while (!args.queueLimit || completed < args.queueLimit) {
+    const { job, blocked } = takeNextScheduledJob({ lane: args.lane, workerId: args.workerId, cdp: args.cdp,
+      targetId: args.targetId, conversation: args.expectedSessionId || '' });
     if (!job) {
-      if (blocked) {
-        if (args.skipFailed && blocked.job.status === 'failed') {
-          finishScheduledJob(blocked.job.id, {
-            status: 'skipped',
-            lastError: blocked.job.lastError || '',
-            result: { ...(blocked.job.result || {}), skippedAt: nowIso(), skippedReason: 'auto-skipped by --skip-failed (blocking failed job)' },
-          }, 'job_skipped_auto', blocked.job.claim?.token);
-          info(`[queue] #${blocked.job.seq} ${blocked.job.id}: auto-skipped (failed; --skip-failed)`);
-          continue;
-        }
-        const message = `[queue] blocked at #${blocked.job.seq} ${blocked.job.id}: ${blocked.reason}`;
-        if (!args.queueWatch) {
-          console.error(message);
-          return;
-        }
-        info(message);
-      } else if (!args.queueWatch) {
-        info('[queue] no pending jobs');
+      if (blocked && args.skipFailed && blocked.job.status === 'failed') {
+        skipFailedScheduledJob(blocked.job.id);
+        continue;
+      }
+      if (!args.queueWatch) {
+        info(blocked ? `[queue] blocked: ${blocked.reason}` : '[queue] no eligible jobs');
         return;
       }
-      if (staticPage && typeof staticPage.waitForTimeout === 'function') {
-        await staticPage.waitForTimeout(args.stateInterval);
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, args.stateInterval));
-      }
+      await new Promise(resolve => setTimeout(resolve, args.stateInterval));
       continue;
     }
-
-    const claimToken = job.claim?.token || null;
-    markJobRunning(job.id, claimToken);
-
-    let targetPage = staticPage;
-    let targetLease = null;
-
+    let binding = null;
+    let running = false;
+    let heartbeat = null;
+    const target = job.run.target;
+    const jobArgs = { ...args, jobId: job.id, jobClaim: job.claim,
+      conversation: target.sessionId || '', expectedSessionId: target.sessionId || '',
+      newConversation: target.action === 'new', newTab: false,
+      targetId: job.targetId || args.targetId || '', pageTargetId: '',
+      _pageBinding: null, _laneLease: null, _conversationLease: null, _activeConversationLease: null };
     try {
-      if (!targetPage && browser) {
-        const jobPageArgs = {
-          ...args,
-          conversation: job.target?.sessionId || (job.target?.newConversation ? '' : (job.target?.alias || '')),
-          expectedSessionId: job.target?.sessionId || '',
-          newConversation: Boolean(job.target?.newConversation),
-          targetId: job.targetId || args.targetId || '',
-          lane: job.workerLane || args.lane || '',
-        };
-        targetPage = await findTargetAppPage(browser, jobPageArgs);
-        targetLease = jobPageArgs._laneLease || null;
-      }
-
-      const result = await runScheduledJob(targetPage, job, args);
-      finishScheduledJob(job.id, {
-        status: 'done',
-        result,
-        lastError: '',
-      }, 'job_completed', claimToken);
-      completed += 1;
-      info(`[queue] #${job.seq} ${job.id}: done session=${result.sessionId || '(none)'} transcript=${result.transcript}`);
+      assertJobClaimCurrent(job.id, job.claim);
+      binding = await findTargetAppPage(browser, jobArgs);
+      assertLeaseCurrent(binding.targetLease);
+      markJobRunning(job.id, job.claim);
+      running = true;
+      heartbeat = setInterval(() => {
+        try { heartbeatScheduledJob(job.id, job.claim); }
+        catch (error) { jobArgs._claimError = error; }
+      }, 5000);
+      heartbeat.unref();
+      const result = await runScheduledJob(binding.page, job, jobArgs);
+      finishScheduledJob(job.id, { status: 'done', result, lastError: '' }, 'job_completed', job.claim);
+      completed++;
+      info(`[queue] #${job.seq} ${job.id}: done session=${result.sessionId}`);
     } catch (error) {
-      const message = error.message || String(error);
-      const status = queueHoldStatusForError(error);
-      const eventType = status === 'failed' ? 'job_failed' : 'job_held';
-      finishScheduledJob(job.id, {
-        status,
-        lastError: message,
-        result: {
-          heldAt: nowIso(),
-          url: targetPage && typeof targetPage.url === 'function' ? targetPage.url() : '',
-          recoverable: status !== 'failed',
-        },
-      }, eventType, claimToken);
-      console.error(`[queue] #${job.seq} ${job.id}: ${status}: ${message}`);
-      return;
-    } finally {
-      if (targetLease) {
-        releaseBrowserLaneLease(targetLease);
-        targetLease = null;
+      if (!running && ['BROWSER_LANE_BUSY', 'CONVERSATION_LEASE_BUSY', 'BROWSER_TOPOLOGY_BUSY', 'SCHEDULER_LOCK_BUSY'].includes(error.code)) {
+        deferScheduledJob(job.id, job.claim);
+      } else if (error.code !== 'STALE_JOB_CLAIM') {
+        const status = queueHoldStatusForError(error);
+        finishScheduledJob(job.id, { status, lastError: error.message || String(error),
+          result: { heldAt: nowIso(), url: binding?.page.url() || '', recoverable: status !== 'failed' } },
+        status === 'failed' ? 'job_failed' : 'job_held', job.claim);
       }
+      console.error(`[queue] #${job.seq}: ${error.code || 'ERROR'}: ${error.message}`);
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+      releasePageBinding(binding);
     }
   }
 }
@@ -11337,6 +11404,16 @@ async function watchTargetAppState(page, args, options = {}) {
   }
 }
 
+function assertOperationOwnership(args) {
+  if (args._claimError) throw args._claimError;
+  if (args._pageBinding) {
+    if (args._pageBinding.released) throw cbError('LEASE_LOST', 'Page binding has been released');
+    assertLeaseCurrent(args._pageBinding.targetLease);
+    if (args._pageBinding.conversationLease) assertLeaseCurrent(args._pageBinding.conversationLease);
+  }
+  if (args.jobId && args.jobClaim) assertJobClaimCurrent(args.jobId, args.jobClaim);
+}
+
 async function ask(page, message, args) {
   // Preflight disposition check for reserved round before any browser preparation
   if (args.roundId) {
@@ -11395,7 +11472,7 @@ async function ask(page, message, args) {
     laneLease = takeBrowserLaneLease(args, args.jobId || randomId('lane-op'));
     if (!isNewChat && expectedSessionId) {
       // Adopt caller-supplied conversation lease or acquire immediately before any preparation/reload
-      leaseHandle = args._conversationLease || acquireConversationLease(expectedSessionId, args.roundId || randomId('round-conv'));
+      leaseHandle = args._conversationLease || takeConversationLease(args, expectedSessionId, args.roundId || randomId('round-conv'));
       if (args._conversationLease) {
         args._conversationLease = null; // Adopted!
       }
@@ -11415,8 +11492,10 @@ async function ask(page, message, args) {
       }
     }
 
-    await reconcileCurrentConversation(page, args, { suppressAlias: isNewChat }).catch(() => {});
+    args._activeConversationLease = leaseHandle;
+    await reconcileCurrentConversation(page, args, { suppressAlias: isNewChat });
     refreshSessionTranscript(page, args);
+    assertOperationOwnership(args);
     if (args.model) {
       info(`[model] selecting ${args.model}`);
       const result = await selectModel(page, args.model);
@@ -11427,6 +11506,7 @@ async function ask(page, message, args) {
       const result = await selectReasoning(page, args.reasoning);
       if (result) info(`[reasoning] ${formatModelSelectionResult(result, 'reasoning')}`);
     }
+    assertOperationOwnership(args);
     if (args.attachments && args.attachments.length) {
       info(`[attach] ${args.attachments.join(', ')}`);
       const state = await attachFiles(page, args.attachments);
@@ -11484,7 +11564,7 @@ async function ask(page, message, args) {
 
     if (!isNewChat && expectedSessionId && !leaseHandle) {
       try {
-        leaseHandle = acquireConversationLease(expectedSessionId, round.id);
+        leaseHandle = takeConversationLease(args, expectedSessionId, round.id);
       } catch (leaseError) {
         updateRound(round.id, {
           status: 'failed',
@@ -11499,6 +11579,7 @@ async function ask(page, message, args) {
       expectedSessionId,
       roundId: round.id,
       requireNewChatRoot: isNewChat,
+      assertOwnership: () => assertOperationOwnership(args),
     });
     const acceptedUserTurnRef = turnRef(acceptedUserTurn);
 
@@ -11537,7 +11618,7 @@ async function ask(page, message, args) {
 
       expectedSessionId = candidateSessionId;
       args.expectedSessionId = candidateSessionId;
-      args.transcript = transcriptPathForSession(candidateSessionId);
+      if (!args.transcriptOverride) args.transcript = transcriptPathForSession(candidateSessionId);
 
       updateRound(round.id, {
         sessionId: candidateSessionId,
@@ -11553,6 +11634,12 @@ async function ask(page, message, args) {
 
       // Overlapping lease: acquire stable session lease while bootstrap lease is held
       leaseHandle = acquireConversationLease(candidateSessionId, round.id);
+      if (args._pageBinding && !args._pageBinding.released) {
+        args._pageBinding.conversationId = candidateSessionId;
+        args._pageBinding.conversationLease = leaseHandle;
+        leaseHandle = { ...leaseHandle, borrowed: true };
+      }
+      args._activeConversationLease = leaseHandle;
     }
 
     const authoritativeSessionId = expectedSessionId || round.sessionId;
@@ -11562,6 +11649,7 @@ async function ask(page, message, args) {
     } else {
       refreshSessionTranscript(page, args);
     }
+    assertOperationOwnership(args);
     if (args.transcript) {
       appendTranscript(args.transcript, 'user', message);
     }
@@ -11603,6 +11691,7 @@ async function ask(page, message, args) {
     if (finalSessionId) {
       await assertThreadIdentity(page, finalSessionId, 'before persisting completed response');
     }
+    assertOperationOwnership(args);
     const finalTranscript = args.transcript || (finalSessionId ? transcriptPathForSession(finalSessionId) : '');
     if (finalTranscript) {
       appendTranscript(finalTranscript, 'assistant', response);
@@ -11629,6 +11718,7 @@ async function ask(page, message, args) {
     }
     return response;
   } finally {
+    args._activeConversationLease = null;
     releaseConversationLease(leaseHandle);
     releaseBootstrapLease(bootstrapLease);
     releaseBrowserLaneLease(laneLease);
@@ -12419,6 +12509,12 @@ async function main() {
     args.scriptedInput = await readAllStdin();
   }
 
+  if (args.listTargets) {
+    const inventory = await require('./lib/browser-targets').inspectBrowser(args.cdp);
+    console.log(JSON.stringify(inventory, null, 2));
+    return;
+  }
+  if (args.windowId != null && !Number.isInteger(args.windowId)) throw cbError('INVALID_WINDOW_ID', 'Window ID must be an integer');
   validateAutoRecoverMode(args);
   validateRecoverBranchMode(args);
   reconcileIncompleteBranches();
@@ -12439,11 +12535,15 @@ async function main() {
     );
 
     if (canRecoverReadOnly) {
+      args.expectedSessionId = candidateSessionId;
+      args.conversation = candidateSessionId;
       const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
       try {
-        const page = await findTargetAppPage(browser, args);
+        const binding = await findTargetAppPage(browser, args);
+        const page = binding.page;
         branch = await recoverCandidateBranchLineage(page, args, branch);
       } finally {
+        releasePageBinding(args._pageBinding);
         await browser.close().catch(() => {});
       }
     }
@@ -12499,12 +12599,13 @@ async function main() {
 
   const browser = await chromium.connectOverCDP(args.cdp, { timeout: CDP_CONNECT_TIMEOUT_MS });
   try {
-    if (args.runQueue && !args.targetId && !args.conversation) {
+    if (args.runQueue) {
       await runScheduledQueue(browser, args);
       return;
     }
 
-    const page = await findTargetAppPage(browser, args);
+    const binding = await findTargetAppPage(browser, args);
+    const page = binding.page;
     const passiveCurrentPageRead = isPassiveCurrentPageRead(args);
     refreshSessionTranscript(page, args);
 
@@ -12514,15 +12615,6 @@ async function main() {
       return;
     }
 
-    if (args.runQueue) {
-      const recovery = await withBrowserLaneLease(args, randomId('run-queue-recovery'), () => recoverScheduledQueue(page, args));
-      if (recovery.blocked) {
-        printQueueRecovery(recovery, args.stateJsonl);
-        return;
-      }
-      await runScheduledQueue(page, args);
-      return;
-    }
 
     if (args.recoverQueue) {
       await prepareConversationForRead(page, args);
@@ -12753,6 +12845,7 @@ async function main() {
 
     await interactive(page, args);
   } finally {
+    releasePageBinding(args._pageBinding);
     if (args._laneLease) {
       releaseBrowserLaneLease(args._laneLease);
       args._laneLease = null;
@@ -12820,6 +12913,14 @@ module.exports = {
   parseArgs,
   canonicalRawPrompt,
   findTargetAppPage,
+  releasePageBinding,
+  assertLeaseCurrent,
+  takeConversationLease,
+  assertJobClaimCurrent,
+  deferScheduledJob,
+  publishStagedTranscript,
+  getTargetAppState,
+  buildStateEvent,
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,
@@ -12904,11 +13005,16 @@ module.exports = {
   releaseTargetLease,
   conversationLeasePath,
   getProcessStartTime,
+  isProcessAlive,
+  processExists,
+  acquireSchedulerLock,
+  withSchedulerLock,
   computeJobSerializationKey,
   takeNextScheduledJob,
   markJobRunning,
   finishScheduledJob,
   enqueueScheduledJob,
+  recoverQueueStateFromRounds,
   runScheduledQueue,
   loadQueueState,
   saveQueueState,
