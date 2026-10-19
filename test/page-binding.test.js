@@ -105,3 +105,14 @@ test('allocation failure closes only its owned new page before releasing locks',
   assert.equal(closed, true);
   assert.equal(f.locks.size, 0);
 });
+
+test('page binding automatically locks dark colorScheme when emulateMedia is available', async () => {
+  const f = fixture();
+  let emulatedScheme = null;
+  const page = f.makePage('A', `${f.origin}/c/${f.session}`);
+  page.emulateMedia = async ({ colorScheme }) => { emulatedScheme = colorScheme; };
+  f.pages.push(page);
+  const binding = await acquirePageBinding(f.browser, { targetId: 'A' }, f.deps);
+  assert.equal(emulatedScheme, 'dark');
+  releasePageBinding(binding, f.deps.releaseConversationLease);
+});
