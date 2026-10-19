@@ -3854,6 +3854,7 @@ async function getGenerationState(page) {
       if (voiceControlRe.test(meta)) return false;
       if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
       if (/^cancel$/i.test(visibleText.trim())) return false;
+      if (button.closest?.('form, [data-user-message-bubble="true"], [data-message-author-role="user"]')) return false;
 
       const turn = button.closest?.('[data-testid^="conversation-turn-"], [data-turn-key]');
       if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
@@ -4040,6 +4041,7 @@ async function getTargetAppState(page) {
       if (voiceControlRe.test(meta)) return false;
       if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
       if (/^cancel$/i.test(visibleText.trim())) return false;
+      if (button.closest?.('form, [data-user-message-bubble="true"], [data-message-author-role="user"]')) return false;
 
       const turn = button.closest?.('[data-testid^="conversation-turn-"], [data-turn-key]');
       if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
@@ -4277,6 +4279,20 @@ async function getTargetAppState(page) {
       .filter((text, index, arr) => arr.indexOf(text) === index)
       .slice(-20);
 
+    const thinkButtonEl = composerRoot
+      ? [...composerRoot.querySelectorAll('button, [role="button"]')].find((b) => {
+        const txt = textOf(b).trim().toLowerCase();
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+        return (txt === 'think' || aria === 'think') && b.hasAttribute('aria-pressed');
+      })
+      : null;
+    const binaryReasoning = thinkButtonEl
+      ? {
+        exists: true,
+        enabled: thinkButtonEl.getAttribute('aria-pressed') === 'true',
+      }
+      : { exists: false, enabled: false };
+
     const modelButtonEl = buttons.find((button) => {
       const text = textOf(button);
       const meta = controlText(button);
@@ -4330,7 +4346,8 @@ async function getTargetAppState(page) {
       connectionInterruptedBanner: connectionInterruptedBanner ? textOf(connectionInterruptedBanner) : '',
       terminalError: Boolean(terminalErrorBanner),
       terminalErrorText: terminalErrorBanner ? textOf(terminalErrorBanner) : '',
-      model: modelButton ? (modelButton.text || modelButton.aria || modelButton.testid) : '',
+      model: modelButton ? (modelButton.text || modelButton.aria || modelButton.testid) : (binaryReasoning.exists ? (binaryReasoning.enabled ? 'Think' : 'Instant') : ''),
+      binaryReasoning,
       blockingModal,
       reasoningControls,
       isGenerating: generationControls.length > 0,
@@ -4549,7 +4566,16 @@ function stateBaseline(state) {
 function buildStateEvent(state, baseline = null, transcriptPath = '') {
   const latestTurn = state.lastTurns?.[state.lastTurns.length - 1] || null;
   const latestAssistant = latestTurnByRole(state, 'assistant');
-  const modelSelection = parseModelSelection(state.model || '');
+  const isBinaryTier = Boolean(state.binaryReasoning?.exists);
+  const binaryEnabled = Boolean(state.binaryReasoning?.enabled);
+  const modelSelection = isBinaryTier
+    ? {
+      button: binaryEnabled ? 'Think' : 'Instant',
+      model: 'Default',
+      mode: binaryEnabled ? 'Thinking' : 'Instant',
+      effort: binaryEnabled ? 'Think' : 'Instant',
+    }
+    : parseModelSelection(state.model || '');
   const modelConfig = compactModelConfig(state.modelConfig || null);
   const latestAssistantSignature = turnSignature(latestAssistant);
   const assistantAdvanced = Boolean(latestAssistant && baseline && (
@@ -4601,6 +4627,7 @@ function buildStateEvent(state, baseline = null, transcriptPath = '') {
     title: state.title,
     transcript: transcriptPath,
     model: state.model || '',
+    tierMode: isBinaryTier ? 'binary_reasoning' : 'multi_model',
     modelSelection: {
       button: state.model || '',
       model: modelSelection.model || modelConfig?.current?.model || modelConfig?.configure?.model || (modelSelection.effort || modelSelection.mode ? 'Latest' : ''),
@@ -5037,6 +5064,7 @@ async function stopGeneration(page) {
       if (voiceControlRe.test(meta)) return false;
       if (/\b(share|copy|close|cancel dictation)\b/i.test(meta)) return false;
       if (/^cancel$/i.test(visibleText.trim())) return false;
+      if (button.closest?.('form, [data-user-message-bubble="true"], [data-message-author-role="user"]')) return false;
 
       const turn = button.closest?.('[data-testid^="conversation-turn-"]');
       if (turn && turn.querySelector?.('[id^="message-edit-"][contenteditable="true"], .ProseMirror[contenteditable="true"]')) {
@@ -5768,6 +5796,10 @@ async function waitForModelMenu(page, timeout = 5000) {
 async function openModelSwitcher(page) {
   await ensureNoBlockingModal(page, 'before opening target app model picker');
   if (await hasOpenModelMenu(page)) return 'open';
+  const state = await getTargetAppState(page).catch(() => null);
+  if (state?.binaryReasoning?.exists) {
+    return 'binary_reasoning';
+  }
   const label = await markModelSwitcher(page);
   if (!label) return '';
   await page.locator('[data-cb-model-switcher="true"]').click({ timeout: 5000 });
@@ -6410,6 +6442,25 @@ async function getConfigureModalState(page, includeDropdowns = false) {
 
 async function inspectModelConfigurator(page, options = {}) {
   const buttonState = await getTargetAppState(page).catch(() => null);
+  if (buttonState?.binaryReasoning?.exists) {
+    const isPressed = Boolean(buttonState.binaryReasoning.enabled);
+    return {
+      tierMode: 'binary_reasoning',
+      button: isPressed ? 'Think' : 'Instant',
+      current: { label: isPressed ? 'Default (Thinking)' : 'Default (Instant)', model: 'Default' },
+      modes: [
+        { label: 'Instant', mode: 'Instant', checked: isPressed ? 'false' : 'true' },
+        { label: 'Think', mode: 'Thinking', checked: isPressed ? 'true' : 'false' },
+      ],
+      models: [{ label: 'Default (Free Tier)', name: 'Default', checked: true }],
+      efforts: [
+        { label: 'Instant (No reasoning)', selected: !isPressed },
+        { label: 'Think (Reasoning enabled)', selected: isPressed },
+      ],
+      hasSlider: false,
+      configureAvailable: false,
+    };
+  }
   await openModelSwitcher(page);
   const menu = await getModelMenuState(page);
   const result = {
@@ -6464,6 +6515,17 @@ async function inspectModelConfigurator(page, options = {}) {
 
 async function listModelOptions(page) {
   const config = await inspectModelConfigurator(page, { includeDetails: true });
+  if (config.tierMode === 'binary_reasoning') {
+    const isThink = config.button === 'Think';
+    return [
+      'Tier: Free (Binary Reasoning)',
+      'Model: Default (Managed by service)',
+      `Current Reasoning: ${isThink ? 'Think (Enabled)' : 'Instant (Disabled)'}`,
+      'Options:',
+      `  - Think   (Reasoning enabled)${isThink ? ' [selected]' : ''}`,
+      `  - Instant (No reasoning / fast)${!isThink ? ' [selected]' : ''}`,
+    ];
+  }
   const lines = [];
   if (config.current?.label) lines.push(`Current: ${config.current.label}`);
   if (config.button) lines.push(`Selected: ${config.button}`);
@@ -6869,7 +6931,79 @@ async function applySliderModelSelection(page, selection, menuState, label) {
   };
 }
 
+function isBinaryReasoningDesired(label) {
+  const str = String(label || '').trim().toLowerCase();
+  if (/\b(instant|fast|off|false|no|0|none|auto|light|standard)\b/i.test(str)) {
+    return false;
+  }
+  if (/\b(think|thinking|on|true|yes|1|high|deep|extra high|extended|pro|heavy)\b/i.test(str)) {
+    return true;
+  }
+  return true;
+}
+
+async function applyBinaryReasoningSelection(page, label, binaryReasoningState) {
+  const desire = isBinaryReasoningDesired(label);
+  const current = Boolean(binaryReasoningState?.enabled);
+  const selectedName = desire ? 'Think' : 'Instant';
+  if (current === desire) {
+    info(`[reasoning] Binary reasoning is already ${desire ? 'enabled (Think)' : 'disabled (Instant)'}; skipping toggle`);
+    return {
+      requested: label,
+      selected: selectedName,
+      fallback: false,
+      available: ['Think', 'Instant'],
+    };
+  }
+  const thinkBtn = page.locator('form button:has-text("Think"), button:has-text("Think")').first();
+  if (!await thinkBtn.count().catch(() => 0)) {
+    throw cbError('REASONING_CONTROL_NOT_FOUND', 'Could not locate Think toggle button in composer');
+  }
+  info(`[reasoning] Toggling reasoning: ${current ? 'Think' : 'Instant'} -> ${selectedName}`);
+  await thinkBtn.click({ timeout: 5000 });
+  await page.waitForTimeout(500);
+  let afterPressed = await thinkBtn.getAttribute('aria-pressed').catch(() => null);
+  if (afterPressed !== String(desire)) {
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('form button, button')].find((b) => (b.innerText || '').trim().toLowerCase() === 'think');
+      if (btn) btn.click();
+    });
+    await page.waitForTimeout(500);
+    afterPressed = await thinkBtn.getAttribute('aria-pressed').catch(() => null);
+  }
+  const verifiedState = afterPressed === 'true';
+  if (verifiedState !== desire) {
+    throw cbError('REASONING_TOGGLE_UNVERIFIED', `Failed to verify Think toggle transition to ${selectedName} (current aria-pressed: ${afterPressed})`);
+  }
+  return {
+    requested: label,
+    selected: selectedName,
+    fallback: false,
+    available: ['Think', 'Instant'],
+  };
+}
+
 async function selectModel(page, label) {
+  const appState = await getTargetAppState(page).catch(() => null);
+  if (appState?.binaryReasoning?.exists) {
+    if (/\b(think|thinking|instant|fast|deep|high|low|auto|off|on)\b/i.test(String(label || ''))) {
+      info(`[model] Free tier detected (no model picker); routing reasoning preference "${label}" to Think toggle`);
+      const reasoningRes = await applyBinaryReasoningSelection(page, label, appState.binaryReasoning);
+      return {
+        requested: label,
+        selected: `Default (${reasoningRes.selected})`,
+        fallback: true,
+        available: ['Default (Instant)', 'Default (Think)'],
+      };
+    }
+    info(`[model] Free tier detected: model selection ("${label}") is unavailable; managed by service`);
+    return {
+      requested: label,
+      selected: appState.binaryReasoning.enabled ? 'Default (Thinking)' : 'Default (Instant)',
+      fallback: true,
+      available: ['Default (Instant)', 'Default (Think)'],
+    };
+  }
   const selection = parseModelSelection(label);
   const currentButtonSelection = parseModeAndEffort((await getTargetAppState(page).catch(() => null))?.model || '');
   if (!await openModelSwitcher(page)) throw new Error('No visible model picker found');
@@ -6931,8 +7065,11 @@ async function selectModel(page, label) {
 }
 
 async function selectReasoning(page, label) {
-  const selection = parseModelSelection(label);
   const state = await getTargetAppState(page).catch(() => null);
+  if (state?.binaryReasoning?.exists) {
+    return applyBinaryReasoningSelection(page, label, state.binaryReasoning);
+  }
+  const selection = parseModelSelection(label);
   const currentModelLabel = state?.model || '';
   const currentParsed = parseModeAndEffort(currentModelLabel);
   const currentEffort = normalizeModelLabel(currentParsed.effort || currentModelLabel);
@@ -12921,6 +13058,11 @@ module.exports = {
   publishStagedTranscript,
   getTargetAppState,
   buildStateEvent,
+  selectReasoning,
+  selectModel,
+  listModelOptions,
+  inspectModelConfigurator,
+  applyBinaryReasoningSelection,
   compactActiveConversation,
   compactTargetConversation,
   syncTranscriptFromPage,

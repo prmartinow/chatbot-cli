@@ -252,6 +252,17 @@ live picker before selecting. If a requested tier or model is targeted, CB toggl
 between the slider view and the model list view, updates the selection, and returns
 to the composer.
 
+### Free Tier (Binary Reasoning Mode)
+
+On free-tier accounts where multi-model dropdowns and effort sliders are absent,
+CB CLI automatically detects the binary `Think` reasoning toggle (`aria-pressed="false"|"true"`)
+inside the composer form:
+- `--models`: Reports `Tier: Free (Binary Reasoning)`, `Model: Default (Managed by service)`, and current toggle state.
+- `--reasoning Think` (or aliases `thinking`, `on`, `true`, `high`, `deep`): Enables reasoning (`aria-pressed="true"`).
+- `--reasoning Instant` (or aliases `fast`, `off`, `false`, `none`, `standard`): Disables reasoning (`aria-pressed="false"`).
+- `--model <name>`: Automatically routes any reasoning preferences to the `Think` toggle and notes that base model selection is managed by the service.
+- State JSONL: Emits `"tierMode": "binary_reasoning"` and normalized `"modelSelection": {"button": "Think|Instant", "model": "Default", "mode": "Thinking|Instant", "effort": "Think|Instant"}`.
+
 Watch target app state for orchestration:
 
 ```bash
