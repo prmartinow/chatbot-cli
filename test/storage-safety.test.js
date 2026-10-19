@@ -63,3 +63,36 @@ test('staging identifiers cannot escape the staging root', () => {
   assert.notEqual(cb.jobStagingDir('job-a'), cb.jobStagingDir('job-b'));
   assert.throws(() => cb.jobStagingDir('../canonical'), { code: 'INVALID_JOB_ID' });
 });
+
+test('publication strictly rejects same-length rewrites, non-extension rewrites, and prefix mutations', () => {
+  const staged = path.join(root, 'staged-rewrite.txt');
+  fs.writeFileSync(transcript, original);
+
+  // 1. Same length rewrite with different text
+  fs.writeFileSync(staged, content([['user', 'original prompt'], ['assistant', 'rewritten answer']]));
+  assert.throws(() => cb.publishStagedTranscript(staged, transcript, session), { code: 'TRANSCRIPT_DIVERGENCE' });
+
+  // 2. Same turn count and text but altered timestamp metadata
+  const originalWithTs = [
+    cb.formatTranscriptEntry('user', 'original prompt', '2026-10-01T10:00:00.000Z'),
+    cb.formatTranscriptEntry('assistant', 'original answer', '2026-10-01T10:01:00.000Z'),
+  ].join('');
+  const stagedWithAlteredTs = [
+    cb.formatTranscriptEntry('user', 'original prompt', '2026-10-01T10:00:00.000Z'),
+    cb.formatTranscriptEntry('assistant', 'original answer', '2026-10-01T10:05:00.000Z'), // Altered!
+  ].join('');
+  fs.writeFileSync(transcript, originalWithTs);
+  fs.writeFileSync(staged, stagedWithAlteredTs);
+  assert.throws(() => cb.publishStagedTranscript(staged, transcript, session), { code: 'TRANSCRIPT_DIVERGENCE' });
+
+  // 3. Staged file that does not strictly grow in entry count
+  fs.writeFileSync(staged, originalWithTs);
+  const sameResult = cb.publishStagedTranscript(staged, transcript, session);
+  assert.equal(sameResult.updated, false); // Idempotent unchanged
+
+  // 4. Staging directory incorporates claim fence when provided
+  const baseStaging = cb.jobStagingDir('job-alpha');
+  const fencedStaging = cb.jobStagingDir('job-alpha', 3);
+  assert.notEqual(baseStaging, fencedStaging);
+  assert.ok(fencedStaging.includes(path.join('job-alpha', 'fence-3')));
+});

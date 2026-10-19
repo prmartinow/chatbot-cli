@@ -234,3 +234,29 @@ test('Binary Reasoning: inspectModelConfigurator and listModelOptions report Fre
   assert.ok(optionsPressed.some((line) => line.includes('Current Reasoning: Think (Enabled)')));
   assert.ok(optionsPressed.some((line) => line.includes('- Think   (Reasoning enabled) [selected]')));
 });
+
+test('Binary Reasoning: rejects invalid reasoning levels and unverified toggle transitions', async () => {
+  const page = createMockPage('false');
+
+  // 1. Unrecognized / misspelled label throws INVALID_REASONING_LEVEL
+  await assert.rejects(
+    async () => cb.selectReasoning(page, 'super-think-xyz'),
+    (err) => err.code === 'INVALID_REASONING_LEVEL'
+  );
+
+  // 2. Unverified transition (e.g. toggle returns null or wrong value) throws REASONING_TOGGLE_UNVERIFIED
+  const brokenPage = {
+    ...page,
+    locator: () => ({
+      first: () => ({
+        count: async () => 1,
+        click: async () => {},
+        getAttribute: async () => null, // Returns null!
+      }),
+    }),
+  };
+  await assert.rejects(
+    async () => cb.applyBinaryReasoningSelection(brokenPage, 'Think', { exists: true, enabled: false }),
+    (err) => err.code === 'REASONING_TOGGLE_UNVERIFIED'
+  );
+});

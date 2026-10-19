@@ -2020,9 +2020,10 @@ function targetDescription(target) {
   return 'current';
 }
 
-function jobStagingDir(jobId) {
+function jobStagingDir(jobId, claimFence = null) {
   if (!/^[A-Za-z0-9._:-]+$/.test(String(jobId || '')) || jobId === '.' || jobId === '..') throw cbError('INVALID_JOB_ID', 'Invalid staging identifier');
-  return path.join(SCHEDULER_DIR, 'staging', jobId);
+  const fence = claimFence != null ? `fence-${claimFence}` : '';
+  return fence ? path.join(SCHEDULER_DIR, 'staging', jobId, fence) : path.join(SCHEDULER_DIR, 'staging', jobId);
 }
 
 function publishStagedTranscript(stagedPath, canonicalPath, sessionId, args = {}) {
@@ -2037,8 +2038,14 @@ function publishStagedTranscript(stagedPath, canonicalPath, sessionId, args = {}
     if (canonical === staged) return { published: true, updated: false };
     const oldEntries = parseTranscriptEntries(canonical);
     const newEntries = parseTranscriptEntries(staged);
-    if (!newEntries.length || oldEntries.some((entry, i) => !newEntries[i] || entry.role !== newEntries[i].role || normalizeTurnText(entry.text) !== normalizeTurnText(newEntries[i].text))) {
-      throw cbError('TRANSCRIPT_DIVERGENCE', 'Staged transcript does not extend the canonical history');
+    if (!newEntries.length || (oldEntries.length > 0 && newEntries.length <= oldEntries.length)
+      || oldEntries.some((entry, i) => !newEntries[i] || entry.role !== newEntries[i].role
+        || normalizeTurnText(entry.text) !== normalizeTurnText(newEntries[i].text)
+        || (entry.timestamp && newEntries[i].timestamp && entry.timestamp !== newEntries[i].timestamp))) {
+      throw cbError('TRANSCRIPT_DIVERGENCE', 'Staged transcript does not strictly extend the canonical history');
+    }
+    if (canonical && !staged.startsWith(canonical) && canonical.trim() !== staged.slice(0, canonical.length).trim()) {
+      throw cbError('TRANSCRIPT_DIVERGENCE', 'Staged transcript alters existing canonical prefix text');
     }
     fs.mkdirSync(path.dirname(canonicalPath), { recursive: true });
     temporary = `${canonicalPath}.${randomId('publish')}.tmp`;
@@ -2134,7 +2141,7 @@ function enqueueScheduledJob(args, page = null) {
 
     const workerLane = args.lane || 'default';
     const serializationKey = computeJobSerializationKey({ id: jobId, target }, index);
-    const laneSeq = queue.jobs.filter((j) => (j.serializationKey || computeJobSerializationKey(j, index)) === serializationKey).length + 1;
+    const laneSeq = queue.jobs.filter((j) => computeJobSerializationKey(j, index) === serializationKey).length + 1;
     const seq = queue.jobs.reduce((max, job) => Math.max(max, Number(job.seq) || 0), 0) + 1;
     const now = nowIso();
     const job = {
@@ -6933,13 +6940,13 @@ async function applySliderModelSelection(page, selection, menuState, label) {
 
 function isBinaryReasoningDesired(label) {
   const str = String(label || '').trim().toLowerCase();
-  if (/\b(instant|fast|off|false|no|0|none|auto|light|standard)\b/i.test(str)) {
+  if (/^(instant|fast|off|false|no|0|none|auto|light|standard)$/i.test(str)) {
     return false;
   }
-  if (/\b(think|thinking|on|true|yes|1|high|deep|extra high|extended|pro|heavy)\b/i.test(str)) {
+  if (/^(think|thinking|on|true|yes|1|high|deep|extra high|extended|pro|heavy)$/i.test(str)) {
     return true;
   }
-  return true;
+  throw cbError('INVALID_REASONING_LEVEL', `Unsupported reasoning option "${label}" on Free tier. Allowed: Think (enabled) or Instant (disabled)`);
 }
 
 async function applyBinaryReasoningSelection(page, label, binaryReasoningState) {
@@ -6966,13 +6973,12 @@ async function applyBinaryReasoningSelection(page, label, binaryReasoningState) 
   if (afterPressed !== String(desire)) {
     await page.evaluate(() => {
       const btn = [...document.querySelectorAll('form button, button')].find((b) => (b.innerText || '').trim().toLowerCase() === 'think');
-      if (btn) btn.click();
+      if (btn && typeof btn.click === "function") btn.click();
     });
     await page.waitForTimeout(500);
     afterPressed = await thinkBtn.getAttribute('aria-pressed').catch(() => null);
   }
-  const verifiedState = afterPressed === 'true';
-  if (verifiedState !== desire) {
+  if (afterPressed !== String(desire)) {
     throw cbError('REASONING_TOGGLE_UNVERIFIED', `Failed to verify Think toggle transition to ${selectedName} (current aria-pressed: ${afterPressed})`);
   }
   return {
@@ -11152,7 +11158,8 @@ async function runScheduledJob(page, job, runnerArgs) {
   let stagingDir = null;
   let stagedTranscript = null;
   if (target.action === 'new') {
-    stagingDir = jobStagingDir(job.id);
+    const claimFence = job.claim?.fence != null ? Number(job.claim.fence) : (job.fence != null ? Number(job.fence) : 1);
+    stagingDir = jobStagingDir(job.id, claimFence);
     fs.mkdirSync(stagingDir, { recursive: true });
     stagedTranscript = path.join(stagingDir, 'transcript.pending.txt');
   }

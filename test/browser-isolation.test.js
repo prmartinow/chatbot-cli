@@ -140,7 +140,7 @@ test('real CDP: background tabs, two profiles, competing processes and crash rec
     const finished = cb.loadQueueState().jobs.find(item => item.id === scheduled.id);
     assert.equal(finished.status, 'done', cliOutput);
     const canonical = fs.readFileSync(finished.result.transcript, 'utf8');
-    const staged = fs.readFileSync(path.join(cb.jobStagingDir(scheduled.id), 'transcript.pending.txt'), 'utf8');
+    const staged = fs.readFileSync(path.join(cb.jobStagingDir(scheduled.id, finished.claim?.fence || finished.fence || 1), 'transcript.pending.txt'), 'utf8');
     assert.equal(canonical, staged);
     assert.ok(canonical.includes(`Fixture completed: ${scheduled.message}`));
     return finished.result;
